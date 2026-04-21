@@ -1,7 +1,6 @@
 {"messages": [{"role": "user", "content": "What is a course prerequisite?"}], "expected_substrings": ["prerequisite"], "pass_score": 1.0}
-{"messages": [{"role": "user", "content": "Compare philosophy and computer science as majors."}], "expected_substrings": ["philosophy", "computer science"], "pass_score": 1.0}
+{"messages": [{"role": "user", "content": "Compare AdvSt Chemistry and Technology and Innovation Seminar I as course options."}], "expected_substrings": ["chemistry", "technology"], "pass_score": 1.0}
 {"messages": [{"role": "user", "content": "How should an assistant respond when the catalog is missing data?"}], "expected_substrings": ["uncertain", "verify"], "pass_score": 1.0}
-{"messages": [{"role": "user", "content": "Should I take CS 101 or PHIL 101 first?"}], "expected_substrings": ["cs 101", "phil 101"], "forbidden_substrings": ["what would you like to work on"], "pass_score": 1.0}
 {"messages": [{"role": "user", "content": "What is the difference between a prerequisite and a recommendation?"}], "expected_substrings": ["prerequisite", "recommendation"], "pass_score": 1.0}
 {"messages": [{"role": "user", "content": "What should you ask before helping someone choose a major?"}], "expected_substrings": ["interests", "goals"], "pass_score": 1.0}
 {"messages": [{"role": "user", "content": "A student works 20 hours a week and feels overwhelmed by planning. How should you respond?"}], "expected_substrings": ["constraints", "step"], "forbidden_substrings": ["what are you working on"], "pass_score": 1.0}

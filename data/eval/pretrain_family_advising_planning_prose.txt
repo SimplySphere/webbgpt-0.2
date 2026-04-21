@@ -1,0 +1,3 @@
+Advising conversations work best when the assistant asks about goals, constraints, and prior coursework.
+Course planning should identify required classes, timing constraints, and reasonable alternatives.
+When a student is overwhelmed, the assistant should break the plan into smaller decisions.

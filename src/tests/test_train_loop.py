@@ -4,6 +4,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 from config import CheckpointConfig, TrainConfig
 
 
@@ -85,6 +86,18 @@ class _FakeModel:
         return types.SimpleNamespace(loss=_FakeLoss(1.0))
 
 
+class _FakeNonFiniteModel(_FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def __call__(self, **_batch):
+        self.calls += 1
+        if self.calls == 1:
+            return types.SimpleNamespace(loss=_FakeLoss(float("nan")))
+        return types.SimpleNamespace(loss=_FakeLoss(1.0))
+
+
 class _FakeOptimizer:
     def zero_grad(self, set_to_none=True):
         return None
@@ -141,7 +154,31 @@ def test_maybe_compile_model_falls_back_when_dynamo_is_unsupported(monkeypatch, 
     assert "skipping torch.compile" in capsys.readouterr().err
 
 
-def test_run_training_emits_final_eval_for_short_token_budget_stage(monkeypatch, capsys):
+def test_validate_effective_batch_size_rejects_mismatched_global_batch(monkeypatch):
+    fake_checkpoint = types.ModuleType("train.checkpoint")
+    fake_checkpoint.CheckpointManager = object
+    fake_distributed = types.ModuleType("train.distributed")
+    fake_distributed.barrier = lambda: None
+    fake_distributed.is_main_process = lambda: True
+
+    monkeypatch.setitem(sys.modules, "train.checkpoint", fake_checkpoint)
+    monkeypatch.setitem(sys.modules, "train.distributed", fake_distributed)
+    sys.modules.pop("train.loop", None)
+
+    train_loop = importlib.import_module("train.loop")
+
+    def fake_require_torch():
+        return _FakeTorch(), None, None
+
+    monkeypatch.setattr(train_loop, "_require_torch", fake_require_torch)
+
+    config = TrainConfig(global_batch_size=16, micro_batch_size=1, gradient_accumulation_steps=4)
+
+    with pytest.raises(ValueError, match="global_batch_size does not match"):
+        train_loop.validate_effective_batch_size(config)
+
+
+def test_run_training_emits_terminal_eval_for_short_token_budget_stage(monkeypatch, capsys):
     fake_checkpoint = types.ModuleType("train.checkpoint")
     fake_checkpoint.CheckpointManager = object
     fake_distributed = types.ModuleType("train.distributed")
@@ -171,6 +208,7 @@ def test_run_training_emits_final_eval_for_short_token_budget_stage(monkeypatch,
 
     train_config = TrainConfig(
         run_name="test-short-continue",
+        global_batch_size=1,
         max_steps=250,
         micro_batch_size=1,
         gradient_accumulation_steps=1,
@@ -206,8 +244,8 @@ def test_run_training_emits_final_eval_for_short_token_budget_stage(monkeypatch,
 
     assert state.step == 2
     assert len(eval_calls) == 1
-    assert payloads[-1]["final_eval"] is True
     assert payloads[-1]["step"] == 2
+    assert "final_eval" not in payloads[-1]
     assert "progress_summary" in payloads[-1]
     assert "elapsed" in payloads[-1]["progress_summary"]
     assert "left" in payloads[-1]["progress_summary"]
@@ -243,6 +281,7 @@ def test_run_training_merges_eval_payload_and_saves_best_checkpoint(monkeypatch,
 
     train_config = TrainConfig(
         run_name="test-sft",
+        global_batch_size=1,
         max_steps=6,
         micro_batch_size=1,
         gradient_accumulation_steps=1,
@@ -294,6 +333,8 @@ def test_run_training_merges_eval_payload_and_saves_best_checkpoint(monkeypatch,
                     "examples_seen": 3,
                     "best_eval_loss": 2.0,
                     "best_eval_step": 2,
+                    "nonfinite_loss_steps": 0,
+                    "nonfinite_event_samples": [],
                 }
             },
         ),
@@ -306,11 +347,13 @@ def test_run_training_merges_eval_payload_and_saves_best_checkpoint(monkeypatch,
                     "examples_seen": 5,
                     "best_eval_loss": 1.0,
                     "best_eval_step": 4,
+                    "nonfinite_loss_steps": 0,
+                    "nonfinite_event_samples": [],
                 }
             },
         ),
     ]
-    assert payloads[-1]["final_eval"] is True
+    assert "final_eval" not in payloads[-1]
     assert payloads[-1]["qualitative_samples"] == [{"prompt": "p6", "raw_response": "r", "clean_response": "r"}]
     assert payloads[-1]["final_eval_seen"] is True
     train_payloads = [json.loads(line) for line in stdout_lines if '"loss"' in line and '"eval"' not in line]
@@ -318,3 +361,166 @@ def test_run_training_merges_eval_payload_and_saves_best_checkpoint(monkeypatch,
     assert "tokens_seen" in train_payloads[0]
     assert "step_time_sec" in train_payloads[0]
     assert "progress_summary" in train_payloads[0]
+
+
+def test_run_training_skips_nonfinite_losses(monkeypatch, capsys):
+    fake_checkpoint = types.ModuleType("train.checkpoint")
+    fake_checkpoint.CheckpointManager = object
+    fake_distributed = types.ModuleType("train.distributed")
+    fake_distributed.barrier = lambda: None
+    fake_distributed.is_main_process = lambda: True
+
+    monkeypatch.setitem(sys.modules, "train.checkpoint", fake_checkpoint)
+    monkeypatch.setitem(sys.modules, "train.distributed", fake_distributed)
+    sys.modules.pop("train.loop", None)
+
+    train_loop = importlib.import_module("train.loop")
+
+    def fake_require_torch():
+        return _FakeTorch(), None, None
+
+    monkeypatch.setattr(train_loop, "_require_torch", fake_require_torch)
+    monkeypatch.setattr(train_loop, "_to_device", lambda batch, _device: batch)
+    monkeypatch.setattr(train_loop, "barrier", lambda: None)
+    monkeypatch.setattr(train_loop, "is_main_process", lambda: True)
+
+    train_config = TrainConfig(
+        run_name="test-nonfinite",
+        global_batch_size=1,
+        max_steps=1,
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        learning_rate=1e-4,
+        min_learning_rate=1e-5,
+        warmup_steps=1,
+        log_every_steps=1,
+        checkpoint=CheckpointConfig(output_dir="/tmp/webbgpt-test", save_every_steps=1000),
+    )
+    train_loader = [
+        {
+            "attention_mask": _FakeMask(2),
+            "provenance_json": [
+                json.dumps(
+                    {
+                        "shard_index": 0,
+                        "row_index": 0,
+                        "source_names": ["general_clean_prose"],
+                    }
+                )
+            ],
+        },
+        {"attention_mask": _FakeMask(2)},
+    ]
+    checkpoint_manager = _FakeCheckpointManager()
+
+    state = train_loop.run_training(
+        model=_FakeNonFiniteModel(),
+        train_loader=train_loader,
+        train_config=train_config,
+        checkpoint_manager=checkpoint_manager,
+        optimizer=_FakeOptimizer(),
+        scheduler=_FakeScheduler(),
+        save_final_checkpoint=True,
+        checkpoint_metadata={
+            "stage": "pretrain",
+            "artifact_status": "promotable",
+            "promotion_blockers": [],
+            "promotion_eligible": True,
+        },
+    )
+
+    assert state.step == 1
+    assert state.nonfinite_loss_steps == 1
+    assert state.nonfinite_event_samples[0]["step"] == 0
+    assert state.nonfinite_event_samples[0]["examples_in_batch"] == 1
+    assert state.nonfinite_event_samples[0]["provenance"][0]["source_names"] == ["general_clean_prose"]
+    saved_metadata = checkpoint_manager.saved_steps[-1][1]["checkpoint_metadata"]
+    assert saved_metadata["artifact_status"] == "dev_only"
+    assert saved_metadata["promotion_blockers"] == ["nonfinite_loss_seen"]
+    assert saved_metadata["nonfinite_loss_steps"] == 1
+    assert saved_metadata["nonfinite_event_samples"][0]["step"] == 0
+    assert saved_metadata["nonfinite_event_samples"][0]["provenance"][0]["source_names"] == [
+        "general_clean_prose"
+    ]
+    assert "skipping non-finite training loss" in capsys.readouterr().err
+
+
+def test_to_device_preserves_non_tensor_metadata(monkeypatch):
+    fake_checkpoint = types.ModuleType("train.checkpoint")
+    fake_checkpoint.CheckpointManager = object
+    fake_distributed = types.ModuleType("train.distributed")
+    fake_distributed.barrier = lambda: None
+    fake_distributed.is_main_process = lambda: True
+
+    monkeypatch.setitem(sys.modules, "train.checkpoint", fake_checkpoint)
+    monkeypatch.setitem(sys.modules, "train.distributed", fake_distributed)
+    sys.modules.pop("train.loop", None)
+
+    train_loop = importlib.import_module("train.loop")
+
+    def fake_require_torch():
+        return _FakeTorch(), None, None
+
+    monkeypatch.setattr(train_loop, "_require_torch", fake_require_torch)
+
+    batch = {
+        "attention_mask": _FakeMask(2),
+        "provenance_json": ['{"source_names":["general_clean_prose"]}'],
+    }
+
+    moved = train_loop._to_device(batch, "cpu")
+
+    assert moved["provenance_json"] == ['{"source_names":["general_clean_prose"]}']
+
+
+def test_run_training_honors_qualitative_stop_request(monkeypatch, capsys):
+    fake_checkpoint = types.ModuleType("train.checkpoint")
+    fake_checkpoint.CheckpointManager = object
+    fake_distributed = types.ModuleType("train.distributed")
+    fake_distributed.barrier = lambda: None
+    fake_distributed.is_main_process = lambda: True
+
+    monkeypatch.setitem(sys.modules, "train.checkpoint", fake_checkpoint)
+    monkeypatch.setitem(sys.modules, "train.distributed", fake_distributed)
+    sys.modules.pop("train.loop", None)
+
+    train_loop = importlib.import_module("train.loop")
+
+    def fake_require_torch():
+        return _FakeTorch(), None, None
+
+    monkeypatch.setattr(train_loop, "_require_torch", fake_require_torch)
+    monkeypatch.setattr(train_loop, "_to_device", lambda batch, _device: batch)
+    monkeypatch.setattr(train_loop, "barrier", lambda: None)
+    monkeypatch.setattr(train_loop, "is_main_process", lambda: True)
+    monkeypatch.setattr(
+        train_loop,
+        "evaluate_language_model",
+        lambda _model, _loader, _max_batches: {"loss": 1.0, "perplexity": 2.71},
+    )
+
+    state = train_loop.run_training(
+        model=_FakeModel(),
+        train_loader=[{"attention_mask": _FakeMask(2)}],
+        train_config=TrainConfig(
+            run_name="test-stop",
+            global_batch_size=1,
+            max_steps=5,
+            micro_batch_size=1,
+            gradient_accumulation_steps=1,
+            learning_rate=1e-4,
+            min_learning_rate=1e-5,
+            warmup_steps=1,
+            log_every_steps=1,
+            checkpoint=CheckpointConfig(output_dir="/tmp/webbgpt-test-stop", save_every_steps=1000),
+        ),
+        checkpoint_manager=_FakeCheckpointManager(),
+        optimizer=_FakeOptimizer(),
+        scheduler=_FakeScheduler(),
+        val_loader=[{"attention_mask": _FakeMask(2)}],
+        eval_control=train_loop.EvalControl(stage_name="sft", evaluate_at_start=True),
+        eval_payload_callback=lambda *_args, **_kwargs: {"should_stop_training": True},
+    )
+
+    assert state.step == 0
+    assert "qualitative gate requested termination" in capsys.readouterr().err

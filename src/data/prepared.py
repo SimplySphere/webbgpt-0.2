@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from progress import build_progress_snapshot
 from tokenizer import SentencePieceTokenizer, format_chat
 
 
@@ -106,6 +105,16 @@ def _atomic_save_array(path: str | Path, rows: list[list[int]]) -> None:
     tmp_target.replace(target)
 
 
+def _atomic_write_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_target = target.with_name(f"{target.name}.tmp")
+    with tmp_target.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    tmp_target.replace(target)
+
+
 def _save_buffer_rows(path: str | Path, rows: list[list[int]]) -> str | None:
     if not rows:
         return None
@@ -126,6 +135,29 @@ def load_buffer_rows(path: str | Path | None) -> list[list[int]]:
         raise RuntimeError(f"Prepared-data resume buffer is missing: {buffer_path}")
     array = np.load(buffer_path, mmap_mode=None)
     return array.astype("int32").tolist()
+
+
+def save_metadata_rows(path: str | Path, rows: list[dict[str, Any]]) -> str | None:
+    if not rows:
+        return None
+    _atomic_write_jsonl(path, rows)
+    return str(path)
+
+
+def load_metadata_rows(path: str | Path | None) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    metadata_path = Path(path)
+    if not metadata_path.exists():
+        raise RuntimeError(f"Prepared-data metadata sidecar is missing: {metadata_path}")
+    rows: list[dict[str, Any]] = []
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
 
 
 def append_hash_chunk(path: str | Path, hashes: list[str]) -> str | None:
@@ -186,17 +218,59 @@ def stage_has_partial_outputs(manifest_path: str | Path) -> bool:
 
 def validate_resume_state_files(state: dict[str, Any]) -> None:
     for shard in state.get("shards", []):
-        for key in ("path", "input_ids_path", "labels_path", "chosen_input_ids_path", "rejected_input_ids_path"):
+        for key in (
+            "path",
+            "input_ids_path",
+            "labels_path",
+            "chosen_input_ids_path",
+            "rejected_input_ids_path",
+            "metadata_path",
+        ):
             raw_path = shard.get(key)
             if raw_path and not Path(raw_path).exists():
                 raise RuntimeError(f"Prepared-data resume shard is missing: {raw_path}")
-    for key in ("rows_buffer_path", "input_buffer_path", "label_buffer_path", "chosen_buffer_path", "rejected_buffer_path"):
+    for key in (
+        "rows_buffer_path",
+        "input_buffer_path",
+        "label_buffer_path",
+        "chosen_buffer_path",
+        "rejected_buffer_path",
+        "metadata_buffer_path",
+    ):
         raw_path = state.get(key)
         if raw_path and not Path(raw_path).exists():
             raise RuntimeError(f"Prepared-data resume buffer is missing: {raw_path}")
     for raw_path in state.get("dedupe_hash_chunks", []):
         if not Path(raw_path).exists():
             raise RuntimeError(f"Prepared-data dedupe hash chunk is missing: {raw_path}")
+
+
+def prepared_manifest_trust_flags(manifest: dict[str, Any]) -> list[str]:
+    version = str(manifest.get("version", "1.0"))
+    kind = manifest.get("kind")
+    flags: list[str] = []
+    if kind in {"sft", "preference"} and not version.startswith("2."):
+        flags.extend(["behavior_eval_untrusted", "overlap_guard_skipped"])
+    return flags
+
+
+def prepared_manifest_supports_prompt_overlap(manifest: dict[str, Any]) -> bool:
+    return not prepared_manifest_trust_flags(manifest)
+
+
+def derive_artifact_status(
+    blockers: list[str] | set[str],
+    *,
+    base_status: str = "promotable",
+) -> str:
+    blocker_set = {value for value in blockers if value}
+    if base_status == "blocked":
+        return "blocked"
+    if {"lineage_ambiguous", "lm_health_regressed"} & blocker_set:
+        return "blocked"
+    if base_status == "dev_only" or blocker_set:
+        return "dev_only"
+    return "promotable"
 
 
 def _flush_single_array_shard(
@@ -308,19 +382,10 @@ def write_packed_lm_artifacts(
     num_sequences = 0
     num_tokens = 0
     last_heartbeat = time.monotonic()
-    stage_start_time = time.monotonic()
-
-    def _stage_summary() -> str:
-        return build_progress_snapshot(
-            time.monotonic() - stage_start_time,
-            (num_tokens, token_budget),
-        ).summary
-
     budget_text = "unbounded" if token_budget is None else f"{token_budget:,} tokens"
     _progress(
         f"WebbGPT: preparing {stage} packed LM artifacts "
-        f"(sequence_length={sequence_length}, rows_per_shard={rows_per_shard}, token_budget={budget_text}). "
-        f"[{_stage_summary()}]"
+        f"(sequence_length={sequence_length}, rows_per_shard={rows_per_shard}, token_budget={budget_text})."
     )
 
     for sequence in token_sequences:
@@ -338,7 +403,7 @@ def write_packed_lm_artifacts(
             )
             _progress(
                 f"WebbGPT: preparing {stage}: wrote shard {shard_index + 1} "
-                f"({num_sequences:,} sequences, {num_tokens:,} packed tokens so far). [{_stage_summary()}]"
+                f"({num_sequences:,} sequences, {num_tokens:,} packed tokens so far)."
             )
             rows = []
             shard_index += 1
@@ -348,8 +413,7 @@ def write_packed_lm_artifacts(
         if now - last_heartbeat >= 30:
             _progress(
                 f"WebbGPT: preparing {stage} is still running "
-                f"({num_sequences:,} sequences, {num_tokens:,} packed tokens, {len(shards):,} shards written). "
-                f"[{_stage_summary()}]"
+                f"({num_sequences:,} sequences, {num_tokens:,} packed tokens, {len(shards):,} shards written)."
             )
             last_heartbeat = now
 
@@ -364,7 +428,7 @@ def write_packed_lm_artifacts(
         )
         _progress(
             f"WebbGPT: preparing {stage}: wrote final shard {shard_index + 1} "
-            f"({num_sequences:,} sequences, {num_tokens:,} packed tokens total). [{_stage_summary()}]"
+            f"({num_sequences:,} sequences, {num_tokens:,} packed tokens total)."
         )
 
     manifest = {
@@ -384,8 +448,7 @@ def write_packed_lm_artifacts(
     save_prepared_manifest(manifest_path, manifest)
     _progress(
         f"WebbGPT: finished preparing {stage} "
-        f"({num_sequences:,} sequences across {len(shards):,} shards, {num_tokens:,} packed tokens). "
-        f"[{_stage_summary()}]"
+        f"({num_sequences:,} sequences across {len(shards):,} shards, {num_tokens:,} packed tokens)."
     )
     return manifest
 
@@ -413,18 +476,11 @@ def write_sft_artifacts(
     num_examples = 0
     num_label_tokens = 0
     last_heartbeat = time.monotonic()
-    stage_start_time = time.monotonic()
     total_examples = len(examples) if hasattr(examples, "__len__") else None
-
-    def _stage_summary() -> str:
-        return build_progress_snapshot(
-            time.monotonic() - stage_start_time,
-            (num_examples, total_examples),
-        ).summary
 
     _progress(
         f"WebbGPT: preparing {stage} SFT artifacts "
-        f"(sequence_length={sequence_length}, rows_per_shard={rows_per_shard}). [{_stage_summary()}]"
+        f"(sequence_length={sequence_length}, rows_per_shard={rows_per_shard})."
     )
 
     for messages in examples:
@@ -451,7 +507,7 @@ def write_sft_artifacts(
             )
             _progress(
                 f"WebbGPT: preparing {stage}: wrote shard {shard_index + 1} "
-                f"({num_examples:,} examples, {num_label_tokens:,} supervised tokens so far). [{_stage_summary()}]"
+                f"({num_examples:,} examples, {num_label_tokens:,} supervised tokens so far)."
             )
             input_rows = []
             label_rows = []
@@ -460,8 +516,7 @@ def write_sft_artifacts(
         if now - last_heartbeat >= 30:
             _progress(
                 f"WebbGPT: preparing {stage} is still running "
-                f"({num_examples:,} examples, {num_label_tokens:,} supervised tokens, {len(shards):,} shards written). "
-                f"[{_stage_summary()}]"
+                f"({num_examples:,} examples, {num_label_tokens:,} supervised tokens, {len(shards):,} shards written)."
             )
             last_heartbeat = now
 
@@ -483,7 +538,7 @@ def write_sft_artifacts(
         )
         _progress(
             f"WebbGPT: preparing {stage}: wrote final shard {shard_index + 1} "
-            f"({num_examples:,} examples total). [{_stage_summary()}]"
+            f"({num_examples:,} examples total)."
         )
 
     manifest = {
@@ -502,8 +557,7 @@ def write_sft_artifacts(
     save_prepared_manifest(manifest_path, manifest)
     _progress(
         f"WebbGPT: finished preparing {stage} "
-        f"({num_examples:,} examples across {len(shards):,} shards, {num_label_tokens:,} supervised tokens). "
-        f"[{_stage_summary()}]"
+        f"({num_examples:,} examples across {len(shards):,} shards, {num_label_tokens:,} supervised tokens)."
     )
     return manifest
 
@@ -530,18 +584,11 @@ def write_preference_artifacts(
     shard_index = 0
     num_examples = 0
     last_heartbeat = time.monotonic()
-    stage_start_time = time.monotonic()
     total_examples = len(examples) if hasattr(examples, "__len__") else None
-
-    def _stage_summary() -> str:
-        return build_progress_snapshot(
-            time.monotonic() - stage_start_time,
-            (num_examples, total_examples),
-        ).summary
 
     _progress(
         f"WebbGPT: preparing {stage} preference artifacts "
-        f"(sequence_length={sequence_length}, rows_per_shard={rows_per_shard}). [{_stage_summary()}]"
+        f"(sequence_length={sequence_length}, rows_per_shard={rows_per_shard})."
     )
 
     for prompt, chosen, rejected in examples:
@@ -566,7 +613,7 @@ def write_preference_artifacts(
             )
             _progress(
                 f"WebbGPT: preparing {stage}: wrote shard {shard_index + 1} "
-                f"({num_examples:,} preference examples so far). [{_stage_summary()}]"
+                f"({num_examples:,} preference examples so far)."
             )
             chosen_rows = []
             rejected_rows = []
@@ -575,7 +622,7 @@ def write_preference_artifacts(
         if now - last_heartbeat >= 30:
             _progress(
                 f"WebbGPT: preparing {stage} is still running "
-                f"({num_examples:,} preference examples, {len(shards):,} shards written). [{_stage_summary()}]"
+                f"({num_examples:,} preference examples, {len(shards):,} shards written)."
             )
             last_heartbeat = now
 
@@ -597,7 +644,7 @@ def write_preference_artifacts(
         )
         _progress(
             f"WebbGPT: preparing {stage}: wrote final shard {shard_index + 1} "
-            f"({num_examples:,} preference examples total). [{_stage_summary()}]"
+            f"({num_examples:,} preference examples total)."
         )
 
     manifest = {
@@ -615,7 +662,7 @@ def write_preference_artifacts(
     save_prepared_manifest(manifest_path, manifest)
     _progress(
         f"WebbGPT: finished preparing {stage} "
-        f"({num_examples:,} examples across {len(shards):,} shards). [{_stage_summary()}]"
+        f"({num_examples:,} examples across {len(shards):,} shards)."
     )
     return manifest
 
@@ -624,6 +671,8 @@ class _PreparedDatasetBase:
     def __init__(self, manifest_path: str | Path):
         self.manifest_path = str(manifest_path)
         self.manifest = load_prepared_manifest(manifest_path)
+        self.trust_flags = prepared_manifest_trust_flags(self.manifest)
+        self.artifact_status = derive_artifact_status(self.trust_flags)
         self.sequence_length = int(self.manifest["sequence_length"])
         self.pad_token_id = int(self.manifest["pad_token_id"])
         self.shards = list(self.manifest["shards"])
@@ -651,12 +700,19 @@ class PreparedPackedDataset(_PreparedDatasetBase):
         if self.manifest.get("kind") != "packed_lm":
             raise ValueError(f"{manifest_path} is not a packed LM manifest.")
         self._arrays: dict[int, Any] = {}
+        self._metadata_rows: dict[int, list[dict[str, Any]]] = {}
 
     def _array(self, shard_index: int):
         np = _require_numpy()
         if shard_index not in self._arrays:
             self._arrays[shard_index] = np.load(self.shards[shard_index]["path"], mmap_mode="r")
         return self._arrays[shard_index]
+
+    def _metadata(self, shard_index: int) -> list[dict[str, Any]]:
+        if shard_index not in self._metadata_rows:
+            metadata_path = self.shards[shard_index].get("metadata_path")
+            self._metadata_rows[shard_index] = load_metadata_rows(metadata_path)
+        return self._metadata_rows[shard_index]
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         torch = _require_torch()
@@ -665,7 +721,25 @@ class PreparedPackedDataset(_PreparedDatasetBase):
         attention_mask = (sequence != self.pad_token_id).long()
         labels = sequence.clone()
         labels[attention_mask == 0] = -100
-        return {"input_ids": sequence, "attention_mask": attention_mask, "labels": labels}
+        metadata = {}
+        metadata_rows = self._metadata(shard_index)
+        if row_index < len(metadata_rows):
+            metadata = dict(metadata_rows[row_index])
+        return {
+            "input_ids": sequence,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "provenance_json": json.dumps(
+                {
+                    "shard_index": shard_index,
+                    "row_index": row_index,
+                    "source_names": list(metadata.get("source_names", [])),
+                    "contributors": list(metadata.get("contributors", [])),
+                    "packed_document_count": int(metadata.get("packed_document_count", 0)),
+                },
+                sort_keys=True,
+            ),
+        }
 
 
 class PreparedSFTDataset(_PreparedDatasetBase):
@@ -675,6 +749,26 @@ class PreparedSFTDataset(_PreparedDatasetBase):
             raise ValueError(f"{manifest_path} is not an SFT manifest.")
         self._input_arrays: dict[int, Any] = {}
         self._label_arrays: dict[int, Any] = {}
+        self.examples = self._build_examples()
+
+    def _build_examples(self):
+        if not prepared_manifest_supports_prompt_overlap(self.manifest):
+            return None
+        from data.schemas import SFTExample
+
+        examples = []
+        for shard in self.shards:
+            for row in load_metadata_rows(shard.get("metadata_path")):
+                examples.append(
+                    SFTExample(
+                        messages=[],
+                        source=str(row.get("source", "prepared")),
+                        example_id=row.get("example_id"),
+                        split_group_id=row.get("split_group_id"),
+                        metadata=row,
+                    )
+                )
+        return examples
 
     def _input_array(self, shard_index: int):
         np = _require_numpy()
@@ -708,6 +802,28 @@ class PreparedPreferenceDataset(_PreparedDatasetBase):
             raise ValueError(f"{manifest_path} is not a preference manifest.")
         self._chosen_arrays: dict[int, Any] = {}
         self._rejected_arrays: dict[int, Any] = {}
+        self.examples = self._build_examples()
+
+    def _build_examples(self):
+        if not prepared_manifest_supports_prompt_overlap(self.manifest):
+            return None
+        from data.schemas import PreferenceExample
+
+        examples = []
+        for shard in self.shards:
+            for row in load_metadata_rows(shard.get("metadata_path")):
+                examples.append(
+                    PreferenceExample(
+                        prompt=[],
+                        chosen="",
+                        rejected="",
+                        source=str(row.get("source", "prepared")),
+                        example_id=row.get("example_id"),
+                        split_group_id=row.get("split_group_id"),
+                        metadata=row,
+                    )
+                )
+        return examples
 
     def _chosen_array(self, shard_index: int):
         np = _require_numpy()

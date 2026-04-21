@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import math
 import sys
 import time
@@ -11,17 +10,20 @@ from config import DataConfig, ModelConfig, TrainConfig
 from data.dataset import DatasetBuilder
 from model.transformer import CausalTransformer
 from posttrain.eval import (
+    assess_sample_behavior,
     append_eval_history,
     ensure_no_regression_prompt_overlap,
     generate_qualitative_samples,
     update_topk_candidates,
     write_selection_metadata,
 )
+from progress import build_progress_snapshot
 from repro import seed_everything
-from train.checkpoint import CheckpointManager
+from train.checkpoint import CheckpointManager, load_artifact_trust
+from train.console import print_dpo_eval_event, print_dpo_train_event
 from train.distributed import barrier, cleanup_distributed, init_distributed, is_main_process, maybe_wrap_fsdp
-from train.entrypoints import snapshot_configs
-from train.loop import build_dataloader, evaluate_language_model, save_run_metadata
+from train.entrypoints import build_stage_data_fingerprint, snapshot_configs
+from train.loop import build_dataloader, evaluate_language_model, save_run_metadata, save_stage_summary
 from train.optim import build_optimizer, build_scheduler
 
 
@@ -53,6 +55,40 @@ def _apply_dpo_overrides(train_config: TrainConfig) -> TrainConfig:
     if stage_config.dpo_max_steps is not None:
         stage_config.max_steps = stage_config.dpo_max_steps
     return stage_config
+
+
+def _compute_dpo_schedule(
+    *,
+    train_loader_steps: int,
+    stage_config: TrainConfig,
+) -> tuple[int, int, int, int]:
+    steps_per_epoch = max(
+        1,
+        math.ceil(train_loader_steps / max(stage_config.gradient_accumulation_steps, 1)),
+    )
+    effective_max_steps = stage_config.max_steps
+    if stage_config.dpo_max_epochs is not None and stage_config.dpo_max_epochs > 0:
+        effective_max_steps = min(effective_max_steps, steps_per_epoch * stage_config.dpo_max_epochs)
+    eval_interval = max(1, math.ceil(steps_per_epoch / max(stage_config.dpo_evals_per_epoch, 1)))
+    early_eval_step = min(10, eval_interval)
+    return steps_per_epoch, effective_max_steps, eval_interval, early_eval_step
+
+
+def _dpo_scale_blockers(
+    *,
+    train_examples: int,
+    validation_examples: int,
+    stage_config: TrainConfig,
+) -> list[str]:
+    blockers: list[str] = []
+    if stage_config.dpo_min_train_examples > 0 and train_examples < stage_config.dpo_min_train_examples:
+        blockers.append("dpo_train_dataset_too_small")
+    if (
+        stage_config.dpo_min_validation_examples > 0
+        and validation_examples < stage_config.dpo_min_validation_examples
+    ):
+        blockers.append("dpo_validation_dataset_too_small")
+    return blockers
 
 
 def evaluate_dpo_model(policy_model, reference_model, dataloader, max_batches: int, beta: float) -> dict[str, float]:
@@ -98,7 +134,7 @@ def evaluate_dpo_model(policy_model, reference_model, dataloader, max_batches: i
         "val_dpo_loss": float(total_loss.item() / total),
         "preference_accuracy": float(total_correct.item() / total),
         "mean_margin": float(total_margin.item() / total),
-        "examples_evaluated": float(total_examples.item()),
+        "examples_evaluated": int(total_examples.item()),
     }
 
 
@@ -112,6 +148,16 @@ def run_dpo_job(
     torch = _require_torch()
     stage_config = _apply_dpo_overrides(train_config)
     builder = DatasetBuilder(data_config)
+    trust_blockers: list[str] = []
+    parent_trust = load_artifact_trust(reference_checkpoint)
+    if str(parent_trust.get("artifact_status", "promotable")) != "promotable":
+        trust_blockers.append("parent_checkpoint_untrusted")
+        print(
+            "WebbGPT: DPO parent checkpoint is not promotable; continuing only in non-promotable mode "
+            f"(artifact_status={parent_trust.get('artifact_status')}).",
+            file=sys.stderr,
+            flush=True,
+        )
     train_dataset, validation_dataset = builder.build_preference_split(
         seed=stage_config.seed,
         validation_fraction=stage_config.dpo_validation_fraction,
@@ -128,11 +174,61 @@ def run_dpo_job(
             validation_examples=validation_examples,
         )
     elif train_examples is None or validation_examples is None:
+        trust_blockers.extend(["behavior_eval_untrusted", "overlap_guard_skipped"])
         print(
             "WebbGPT: skipping DPO regression-prompt overlap guard because prepared datasets do not expose raw prompt metadata in v1.",
             file=sys.stderr,
             flush=True,
         )
+    preference_validation = builder.validate_preference_datasets(train_dataset, validation_dataset)
+    for blocker in preference_validation["promotion_blockers"]:
+        if blocker not in trust_blockers:
+            trust_blockers.append(blocker)
+    if preference_validation["promotion_blockers"]:
+        print(
+            "WebbGPT: DPO preference metadata is not promotable as-is; continuing only in non-promotable mode "
+            f"(blockers={', '.join(preference_validation['promotion_blockers'])}).",
+            file=sys.stderr,
+            flush=True,
+        )
+    train_dataset_size = len(train_dataset)
+    validation_dataset_size = len(validation_dataset)
+    scale_blockers = _dpo_scale_blockers(
+        train_examples=train_dataset_size,
+        validation_examples=validation_dataset_size,
+        stage_config=stage_config,
+    )
+    if scale_blockers:
+        promotion_blockers = list(dict.fromkeys([*scale_blockers, *trust_blockers]))
+        summary = {
+            "stage": "dpo",
+            "skipped": True,
+            "skip_reason": "insufficient_preference_scale",
+            "preference_scale": {
+                "train_examples": train_dataset_size,
+                "validation_examples": validation_dataset_size,
+                "required_train_examples": stage_config.dpo_min_train_examples,
+                "required_validation_examples": stage_config.dpo_min_validation_examples,
+            },
+            "parent_stage": "sft",
+            "parent_checkpoint_path": reference_checkpoint,
+            "parent_artifact_status": parent_trust.get("artifact_status", "promotable"),
+            "parent_promotion_eligible": bool(parent_trust.get("promotion_eligible", False)),
+            "parent_promotion_blockers": list(parent_trust.get("promotion_blockers", [])),
+            "input_data_fingerprint": build_stage_data_fingerprint(data_config, "preference"),
+            "artifact_status": "dev_only",
+            "promotion_blockers": promotion_blockers,
+            "promotion_eligible": False,
+        }
+        if is_main_process():
+            print(
+                "WebbGPT: skipping DPO because the reviewed preference dataset is too small for a meaningful run: "
+                + ", ".join(scale_blockers),
+                file=sys.stderr,
+                flush=True,
+            )
+            save_stage_summary(stage_config.checkpoint.output_dir, summary)
+        return
     init_distributed()
     try:
         seed_bundle = seed_everything(stage_config.seed)
@@ -167,6 +263,7 @@ def run_dpo_job(
             best_preference_accuracy = train_state.get("best_preference_accuracy", float("-inf"))
             best_mean_margin = train_state.get("best_mean_margin", float("-inf"))
             examples_seen = int(train_state.get("examples_seen", 0))
+            nonfinite_loss_steps = int(train_state.get("nonfinite_loss_steps", 0))
         else:
             checkpoint_manager.load(reference_checkpoint, policy_model, strict=True)
             step = 0
@@ -175,21 +272,7 @@ def run_dpo_job(
             best_preference_accuracy = float("-inf")
             best_mean_margin = float("-inf")
             examples_seen = 0
-
-        if is_main_process():
-            snapshot_configs(model_config, data_config, stage_config)
-            save_run_metadata(
-                stage_config,
-                stage_config.checkpoint.output_dir,
-                extra={
-                    "seed_bundle": seed_bundle,
-                    "validation_policy": {
-                        "require_explicit_validation": stage_config.require_explicit_dpo_validation,
-                        "validation_min_examples": stage_config.dpo_validation_min_examples,
-                        "allow_weak_posttrain_validation": stage_config.allow_weak_posttrain_validation,
-                    },
-                },
-            )
+            nonfinite_loss_steps = 0
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         policy_model = policy_model.to(device)
@@ -206,12 +289,34 @@ def run_dpo_job(
                 batch_size=stage_config.micro_batch_size,
                 shuffle=False,
             )
-        steps_per_epoch = max(
-            1,
-            math.ceil(len(train_loader) / max(stage_config.gradient_accumulation_steps, 1)),
+        configured_max_steps = stage_config.max_steps
+        steps_per_epoch, effective_max_steps, eval_interval, early_eval_step = _compute_dpo_schedule(
+            train_loader_steps=len(train_loader),
+            stage_config=stage_config,
         )
-        eval_interval = max(1, math.ceil(steps_per_epoch / max(stage_config.dpo_evals_per_epoch, 1)))
-        early_eval_step = min(10, eval_interval)
+        stage_config.max_steps = effective_max_steps
+        if is_main_process():
+            snapshot_configs(model_config, data_config, stage_config)
+            save_run_metadata(
+                stage_config,
+                stage_config.checkpoint.output_dir,
+                extra={
+                    "seed_bundle": seed_bundle,
+                    "dpo_schedule": {
+                        "configured_max_steps": configured_max_steps,
+                        "effective_max_steps": effective_max_steps,
+                        "steps_per_epoch": steps_per_epoch,
+                        "max_epochs": stage_config.dpo_max_epochs,
+                        "eval_interval_steps": eval_interval,
+                        "early_eval_step": early_eval_step,
+                    },
+                    "validation_policy": {
+                        "require_explicit_validation": stage_config.require_explicit_dpo_validation,
+                        "validation_min_examples": stage_config.dpo_validation_min_examples,
+                        "allow_weak_posttrain_validation": stage_config.allow_weak_posttrain_validation,
+                    },
+                },
+            )
         eval_history_path = Path(stage_config.checkpoint.output_dir) / "eval_history.jsonl"
         autocast_context = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -221,11 +326,52 @@ def run_dpo_job(
         last_saved_step = -1
         last_eval_step = -1
         last_lm_health_loss = math.nan
+        initial_lm_health_loss = math.nan
         no_improvement_evals = 0
         lm_health_worsening_evals = 0
         should_stop_training = False
         optimizer.zero_grad(set_to_none=True)
         micro_step = 0
+        stage_start_time = time.perf_counter()
+
+        def _current_checkpoint_metadata() -> dict[str, object]:
+            blockers = list(trust_blockers)
+            if nonfinite_loss_steps > 0 and "nonfinite_loss_seen" not in blockers:
+                blockers.append("nonfinite_loss_seen")
+            artifact_status = "dev_only" if blockers else "promotable"
+            return {
+                "stage": "dpo",
+                "parent_stage": "sft",
+                "parent_checkpoint_path": stage_config.checkpoint.resume_from or reference_checkpoint,
+                "input_data_fingerprint": build_stage_data_fingerprint(data_config, "preference"),
+                "artifact_status": artifact_status,
+                "promotion_blockers": blockers,
+                "promotion_eligible": artifact_status == "promotable",
+                "nonfinite_loss_steps": nonfinite_loss_steps,
+            }
+
+        def _checkpoint_extra_state() -> dict[str, object]:
+            return {
+                "dpo": {"beta": beta},
+                "train_state": {
+                    "best_eval_loss": best_eval_loss,
+                    "best_eval_step": best_eval_step,
+                    "best_preference_accuracy": best_preference_accuracy,
+                    "best_mean_margin": best_mean_margin,
+                    "examples_seen": examples_seen,
+                    "nonfinite_loss_steps": nonfinite_loss_steps,
+                },
+                "checkpoint_metadata": _current_checkpoint_metadata(),
+            }
+
+        def _stage_progress(completed_steps: int | None = None):
+            return build_progress_snapshot(
+                time.perf_counter() - stage_start_time,
+                (
+                    step if completed_steps is None else completed_steps,
+                    stage_config.max_steps,
+                ),
+            )
 
         def _approx_epoch(current_step: int, *, initial_eval: bool, final_eval: bool) -> float:
             if initial_eval:
@@ -256,6 +402,7 @@ def run_dpo_job(
             nonlocal best_mean_margin
             nonlocal last_eval_step
             nonlocal last_lm_health_loss
+            nonlocal initial_lm_health_loss
             nonlocal no_improvement_evals
             nonlocal lm_health_worsening_evals
             nonlocal should_stop_training
@@ -267,17 +414,21 @@ def run_dpo_job(
                 beta=beta,
             )
             payload: dict[str, object] = {"step": current_step, "eval": metrics}
-            if final_eval:
-                payload["final_eval"] = True
             if initial_eval:
                 payload["initial_eval"] = True
             payload["approx_epoch"] = _approx_epoch(
                 current_step, initial_eval=initial_eval, final_eval=final_eval
             )
-            payload["train_dataset_size"] = len(train_dataset)
-            payload["validation_dataset_size"] = len(validation_dataset)
+            payload["train_dataset_size"] = train_dataset_size
+            payload["validation_dataset_size"] = validation_dataset_size
             payload["train_examples_seen"] = examples_seen
             payload["validation_examples_evaluated"] = int(metrics["examples_evaluated"])
+            progress = _stage_progress(completed_steps=min(max(current_step, 0), stage_config.max_steps))
+            payload["progress_percent"] = (
+                None if progress.fraction_complete is None else round(progress.fraction_complete * 100.0, 2)
+            )
+            payload["stage_elapsed_sec"] = round(progress.elapsed_seconds, 2)
+            payload["stage_eta_sec"] = None if progress.remaining_seconds is None else round(progress.remaining_seconds, 2)
             payload["qualitative_samples"] = generate_qualitative_samples(
                 policy_model,
                 data_config.tokenizer_path,
@@ -286,6 +437,12 @@ def run_dpo_job(
                 temperature=0.0,
                 top_p=1.0,
             )
+            sample_behavior = assess_sample_behavior(payload["qualitative_samples"])
+            payload["sample_behavior"] = sample_behavior
+            if sample_behavior["collapse_detected"]:
+                for blocker in sample_behavior["promotion_blockers"]:
+                    if blocker not in trust_blockers:
+                        trust_blockers.append(blocker)
             lm_health_metrics = None
             if lm_health_loader is not None:
                 lm_health_metrics = evaluate_language_model(
@@ -320,10 +477,12 @@ def run_dpo_job(
             elif lm_health_metrics is not None:
                 lm_health_worsening_evals = 0
             if lm_health_metrics is not None:
+                if math.isnan(initial_lm_health_loss):
+                    initial_lm_health_loss = float(lm_health_metrics["loss"])
                 last_lm_health_loss = float(lm_health_metrics["loss"])
             payload["best_step_so_far"] = best_eval_step
             if is_main_process():
-                print(json.dumps(payload))
+                print_dpo_eval_event(payload)
                 append_eval_history(eval_history_path, payload)
             if improved:
                 barrier()
@@ -334,16 +493,7 @@ def run_dpo_job(
                         model=policy_model,
                         optimizer=optimizer,
                         scheduler=scheduler,
-                        extra_state={
-                            "dpo": {"beta": beta},
-                            "train_state": {
-                                "best_eval_loss": best_eval_loss,
-                                "best_eval_step": best_eval_step,
-                                "best_preference_accuracy": best_preference_accuracy,
-                                "best_mean_margin": best_mean_margin,
-                                "examples_seen": examples_seen,
-                            },
-                        },
+                        extra_state=_checkpoint_extra_state(),
                     )
                     selection_payload = {
                         "stage": "dpo",
@@ -381,16 +531,7 @@ def run_dpo_job(
                         model=policy_model,
                         optimizer=optimizer,
                         scheduler=scheduler,
-                        extra_state={
-                            "dpo": {"beta": beta},
-                            "train_state": {
-                                "best_eval_loss": best_eval_loss,
-                                "best_eval_step": best_eval_step,
-                                "best_preference_accuracy": best_preference_accuracy,
-                                "best_mean_margin": best_mean_margin,
-                                "examples_seen": examples_seen,
-                            },
-                        },
+                        extra_state=_checkpoint_extra_state(),
                     )
                     write_selection_metadata(candidate_path, selection_payload)
                     update_topk_candidates(
@@ -451,6 +592,18 @@ def run_dpo_job(
                         )
                     logits = beta * ((policy_chosen - policy_rejected) - (ref_chosen - ref_rejected))
                     loss = -torch.nn.functional.logsigmoid(logits).mean()
+                loss_value = float(loss.item())
+                if not math.isfinite(loss_value):
+                    nonfinite_loss_steps += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    if is_main_process():
+                        print(
+                            f"WebbGPT: skipping non-finite DPO loss at step {step} "
+                            f"(count={nonfinite_loss_steps}).",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    continue
 
                 batch_examples = int(chosen_input_ids.size(0))
                 examples_seen += batch_examples
@@ -467,16 +620,24 @@ def run_dpo_job(
                 optimizer.zero_grad(set_to_none=True)
 
                 if step % stage_config.log_every_steps == 0 and is_main_process():
-                    print(
-                        json.dumps(
-                            {
-                                "step": step,
-                                "loss": float(loss.item()),
-                                "lr": float(scheduler.get_last_lr()[0]),
-                                "train_examples_seen": examples_seen,
-                                "step_time_sec": time.perf_counter() - start_time,
-                            }
-                        )
+                    progress = _stage_progress(completed_steps=min(step + 1, stage_config.max_steps))
+                    print_dpo_train_event(
+                        {
+                            "step": step,
+                            "loss": float(loss.item()),
+                            "lr": float(scheduler.get_last_lr()[0]),
+                            "train_examples_seen": examples_seen,
+                            "progress_percent": (
+                                None
+                                if progress.fraction_complete is None
+                                else round(progress.fraction_complete * 100.0, 2)
+                            ),
+                            "stage_elapsed_sec": round(progress.elapsed_seconds, 2),
+                            "stage_eta_sec": (
+                                None if progress.remaining_seconds is None else round(progress.remaining_seconds, 2)
+                            ),
+                            "step_time_sec": round(time.perf_counter() - start_time, 2),
+                        }
                     )
                 if val_loader is not None and (
                     (step > 0 and step == early_eval_step)
@@ -494,16 +655,7 @@ def run_dpo_job(
                             model=policy_model,
                             optimizer=optimizer,
                             scheduler=scheduler,
-                            extra_state={
-                                "dpo": {"beta": beta},
-                                "train_state": {
-                                    "best_eval_loss": best_eval_loss,
-                                    "best_eval_step": best_eval_step,
-                                    "best_preference_accuracy": best_preference_accuracy,
-                                    "best_mean_margin": best_mean_margin,
-                                    "examples_seen": examples_seen,
-                                },
-                            },
+                            extra_state=_checkpoint_extra_state(),
                         )
                         last_saved_step = step
                 step += 1
@@ -515,15 +667,37 @@ def run_dpo_job(
                 model=policy_model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                extra_state={
-                    "dpo": {"beta": beta},
-                    "train_state": {
-                        "best_eval_loss": best_eval_loss,
-                        "best_eval_step": best_eval_step,
-                        "best_preference_accuracy": best_preference_accuracy,
-                        "best_mean_margin": best_mean_margin,
-                        "examples_seen": examples_seen,
-                    },
+                extra_state=_checkpoint_extra_state(),
+            )
+        if is_main_process():
+            blockers = list(trust_blockers)
+            if nonfinite_loss_steps > 0:
+                blockers.append("nonfinite_loss_seen")
+            if (
+                not math.isnan(initial_lm_health_loss)
+                and not math.isnan(last_lm_health_loss)
+                and last_lm_health_loss > initial_lm_health_loss
+            ):
+                blockers.append("lm_health_regressed")
+            artifact_status = "blocked" if "lm_health_regressed" in blockers else ("dev_only" if blockers else "promotable")
+            save_stage_summary(
+                stage_config.checkpoint.output_dir,
+                {
+                    "stage": "dpo",
+                    "parent_stage": "sft",
+                    "parent_checkpoint_path": stage_config.checkpoint.resume_from or reference_checkpoint,
+                    "input_data_fingerprint": build_stage_data_fingerprint(data_config, "preference"),
+                    "artifact_status": artifact_status,
+                    "promotion_blockers": blockers,
+                    "promotion_eligible": artifact_status == "promotable",
+                    "best_eval_loss": None if best_eval_loss == float("inf") else best_eval_loss,
+                    "best_eval_step": None if best_eval_step < 0 else best_eval_step,
+                    "best_preference_accuracy": None if best_preference_accuracy == float("-inf") else best_preference_accuracy,
+                    "best_mean_margin": None if best_mean_margin == float("-inf") else best_mean_margin,
+                    "examples_seen": examples_seen,
+                    "nonfinite_loss_steps": nonfinite_loss_steps,
+                    "lm_health_initial_loss": None if math.isnan(initial_lm_health_loss) else initial_lm_health_loss,
+                    "lm_health_final_loss": None if math.isnan(last_lm_health_loss) else last_lm_health_loss,
                 },
             )
     finally:

@@ -1,0 +1,137 @@
+{
+  "institutions": [
+    {
+      "id": "webb",
+      "name": "The Webb Schools",
+      "website": "https://www.webb.org"
+    }
+  ],
+  "terms": [
+    {
+      "id": "webb-2026-27",
+      "institution_id": "webb",
+      "code": "2026-27",
+      "title": "2026-27 Course Catalog",
+      "starts_on": "2026-08-01",
+      "ends_on": "2027-06-30"
+    }
+  ],
+  "programs": [
+    {
+      "id": "webb-course-catalog",
+      "institution_id": "webb",
+      "code": "WEBB-CATALOG",
+      "title": "Webb Course Catalog",
+      "description": "Webb's course catalog describes graduation requirements, course planning, departments, course offerings, prerequisites, and workload expectations.",
+      "requirements": {
+        "minimum_credits": 20,
+        "source": "data/webb/mock/course_catalog_2025_26.html"
+      }
+    }
+  ],
+  "courses": [
+    {
+      "id": "webb-advst-chemistry",
+      "institution_id": "webb",
+      "program_id": "webb-course-catalog",
+      "code": "AdvSt Chemistry",
+      "title": "AdvSt Chemistry",
+      "description": "A project-based advanced chemistry course built around an in-depth study of general chemistry and a significant laboratory component. The catalog lists B+ or better in Integrated Math II or Honors Integrated Math II, with Precalculus concurrent, as the prerequisite.",
+      "credits": 1.0,
+      "prerequisites": {
+        "text": "B+ or better in Integrated Math II or Honors Integrated Math II; Precalculus concurrent"
+      },
+      "attributes": {
+        "department": "Science",
+        "workload": "1.25",
+        "source": "data/webb/mock/course_catalog_2025_26.html"
+      }
+    },
+    {
+      "id": "webb-technology-innovation-seminar-i",
+      "institution_id": "webb",
+      "program_id": "webb-course-catalog",
+      "code": "Technology and Innovation Seminar I",
+      "title": "Technology and Innovation Seminar I",
+      "description": "A Webb mathematics and computer science course listed with a concurrent level-appropriate math course prerequisite and workload 1.",
+      "credits": 1.0,
+      "prerequisites": {
+        "text": "Concurrent level-appropriate math course"
+      },
+      "attributes": {
+        "department": "Mathematics & Computer Science",
+        "workload": "1",
+        "source": "data/webb/mock/course_catalog_2025_26.html"
+      }
+    },
+    {
+      "id": "webb-hon-museum-research",
+      "institution_id": "webb",
+      "program_id": "webb-course-catalog",
+      "code": "Hon Museum Research",
+      "title": "Hon Museum Research",
+      "description": "This course builds on skills learned in Honors Paleontology and focuses on scientific study of fossils, research communication, fossil data interpretation, and formal scientific reporting using Alf Museum collections.",
+      "credits": 1.0,
+      "prerequisites": {
+        "text": "Hon Paleontology or concurrent second science"
+      },
+      "attributes": {
+        "department": "Science",
+        "workload": "1",
+        "source": "data/webb/mock/science_2026_27.html"
+      }
+    },
+    {
+      "id": "webb-hmc-advanced-cs",
+      "institution_id": "webb",
+      "program_id": "webb-course-catalog",
+      "code": "HMC / Webb Advanced Courses in Computer Science",
+      "title": "HMC / Webb Advanced Courses in Computer Science",
+      "description": "An advanced mathematics and computer science offering in the Webb catalog. The catalog lists concurrent level-appropriate math as the prerequisite and workload 1.25.",
+      "credits": 1.0,
+      "prerequisites": {
+        "text": "Concurrent level-appropriate math course"
+      },
+      "attributes": {
+        "department": "Mathematics & Computer Science",
+        "workload": "1.25",
+        "source": "data/webb/mock/course_catalog_2025_26.html"
+      }
+    },
+    {
+      "id": "webb-advst-paleontology",
+      "institution_id": "webb",
+      "program_id": "webb-course-catalog",
+      "code": "AdvSt Paleontology",
+      "title": "AdvSt Paleontology",
+      "description": "An advanced original-research course on fossils in the Alf Museum collection. Students review paleontological literature, collect and analyze original data, write formal manuscripts, and present their work.",
+      "credits": 1.0,
+      "prerequisites": {
+        "text": "Hon Museum Research or concurrent second science"
+      },
+      "attributes": {
+        "department": "Science",
+        "workload": "1.25",
+        "source": "data/webb/mock/science_2026_27.html"
+      }
+    },
+    {
+      "id": "webb-advanced-art",
+      "institution_id": "webb",
+      "program_id": "webb-course-catalog",
+      "code": "Advanced Art",
+      "title": "Advanced Art",
+      "description": "A Webb fine arts course in the visual arts sequence. The catalog lists Art AB as the prerequisite and workload 1.",
+      "credits": 1.0,
+      "prerequisites": {
+        "text": "Art AB"
+      },
+      "attributes": {
+        "department": "Fine Arts",
+        "workload": "1",
+        "source": "data/webb/mock/course_catalog_2025_26.html"
+      }
+    }
+  ],
+  "sections": []
+}

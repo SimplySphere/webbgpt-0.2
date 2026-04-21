@@ -7,6 +7,7 @@ from pathlib import Path
 from config import ModelConfig
 from generation import default_stop_strings
 from provenance import checkpoint_manifest, tokenizer_manifest
+from train.checkpoint import load_artifact_trust
 
 
 def _require_torch():
@@ -183,4 +184,11 @@ def export_hf_checkpoint(model_config: ModelConfig, checkpoint_path: str, output
             },
             indent=2,
         )
+    )
+    for metadata_name in ("checkpoint_metadata.json", "stage_summary.json"):
+        source_path = Path(checkpoint_path) / metadata_name
+        if source_path.exists():
+            shutil.copy2(source_path, output / metadata_name)
+    (output / "artifact_trust.json").write_text(
+        json.dumps(load_artifact_trust(checkpoint_path), indent=2)
     )

@@ -1,6 +1,6 @@
-{"messages": [{"role": "user", "content": "I missed class and need a plan for catching up this week."}], "tags": ["general", "supportive"]}
-{"messages": [{"role": "user", "content": "What should you ask before recommending between two majors?"}], "tags": ["domain", "advising"]}
-{"messages": [{"role": "user", "content": "If the catalog does not list ECON 404, how should you respond?"}], "tags": ["domain", "grounded"]}
-{"messages": [{"role": "user", "content": "Explain recursion using a simple everyday analogy."}], "tags": ["general", "reasoning"]}
-{"messages": [{"role": "user", "content": "How would you explain the difference between a prerequisite and a recommendation to a new student?"}], "tags": ["domain", "definition"]}
-{"messages": [{"role": "user", "content": "I am overwhelmed by course planning. How should an assistant respond?"}], "tags": ["off_distribution", "supportive"]}
+{"messages": [{"role": "user", "content": "I missed class and need a plan for catching up this week."}], "tags": ["general", "supportive"], "expected_mode": "direct"}
+{"messages": [{"role": "user", "content": "Before comparing two majors for a student, what background questions matter most?"}], "tags": ["domain", "advising"], "expected_mode": "clarify"}
+{"messages": [{"role": "user", "content": "If the Webb catalog does not list Honors Robotics Lab, how should you respond?"}], "tags": ["domain", "grounded"], "expected_mode": "abstain", "allowed_source_labels": ["course catalog"], "forbidden_source_labels": ["handbook"]}
+{"messages": [{"role": "user", "content": "Explain recursion using a simple everyday analogy."}], "tags": ["general", "reasoning"], "expected_mode": "direct"}
+{"messages": [{"role": "user", "content": "How would you explain the difference between a prerequisite and a recommendation to a new student?"}], "tags": ["domain", "definition"], "expected_mode": "direct"}
+{"messages": [{"role": "user", "content": "I am overwhelmed by course planning. How should an assistant respond?"}], "tags": ["off_distribution", "supportive"], "expected_mode": "direct"}

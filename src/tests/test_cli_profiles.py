@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -7,17 +8,32 @@ import pytest
 
 from cli import (
     _apply_remote_run_preset,
+    _artifact_trust,
     _can_reuse_tokenizer_corpus,
     _can_reuse_tokenizer_model,
+    _prepare_manual_pretrain_train_config,
+    _prepare_manual_stage_data_config,
     _prepare_manual_continue_train_config,
     _prepare_manual_dpo_train_config,
     _prepare_manual_sft_train_config,
+    _shared_config_pack_profile,
+    _require_trusted_artifact,
     _profile_config_paths,
     _stage_train_config,
     _validate_profile_hardware_fit,
     _validate_remote_profile,
 )
-from config import DataConfig, DataSourceConfig, EvalConfig, GroundingConfig, ModelConfig, ServeConfig, TokenizerConfig, TrainConfig
+from config import (
+    CheckpointConfig,
+    DataConfig,
+    DataSourceConfig,
+    EvalConfig,
+    GroundingConfig,
+    ModelConfig,
+    ServeConfig,
+    TokenizerConfig,
+    TrainConfig,
+)
 
 
 def _valid_remote_data_config() -> DataConfig:
@@ -102,6 +118,190 @@ def test_profile_config_paths_cover_local_mvp_and_remote_7b():
     assert remote["tokenizer"] == base / "tokenizer-7b.json"
 
 
+@pytest.mark.parametrize(
+    ("command", "extra_args"),
+    [
+        ("train-pretrain", []),
+        ("train-continue", []),
+        ("train-sft", []),
+        ("train-dpo", ["--reference-checkpoint", "artifacts/runs/local-mvp/checkpoints/sft/best"]),
+    ],
+)
+def test_manual_train_commands_accept_force_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    extra_args: list[str],
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "webbgpt",
+            command,
+            "--model-config",
+            "sample-configs/model-local-mvp.json",
+            "--data-config",
+            "sample-configs/data-local-mvp.json",
+            "--train-config",
+            "sample-configs/train-local-mvp.json",
+            *extra_args,
+            "--force-rebuild",
+        ],
+    )
+
+    args = cli._parse_args()
+
+    assert args.force_rebuild is True
+
+
+def test_prepare_manual_stage_data_config_propagates_force_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "_shared_config_pack_profile", lambda *_args: "local-mvp")
+    monkeypatch.setattr(cli, "_uses_profile_runtime_layout", lambda _profile: True)
+    monkeypatch.setattr(
+        cli,
+        "_manual_profile_prepared_manifest_keys",
+        lambda *_args, **_kwargs: ["pretrain", "validation"],
+    )
+
+    def fake_materialize(
+        profile: str,
+        data_config: DataConfig,
+        manifest_keys: list[str],
+        *,
+        force_rebuild: bool = False,
+    ) -> dict[str, dict[str, object]]:
+        captured["profile"] = profile
+        captured["manifest_keys"] = list(manifest_keys)
+        captured["force_rebuild"] = force_rebuild
+        return {
+            "pretrain": {"path": "artifacts/runs/local-mvp/prepared/pretrain.json", "manifest": {}},
+            "validation": {"path": "artifacts/runs/local-mvp/prepared/validation.json", "manifest": {}},
+        }
+
+    monkeypatch.setattr(cli, "_materialize_profile_prepared_manifests", fake_materialize)
+
+    prepared_config = cli._prepare_manual_stage_data_config(
+        "sample-configs/model-local-mvp.json",
+        "sample-configs/data-local-mvp.json",
+        "sample-configs/train-local-mvp.json",
+        DataConfig(),
+        TrainConfig(),
+        stage_name="pretrain",
+        force_rebuild=True,
+    )
+
+    assert captured == {
+        "profile": "local-mvp",
+        "manifest_keys": ["pretrain", "validation"],
+        "force_rebuild": True,
+    }
+    assert prepared_config.pretrain_sources[0].format == "prepared"
+    assert prepared_config.validation_sources[0].format == "prepared"
+
+
+def test_shared_config_pack_profile_accepts_local_mvp_alternate_train_config_name():
+    assert (
+        _shared_config_pack_profile(
+            "sample-configs/model-local-mvp.json",
+            "sample-configs/data-local-mvp.json",
+            "sample-configs/train-local-mvp-sft-from-pretrain.json",
+        )
+        == "local-mvp"
+    )
+
+
+def test_prepare_manual_stage_data_config_uses_profile_manifests_for_local_mvp_alt_train_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+    data_config = DataConfig(
+        sft_sources=[DataSourceConfig(name="train", path="data/local/sft.jsonl", format="jsonl")],
+        sft_validation_sources=[
+            DataSourceConfig(name="validation", path="data/local/sft_validation.jsonl", format="jsonl")
+        ],
+    )
+
+    def fake_materialize(
+        profile: str,
+        data_config: DataConfig,
+        manifest_keys: list[str],
+        *,
+        force_rebuild: bool = False,
+    ) -> dict[str, dict[str, object]]:
+        captured["profile"] = profile
+        captured["manifest_keys"] = list(manifest_keys)
+        captured["force_rebuild"] = force_rebuild
+        return {
+            "sft": {"path": "artifacts/runs/local-mvp/prepared/sft.json", "manifest": {}},
+            "sft_validation": {
+                "path": "artifacts/runs/local-mvp/prepared/sft_validation.json",
+                "manifest": {},
+            },
+        }
+
+    monkeypatch.setattr(cli, "_materialize_profile_prepared_manifests", fake_materialize)
+
+    prepared_config = cli._prepare_manual_stage_data_config(
+        "sample-configs/model-local-mvp.json",
+        "sample-configs/data-local-mvp.json",
+        "sample-configs/train-local-mvp-sft-from-pretrain.json",
+        data_config,
+        TrainConfig(),
+        stage_name="sft",
+        force_rebuild=True,
+    )
+
+    assert captured == {
+        "profile": "local-mvp",
+        "manifest_keys": ["sft", "sft_validation"],
+        "force_rebuild": True,
+    }
+    assert prepared_config.sft_sources[0].format == "prepared"
+    assert prepared_config.sft_validation_sources[0].format == "prepared"
+
+
+def test_require_trusted_artifact_rejects_dev_only_without_force(tmp_path: Path):
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    (artifact_dir / "stage_summary.json").write_text(
+        json.dumps(
+            {
+                "artifact_status": "dev_only",
+                "promotion_blockers": ["generic_refusal_collapse"],
+                "promotion_eligible": False,
+            }
+        )
+    )
+
+    trust = _artifact_trust(artifact_dir)
+    assert trust["artifact_status"] == "dev_only"
+    with pytest.raises(RuntimeError, match="Refusing to export"):
+        _require_trusted_artifact(artifact_dir, action="export")
+
+
+def test_require_trusted_artifact_allows_force_for_debug(tmp_path: Path, capsys):
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    (artifact_dir / "stage_summary.json").write_text(
+        json.dumps(
+            {
+                "artifact_status": "blocked",
+                "promotion_blockers": ["lm_health_regressed"],
+                "promotion_eligible": False,
+            }
+        )
+    )
+
+    trust = _require_trusted_artifact(artifact_dir, action="serve", force_untrusted=True)
+
+    assert trust["artifact_status"] == "blocked"
+    assert "forcing serve" in capsys.readouterr().err.lower()
+
+
 def test_validate_remote_profile_rejects_placeholder_data():
     data_config = _valid_remote_data_config()
     data_config.sft_sources[0] = DataSourceConfig(
@@ -180,6 +380,54 @@ def test_stage_train_config_applies_continue_overrides():
     assert stage_config.max_steps == 250
 
 
+def test_prepare_manual_pretrain_train_config_uses_local_mvp_stage_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    stale_pretrain_dir = tmp_path / "artifacts/runs/local-mvp/checkpoints/pretrain/step-00001000"
+    stale_pretrain_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli.time, "strftime", lambda _: "20260324-115900")
+
+    stage_config = _prepare_manual_pretrain_train_config(
+        "sample-configs/model-local-mvp.json",
+        "sample-configs/data-local-mvp.json",
+        "sample-configs/train-local-mvp.json",
+        TrainConfig(
+            run_name="webbgpt-local-mvp",
+            checkpoint=CheckpointConfig(output_dir="artifacts/checkpoints-local-mvp"),
+        ),
+    )
+
+    assert stage_config.checkpoint.output_dir == "artifacts/runs/local-mvp/checkpoints/pretrain"
+    assert (
+        tmp_path / "artifacts/runs/local-mvp/checkpoints/pretrain.stale-20260324-115900/step-00001000"
+    ).exists()
+
+
+def test_prepare_manual_pretrain_train_config_uses_remote_3b_stage_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    stale_pretrain_dir = tmp_path / "artifacts/runs/remote-3b/checkpoints/pretrain/step-00025000"
+    stale_pretrain_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli.time, "strftime", lambda _: "20260324-115930")
+
+    stage_config = _prepare_manual_pretrain_train_config(
+        "sample-configs/model-3b.json",
+        "sample-configs/data-3b.json",
+        "sample-configs/train-3b.json",
+        TrainConfig(
+            run_name="webbgpt-3b",
+            checkpoint=CheckpointConfig(output_dir="artifacts/checkpoints"),
+        ),
+    )
+
+    assert stage_config.checkpoint.output_dir == "artifacts/runs/remote-3b/checkpoints/pretrain"
+    assert (
+        tmp_path / "artifacts/runs/remote-3b/checkpoints/pretrain.stale-20260324-115930/step-00025000"
+    ).exists()
+
+
 def test_prepare_manual_continue_train_config_uses_latest_local_mvp_pretrain(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -201,6 +449,68 @@ def test_prepare_manual_continue_train_config_uses_latest_local_mvp_pretrain(
     assert stage_config.checkpoint.output_dir == "artifacts/runs/local-mvp/checkpoints/continue"
     assert (
         tmp_path / "artifacts/runs/local-mvp/checkpoints/continue.stale-20260324-120000/step-00001050"
+    ).exists()
+
+
+def test_prepare_manual_continue_train_config_requires_explicit_lineage_for_legacy_local_mvp_pretrain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    legacy_pretrain_dir = tmp_path / "artifacts/checkpoints-local-mvp/step-00019975"
+    legacy_pretrain_dir.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(RuntimeError, match="explicit lineage"):
+        _prepare_manual_continue_train_config(
+            "sample-configs/model-local-mvp.json",
+            "sample-configs/data-local-mvp.json",
+            "sample-configs/train-local-mvp.json",
+            TrainConfig(
+                run_name="webbgpt-local-mvp",
+                checkpoint=CheckpointConfig(output_dir="artifacts/runs/local-mvp/checkpoints/pretrain"),
+            ),
+        )
+
+
+def test_prepare_manual_continue_train_config_requires_explicit_lineage_for_legacy_remote_3b_pretrain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    legacy_pretrain_dir = tmp_path / "artifacts/checkpoints/step-00050000"
+    legacy_pretrain_dir.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(RuntimeError, match="explicit lineage"):
+        _prepare_manual_continue_train_config(
+            "sample-configs/model-3b.json",
+            "sample-configs/data-3b.json",
+            "sample-configs/train-3b.json",
+            TrainConfig(
+                run_name="webbgpt-3b",
+                checkpoint=CheckpointConfig(output_dir="artifacts/runs/remote-3b/checkpoints/pretrain"),
+            ),
+        )
+
+
+def test_prepare_manual_pretrain_train_config_uses_remote_7b_stage_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    stale_pretrain_dir = tmp_path / "artifacts/runs/remote-7b/checkpoints/pretrain/step-00060000"
+    stale_pretrain_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli.time, "strftime", lambda _: "20260324-115945")
+
+    stage_config = _prepare_manual_pretrain_train_config(
+        "sample-configs/model-7b.json",
+        "sample-configs/data-7b.json",
+        "sample-configs/train-7b.json",
+        TrainConfig(
+            run_name="webbgpt-7b",
+            checkpoint=CheckpointConfig(output_dir="artifacts/checkpoints-7b"),
+        ),
+    )
+
+    assert stage_config.checkpoint.output_dir == "artifacts/runs/remote-7b/checkpoints/pretrain"
+    assert (
+        tmp_path / "artifacts/runs/remote-7b/checkpoints/pretrain.stale-20260324-115945/step-00060000"
     ).exists()
 
 
@@ -229,12 +539,106 @@ def test_prepare_manual_sft_train_config_uses_latest_local_mvp_continue(
     ).exists()
 
 
+def test_prepare_manual_sft_train_config_rotates_existing_history_for_alt_local_mvp_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    pretrain_dir = tmp_path / "artifacts/runs/local-mvp/checkpoints/pretrain/step-00019975"
+    pretrain_dir.mkdir(parents=True, exist_ok=True)
+    continue_dir = tmp_path / "artifacts/runs/local-mvp/checkpoints/continue"
+    continue_dir.mkdir(parents=True, exist_ok=True)
+    (continue_dir / "stage_summary.json").write_text(
+        json.dumps(
+            {
+                "stage": "continue",
+                "skipped": True,
+                "skip_reason": "continue_readiness_failed",
+                "artifact_status": "dev_only",
+                "promotion_blockers": ["continue_readiness_failed"],
+                "promotion_eligible": False,
+            }
+        )
+    )
+    stage_dir = tmp_path / "artifacts/runs/local-mvp/checkpoints/sft"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    (stage_dir / "eval_history.jsonl").write_text("{}\n")
+    monkeypatch.setattr(cli.time, "strftime", lambda _: "20260324-120130")
+
+    stage_config = _prepare_manual_sft_train_config(
+        "sample-configs/model-local-mvp.json",
+        "sample-configs/data-local-mvp.json",
+        "sample-configs/train-local-mvp-sft-from-pretrain.json",
+        TrainConfig(
+            run_name="webbgpt-local-mvp",
+            sft_max_steps=3_000,
+            checkpoint=CheckpointConfig(
+                initialize_from="artifacts/runs/local-mvp/checkpoints/pretrain/step-00019975",
+                output_dir="artifacts/runs/local-mvp/checkpoints/sft",
+            ),
+        ),
+    )
+
+    assert stage_config.checkpoint.output_dir == "artifacts/runs/local-mvp/checkpoints/sft"
+    assert (
+        tmp_path / "artifacts/runs/local-mvp/checkpoints/sft.stale-20260324-120130/eval_history.jsonl"
+    ).exists()
+
+
+def test_prepare_manual_sft_train_config_falls_back_to_pretrain_when_continue_was_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    pretrain_dir = tmp_path / "artifacts/runs/local-mvp/checkpoints/pretrain/step-00019975"
+    pretrain_dir.mkdir(parents=True, exist_ok=True)
+    continue_dir = tmp_path / "artifacts/runs/local-mvp/checkpoints/continue"
+    continue_dir.mkdir(parents=True, exist_ok=True)
+    (continue_dir / "stage_summary.json").write_text(
+        json.dumps(
+            {
+                "stage": "continue",
+                "skipped": True,
+                "skip_reason": "continue_readiness_failed",
+                "artifact_status": "dev_only",
+                "promotion_blockers": ["continue_readiness_failed"],
+                "promotion_eligible": False,
+            }
+        )
+    )
+
+    stage_config = _prepare_manual_sft_train_config(
+        "sample-configs/model-local-mvp.json",
+        "sample-configs/data-local-mvp.json",
+        "sample-configs/train-local-mvp.json",
+        TrainConfig(run_name="webbgpt-local-mvp", sft_max_steps=3_000),
+    )
+
+    assert stage_config.checkpoint.initialize_from == "artifacts/runs/local-mvp/checkpoints/pretrain/step-00019975"
+    assert stage_config.checkpoint.output_dir == "artifacts/runs/local-mvp/checkpoints/sft"
+    assert stage_config.max_steps == 3_000
+
+
+def test_prepare_manual_sft_train_config_requires_explicit_lineage_when_continue_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(RuntimeError, match="Set checkpoint.initialize_from explicitly"):
+        _prepare_manual_sft_train_config(
+            "sample-configs/model-local-mvp.json",
+            "sample-configs/data-local-mvp.json",
+            "sample-configs/train-local-mvp.json",
+            TrainConfig(run_name="webbgpt-local-mvp", sft_max_steps=3_000),
+        )
+
+
 def test_prepare_manual_dpo_train_config_uses_stage_output_and_dpo_steps(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     monkeypatch.chdir(tmp_path)
     stale_dpo_dir = tmp_path / "artifacts/runs/local-mvp/checkpoints/dpo/step-00000050"
     stale_dpo_dir.mkdir(parents=True, exist_ok=True)
+    reference_checkpoint = tmp_path / "artifacts/runs/local-mvp/checkpoints/sft/step-00003000"
+    reference_checkpoint.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(cli.time, "strftime", lambda _: "20260324-120200")
 
     stage_config = _prepare_manual_dpo_train_config(
@@ -242,7 +646,7 @@ def test_prepare_manual_dpo_train_config_uses_stage_output_and_dpo_steps(
         "sample-configs/data-local-mvp.json",
         "sample-configs/train-local-mvp.json",
         TrainConfig(run_name="webbgpt-local-mvp", max_steps=20_000, dpo_max_steps=1_500),
-        reference_checkpoint="artifacts/runs/local-mvp/checkpoints/sft/step-00003000",
+        reference_checkpoint=str(reference_checkpoint.relative_to(tmp_path)),
     )
 
     assert stage_config.checkpoint.output_dir == "artifacts/runs/local-mvp/checkpoints/dpo"
@@ -251,6 +655,63 @@ def test_prepare_manual_dpo_train_config_uses_stage_output_and_dpo_steps(
     assert (
         tmp_path / "artifacts/runs/local-mvp/checkpoints/dpo.stale-20260324-120200/step-00000050"
     ).exists()
+
+
+def test_prepare_manual_dpo_train_config_rejects_missing_reference_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        _prepare_manual_dpo_train_config(
+            "sample-configs/model-local-mvp.json",
+            "sample-configs/data-local-mvp.json",
+            "sample-configs/train-local-mvp.json",
+            TrainConfig(run_name="webbgpt-local-mvp", max_steps=20_000, dpo_max_steps=1_500),
+            reference_checkpoint="artifacts/runs/local-mvp/checkpoints/sft/missing",
+        )
+
+
+def test_prepare_manual_stage_data_config_uses_profile_prepared_manifests(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    recorded: dict[str, object] = {}
+
+    def fake_materialize(profile: str, data_config: DataConfig, manifest_keys: list[str], *, force_rebuild: bool = False):
+        recorded["profile"] = profile
+        recorded["manifest_keys"] = list(manifest_keys)
+        recorded["force_rebuild"] = force_rebuild
+        return {
+            key: {
+                "path": f"artifacts/runs/{profile}/prepared/{key}.json",
+                "manifest": {"kind": "stub"},
+            }
+            for key in manifest_keys
+        }
+
+    monkeypatch.setattr(cli, "_materialize_profile_prepared_manifests", fake_materialize)
+
+    data_config = DataConfig(
+        preference_sources=[DataSourceConfig(name="pref", path="data/pref.jsonl", format="jsonl")],
+        preference_validation_sources=[
+            DataSourceConfig(name="pref-val", path="data/pref-val.jsonl", format="jsonl")
+        ],
+        validation_sources=[DataSourceConfig(name="val", path="data/val.txt", format="text")],
+    )
+    prepared_config = _prepare_manual_stage_data_config(
+        "sample-configs/model-3b.json",
+        "sample-configs/data-3b.json",
+        "sample-configs/train-3b.json",
+        data_config,
+        TrainConfig(dpo_enable_lm_health_eval=True),
+        stage_name="dpo",
+    )
+
+    assert recorded["profile"] == "remote-3b"
+    assert recorded["manifest_keys"] == ["preference", "preference_validation", "validation"]
+    assert prepared_config.preference_sources[0].format == "prepared"
+    assert prepared_config.preference_validation_sources[0].format == "prepared"
+    assert prepared_config.validation_sources[0].format == "prepared"
 
 
 def test_apply_remote_run_preset_mvp_reduces_serious_budgets():

@@ -1,0 +1,5 @@
+{
+  "general_clean_prose": "data/eval/pretrain_family_general_clean_prose.txt",
+  "advising_planning_prose": "data/eval/pretrain_family_advising_planning_prose.txt",
+  "catalog_grounding_prose": "data/eval/pretrain_family_catalog_grounding_prose.txt"
+}

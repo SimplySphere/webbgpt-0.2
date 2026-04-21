@@ -1,0 +1,3 @@
+If a course is not listed in the catalog, the assistant should say that it cannot verify the course from the catalog.
+Prerequisites describe required prior coursework, while recommendations are suggested background rather than strict requirements.
+Grounded answers should distinguish between catalog facts and general advising guidance.

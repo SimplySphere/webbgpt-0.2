@@ -427,6 +427,8 @@ Use this when you want to run the local conversational MVP lane stage by stage i
 
 The manual local-MVP path now has stricter trustworthiness defaults:
 
+- manual stage commands materialize and reuse profile-scoped prepared manifests under `artifacts/runs/local-mvp/prepared`
+- manual stage commands write stage checkpoints under `artifacts/runs/local-mvp/checkpoints/<stage>`
 - `train-continue` initializes from the latest completed pretrain checkpoint
 - `train-sft` initializes from the latest completed continue checkpoint
 - `train-dpo` starts from the SFT stage output and uses the supplied SFT checkpoint as the frozen reference
@@ -437,51 +439,114 @@ The manual local-MVP path now has stricter trustworthiness defaults:
 - serve uses the same Webb grounding snapshot store as eval and writes manual transcripts when `transcript_path` is configured
 - manual demos are only comparable when the recorded checkpoint, tokenizer/export artifact, backend, decode preset, seed bundle, and grounding snapshot match
 
+For direct local reruns, prefer the explicit Python 3.12 entrypoint below:
+
+- use `python3.12 -m src.cli ...` if you want the exact direct command path
+- add `--force-rebuild` when stage inputs changed or a prepared-manifest mismatch appears
+- do not run the same `local-mvp` stage concurrently against the same output directory
+- `train-continue` should be allowed to skip honestly if the readiness gate fails
+- `train-sft` uses the rerun-filtered SFT files already wired in `sample-configs/data-local-mvp.json`
+- `train-dpo` should only be run when the reviewed pair set exceeds the configured local-mvp floor and the SFT artifact is promotable
+
 ```bash
-webbgpt train-pretrain \
+python3.12 -m src.cli train-pretrain \
   --model-config sample-configs/model-local-mvp.json \
   --data-config sample-configs/data-local-mvp.json \
   --train-config sample-configs/train-local-mvp.json
 
-webbgpt train-continue \
+python3.12 -m src.cli train-continue \
   --model-config sample-configs/model-local-mvp.json \
   --data-config sample-configs/data-local-mvp.json \
   --train-config sample-configs/train-local-mvp.json
 
-webbgpt train-sft \
+python3.12 -m src.cli train-sft \
   --model-config sample-configs/model-local-mvp.json \
   --data-config sample-configs/data-local-mvp.json \
   --train-config sample-configs/train-local-mvp.json
 
-webbgpt train-dpo \
+python3.12 -m src.cli train-dpo \
   --model-config sample-configs/model-local-mvp.json \
   --data-config sample-configs/data-local-mvp.json \
   --train-config sample-configs/train-local-mvp.json \
   --reference-checkpoint artifacts/runs/local-mvp/checkpoints/sft/best
 
-webbgpt eval \
+python3.12 -m src.cli eval \
   --model-config sample-configs/model-local-mvp.json \
   --data-config sample-configs/data-local-mvp.json \
   --eval-config sample-configs/eval-local-mvp.json \
   --checkpoint artifacts/runs/local-mvp/checkpoints/dpo/best
 
-webbgpt export-hf \
+python3.12 -m src.cli export-hf \
   --model-config sample-configs/model-local-mvp.json \
   --checkpoint artifacts/runs/local-mvp/checkpoints/dpo/best \
   --output artifacts/runs/local-mvp/export/final
 
-webbgpt webb-sync \
+python3.12 -m src.cli webb-sync \
   --dsn sqlite:///artifacts/grounding/webbgpt-local-mvp.db \
   --seed-url-pack data/webb/seed_urls.json \
   --source-policy-path data/webb/source_policies.json \
   --handbook-url 'https://webb.myschoolapp.com/ftpimages/823/download/download_10529422.pdf?_=1774412901890'
 
-webbgpt serve --serve-config sample-configs/serve-local-mvp.json
+python3.12 -m src.cli serve --serve-config sample-configs/serve-local-mvp.json
+```
+
+If you need to rebuild prepared manifests cleanly for a rerun, use the same commands with `--force-rebuild` on the train stage you are re-running:
+
+```bash
+python3.12 -m src.cli train-pretrain \
+  --model-config sample-configs/model-local-mvp.json \
+  --data-config sample-configs/data-local-mvp.json \
+  --train-config sample-configs/train-local-mvp.json \
+  --force-rebuild
+
+python3.12 -m src.cli train-continue \
+  --model-config sample-configs/model-local-mvp.json \
+  --data-config sample-configs/data-local-mvp.json \
+  --train-config sample-configs/train-local-mvp.json \
+  --force-rebuild
+
+python3.12 -m src.cli train-sft \
+  --model-config sample-configs/model-local-mvp.json \
+  --data-config sample-configs/data-local-mvp.json \
+  --train-config sample-configs/train-local-mvp.json \
+  --force-rebuild
+
+python3.12 -m src.cli train-dpo \
+  --model-config sample-configs/model-local-mvp.json \
+  --data-config sample-configs/data-local-mvp.json \
+  --train-config sample-configs/train-local-mvp.json \
+  --reference-checkpoint artifacts/runs/local-mvp/checkpoints/sft/best \
+  --force-rebuild
+```
+
+Useful local-mvp status checks:
+
+```bash
+python3.12 -m src.cli audit-data \
+  --config sample-configs/data-local-mvp.json \
+  --stage continue
+
+ls artifacts/runs/local-mvp/checkpoints/pretrain
+ls artifacts/runs/local-mvp/checkpoints/continue
+ls artifacts/runs/local-mvp/checkpoints/sft
+ls artifacts/runs/local-mvp/checkpoints/dpo
+
+cat artifacts/runs/local-mvp/checkpoints/pretrain/stage_summary.json
+cat artifacts/runs/local-mvp/checkpoints/continue/stage_summary.json
+cat artifacts/runs/local-mvp/checkpoints/sft/stage_summary.json
+cat artifacts/runs/local-mvp/checkpoints/dpo/stage_summary.json
+
+cat artifacts/runs/local-mvp/checkpoints/pretrain/run_metadata.json
+cat artifacts/runs/local-mvp/checkpoints/continue/run_metadata.json
+cat artifacts/runs/local-mvp/checkpoints/sft/run_metadata.json
+cat artifacts/runs/local-mvp/checkpoints/dpo/run_metadata.json
 ```
 
 ### Manual Remote-3B Path
 
 Use this lane when you want to run the intermediate serious 3B path stage by stage instead of `webbgpt main`. This path is config-driven rather than preset-driven: `--mvp` and `--full` only exist on `webbgpt main`.
+
+Manual remote-3B stage commands materialize and reuse profile-scoped prepared manifests under `artifacts/runs/remote-3b/prepared` and write stage checkpoints under `artifacts/runs/remote-3b/checkpoints/<stage>`.
 
 ```bash
 webbgpt train-pretrain \
@@ -528,6 +593,8 @@ webbgpt serve --serve-config sample-configs/serve-3b.json
 ### Manual Remote-7B Path
 
 Use this lane on the intended Linux multi-GPU system when you want to run the full 7B path stage by stage instead of relying on `webbgpt main --profile remote-7b`.
+
+Manual remote-7B stage commands materialize and reuse profile-scoped prepared manifests under `artifacts/runs/remote-7b/prepared` and write stage checkpoints under `artifacts/runs/remote-7b/checkpoints/<stage>`.
 
 ```bash
 webbgpt train-pretrain \
@@ -838,7 +905,7 @@ The checked-in eval suite is intentionally broader than the earlier tiny slices,
 - `artifacts/runs/<profile>/`: Profile-scoped prepared data, stage checkpoints, evaluation outputs, exports, and manual demo transcripts.
 - `artifacts/catalog/`: Local SQLite grounding databases.
 - `artifacts/grounding/`: Snapshot-backed Webb grounding databases and other non-legacy grounding artifacts. These store `knowledge_snapshots`, `source_documents`, `retrieval_chunks`, family metadata, and the structured Webb tables including athletics.
-- `artifacts/runs/<profile>/prepared/*.json` plus sibling shard directories: Prepared-manifest entrypoints and the packed `.npy` shard payloads that large runs consume.
+- `artifacts/runs/<profile>/prepared/*.json` plus sibling shard directories: Prepared-manifest entrypoints and the packed `.npy` shard payloads that large runs consume, including optional `sft_validation.json` and `preference_validation.json` when explicit post-train validation sources are configured.
 - `artifacts/runs/<profile>/prepared/*.resume.json` plus sibling `.resume/` directories: In-progress prepared-data resume state and buffer snapshots used for safe auto-resume of interrupted preparation jobs.
 - `artifacts/runs/<profile>/checkpoints/<stage>/run_metadata.json`: Stage-level run metadata including seeds, config snapshots, and post-train validation policy details.
 - `artifacts/runs/<profile>/checkpoints/<stage>/eval_history.jsonl`: Chronological held-out evaluation history for post-train stages.

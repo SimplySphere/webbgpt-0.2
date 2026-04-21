@@ -7,7 +7,7 @@ torch = pytest.importorskip("torch")
 
 from config import ModelConfig
 from model.transformer import CausalTransformer
-from train.checkpoint import CheckpointManager
+from train.checkpoint import CheckpointManager, resolve_parent_lineage
 
 
 def test_checkpoint_roundtrip(tmp_path: Path):
@@ -77,3 +77,17 @@ def test_checkpoint_save_named_overwrites_existing_named_directory(tmp_path: Pat
     loaded = manager.load(str(best_dir), model, optimizer=optimizer)
     assert loaded.step == 18
     assert loaded.payload["extra_state"]["run"] == "second"
+
+
+def test_resolve_parent_lineage_reports_actual_parent_stage_and_skipped_context(tmp_path: Path):
+    pretrain_dir = tmp_path / "pretrain" / "best"
+    pretrain_dir.mkdir(parents=True)
+    (pretrain_dir / "checkpoint_metadata.json").write_text(
+        '{"stage": "pretrain", "artifact_status": "dev_only", "promotion_blockers": [], "promotion_eligible": false}'
+    )
+
+    lineage = resolve_parent_lineage(pretrain_dir, nominal_parent_stage="continue")
+
+    assert lineage["parent_stage"] == "pretrain"
+    assert lineage["parent_checkpoint_path"] == str(pretrain_dir)
+    assert lineage["lineage_via_skipped_stage"] == "continue"

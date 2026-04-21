@@ -192,9 +192,11 @@ class DataSourceConfig:
     rejected_field: str = "rejected"
     id_field: str | None = None
     group_field: str | None = None
+    family: str | None = None
     metadata_fields: list[str] = field(default_factory=list)
     language: str | None = None
     quality_filter: bool = True
+    quality_filter_mode: Literal["basic", "broad_lm"] = "basic"
     deduplicate: bool = True
     pii_scrub: bool = True
     max_records: int | None = None
@@ -226,6 +228,14 @@ class DataConfig:
     continued_pretraining_token_budget: int = 15_000_000_000
     min_document_chars: int = 128
     max_document_chars: int = 200_000
+    lm_weighted_source_token_budget: int = 32_768
+    lm_max_source_token_share: float = 0.65
+    lm_max_source_repeat_rate: float = 0.1
+    continue_readiness_min_clean_token_fraction: float = 0.8
+    continue_readiness_min_documents: int = 1_500
+    continue_readiness_min_source_families: int = 3
+    continue_readiness_max_single_source_share: float = 0.65
+    continue_readiness_max_repeat_rate: float = 0.1
     allow_unsafe_code: bool = False
     domain_tags: list[str] = field(
         default_factory=lambda: ["philosophy", "education", "advising", "course_catalog"]
@@ -276,13 +286,17 @@ class TrainConfig:
     sft_min_learning_rate: float | None = None
     sft_warmup_steps: int | None = None
     sft_max_steps: int | None = None
+    sft_max_epochs: int | None = 5
     sft_evals_per_epoch: int = 4
+    sft_min_eval_interval_steps: int = 25
     sft_early_stopping_patience_evals: int = 2
     sft_best_min_delta: float = 0.02
+    sft_sample_every_steps: int = 100
     dpo_learning_rate: float | None = None
     dpo_min_learning_rate: float | None = None
     dpo_warmup_steps: int | None = None
     dpo_max_steps: int | None = None
+    dpo_max_epochs: int | None = 2
     dpo_evals_per_epoch: int = 4
     dpo_early_stopping_patience_evals: int = 2
     dpo_best_min_delta: float = 0.005
@@ -292,6 +306,8 @@ class TrainConfig:
     require_explicit_sft_validation: bool = False
     dpo_validation_fraction: float = 0.1
     dpo_validation_min_examples: int = 16
+    dpo_min_train_examples: int = 0
+    dpo_min_validation_examples: int = 0
     require_explicit_dpo_validation: bool = False
     allow_weak_posttrain_validation: bool = False
     posttrain_top_k_checkpoints: int = 3
@@ -402,7 +418,7 @@ class EvalConfig:
     require_citations: bool = True
     grounding: GroundingConfig | None = None
     catalog_dsn: str = "sqlite:///artifacts/catalog/webbgpt-eval.db"
-    catalog_input_path: str = "data/catalog/catalog.json"
+    catalog_input_path: str = "data/catalog/webb_catalog.json"
     enforce_release_gates: bool = False
     release_gates: ReleaseGateConfig = field(default_factory=ReleaseGateConfig)
 
@@ -428,7 +444,7 @@ class ServeConfig:
     trust_remote_code: bool = False
     grounding: GroundingConfig | None = None
     catalog_dsn: str = "postgresql+psycopg://webbgpt:webbgpt@localhost:5432/webbgpt"
-    catalog_input_path: str = "data/catalog/catalog.json"
+    catalog_input_path: str = "data/catalog/webb_catalog.json"
     enable_grounding: bool = True
     enable_citations: bool = True
     decode_preset: str = "serve"

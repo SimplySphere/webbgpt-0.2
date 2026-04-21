@@ -4,5 +4,5 @@
 {"messages": [{"role": "user", "content": "What should you do when information is missing?"}], "expected_substrings": ["avoid", "guess"], "forbidden_substrings": [",,,,,", "or and"], "pass_score": 1.0}
 {"messages": [{"role": "user", "content": "I missed class and need a plan for catching up this week."}], "expected_substrings": ["plan", "week"], "forbidden_substrings": ["what would you like to work on", "what are you working on"], "pass_score": 1.0}
 {"messages": [{"role": "user", "content": "Explain recursion with a simple analogy."}], "expected_substrings": ["smaller", "problem"], "forbidden_substrings": [",,,,,", "or and"], "pass_score": 1.0}
-{"messages": [{"role": "user", "content": "What should you ask before recommending between two majors?"}], "expected_substrings": ["interests", "goals"], "forbidden_substrings": ["what would you like to work on"], "pass_score": 1.0}
+{"messages": [{"role": "user", "content": "Before comparing two majors for a student, what background questions matter most?"}], "expected_substrings": ["interests", "goals"], "forbidden_substrings": ["what would you like to work on"], "pass_score": 1.0}
 {"messages": [{"role": "user", "content": "I am overwhelmed by course planning. How should an assistant respond?"}], "expected_substrings": ["break", "step"], "forbidden_substrings": ["what are you working on"], "pass_score": 1.0}

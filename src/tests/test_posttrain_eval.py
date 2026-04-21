@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import types
 
 import pytest
+import torch
 
 from config import DataConfig, DataSourceConfig, TokenizerConfig
 from data.dataset import DatasetBuilder, IndexedDataset, split_dataset_for_validation
-from posttrain.eval import _clean_generated_response, ensure_no_regression_prompt_overlap
+from posttrain.eval import (
+    _clean_generated_response,
+    assess_sample_behavior,
+    ensure_no_regression_prompt_overlap,
+    evaluate_pretrain_family_holdouts,
+)
 from tokenizer.spm import train_tokenizer
 
 
@@ -63,6 +70,17 @@ class _DummyDataset:
 
     def __getitem__(self, index: int) -> int:
         return index
+
+
+class _HoldoutEvalModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        del attention_mask, labels
+        loss = input_ids.float().mean() / 100.0
+        return types.SimpleNamespace(loss=loss)
 
 
 def test_split_dataset_for_validation_is_deterministic_and_disjoint():
@@ -354,6 +372,67 @@ def test_regression_overlap_guard_rejects_matching_prompt(tmp_path: Path):
             validation_examples=validation_examples,
             regression_path=regression_path,
         )
+
+
+def test_assess_sample_behavior_flags_grounded_failures():
+    samples = [
+        {
+            "prompt": "If the catalog does not list ECON 404, how should you respond?",
+            "clean_response": "The handbook says ECON 404 is available. [source: handbook]",
+            "expected_mode": "abstain",
+            "allowed_source_labels": ["course catalog"],
+            "forbidden_source_labels": ["handbook"],
+            "requires_source_label": False,
+        },
+        {
+            "prompt": "Before comparing two majors for a student, what background questions matter most?",
+            "clean_response": "The best major is economics.",
+            "expected_mode": "clarify",
+            "allowed_source_labels": [],
+            "forbidden_source_labels": [],
+            "requires_source_label": False,
+        },
+    ]
+
+    behavior = assess_sample_behavior(samples)
+
+    assert behavior["wrong_source_attribution_count"] == 1
+    assert behavior["grounded_abstention_fail_count"] == 1
+    assert behavior["clarification_missing_count"] == 1
+    assert "source_attribution_failures" in behavior["promotion_blockers"]
+    assert "grounded_abstention_failures" in behavior["promotion_blockers"]
+    assert behavior["collapse_detected"] is True
+
+
+def test_evaluate_pretrain_family_holdouts_reports_family_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tokenizer_path: str,
+):
+    monkeypatch.setattr(
+        "posttrain.eval.load_pretrain_family_holdouts",
+        lambda *_args, **_kwargs: {
+            "general_clean_prose": [
+                "Students learn through clear explanations and examples."
+            ],
+            "catalog_grounding_prose": [
+                "If a course is not listed in the catalog, the assistant should say it cannot verify it."
+            ],
+        },
+    )
+
+    family_eval = evaluate_pretrain_family_holdouts(
+        _HoldoutEvalModel(),
+        tokenizer_path,
+        sequence_length=32,
+    )
+
+    assert set(family_eval["families"]) == {
+        "general_clean_prose",
+        "catalog_grounding_prose",
+    }
+    assert family_eval["best_family"] in family_eval["families"]
+    assert family_eval["worst_family"] in family_eval["families"]
+    assert all("loss" in metrics for metrics in family_eval["families"].values())
 
 
 def test_clean_generated_response_keeps_raw_and_strips_special_tokens():

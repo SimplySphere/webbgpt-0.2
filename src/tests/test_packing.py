@@ -1,4 +1,4 @@
-from data.packing import pack_token_sequences
+from data.packing import PackedSequencePacker, pack_token_sequences
 
 
 def test_pack_token_sequences_pads_to_length():
@@ -13,3 +13,30 @@ def test_pack_token_sequences_splits_long_documents():
     packed = pack_token_sequences(sequences, sequence_length=4, pad_token_id=0, eos_token_id=9)
     assert len(packed) == 2
 
+
+def test_pack_token_sequences_drops_one_token_tail_window():
+    sequences = [[1, 2, 3, 4]]
+    packed = pack_token_sequences(sequences, sequence_length=4, pad_token_id=0, eos_token_id=9)
+
+    assert packed == [[1, 2, 3, 4]]
+    assert all(sum(token != 0 for token in row) > 1 for row in packed)
+
+
+def test_packer_tracks_dropped_short_windows_across_state_restore():
+    packer = PackedSequencePacker(sequence_length=4, pad_token_id=0, eos_token_id=9)
+
+    assert list(packer.push([1, 2, 3, 4])) == [[1, 2, 3, 4]]
+    assert packer.dropped_short_windows == 1
+
+    restored = PackedSequencePacker(sequence_length=4, pad_token_id=0, eos_token_id=9)
+    restored.load_state_dict(packer.state_dict())
+
+    assert restored.dropped_short_windows == 1
+
+
+def test_finish_with_metadata_drops_one_token_current_window():
+    packer = PackedSequencePacker(sequence_length=4, pad_token_id=0, eos_token_id=9)
+
+    assert list(packer.push_with_metadata([9], {"source": "tiny"})) == []
+    assert list(packer.finish_with_metadata()) == []
+    assert packer.dropped_short_windows == 1

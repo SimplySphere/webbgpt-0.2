@@ -6,15 +6,19 @@ import math
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from config import TrainConfig
+from data.prepared import derive_artifact_status
 from posttrain.eval import update_topk_candidates
 from progress import build_progress_snapshot
 from train.checkpoint import CheckpointManager
+from train.console import dump_rounded_json
 from train.distributed import barrier, is_main_process
+
+MAX_NONFINITE_EVENT_SAMPLES = 8
 
 
 def _require_torch():
@@ -32,6 +36,8 @@ class TrainState:
     examples_seen: int = 0
     best_eval_loss: float = math.inf
     best_eval_step: int = -1
+    nonfinite_loss_steps: int = 0
+    nonfinite_event_samples: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -68,6 +74,77 @@ def _infer_batch_size(batch: dict[str, Any]) -> int:
     return 1
 
 
+def _world_size() -> int:
+    _, dist, _ = _require_torch()
+    return int(dist.get_world_size()) if dist is not None and dist.is_initialized() else 1
+
+
+def compute_effective_batch_size(train_config: TrainConfig, world_size: int | None = None) -> int:
+    if world_size is None:
+        world_size = _world_size()
+    return int(train_config.micro_batch_size * train_config.gradient_accumulation_steps * world_size)
+
+
+def validate_effective_batch_size(train_config: TrainConfig, world_size: int | None = None) -> dict[str, int]:
+    if world_size is None:
+        world_size = _world_size()
+    effective_batch_size = compute_effective_batch_size(train_config, world_size)
+    configured_global_batch_size = int(train_config.global_batch_size)
+    if configured_global_batch_size != effective_batch_size:
+        raise ValueError(
+            "Configured global_batch_size does not match the runtime effective batch size: "
+            f"global_batch_size={configured_global_batch_size}, "
+            f"micro_batch_size={train_config.micro_batch_size}, "
+            f"gradient_accumulation_steps={train_config.gradient_accumulation_steps}, "
+            f"world_size={world_size}, effective_batch_size={effective_batch_size}. "
+            "Update the config instead of relying on an implicit batch-size mismatch."
+        )
+    return {
+        "micro_batch_size": int(train_config.micro_batch_size),
+        "gradient_accumulation_steps": int(train_config.gradient_accumulation_steps),
+        "world_size": int(world_size),
+        "effective_batch_size": int(effective_batch_size),
+        "configured_global_batch_size": configured_global_batch_size,
+    }
+
+
+def _model_inputs(batch: dict[str, Any]) -> dict[str, Any]:
+    torch, _, _ = _require_torch()
+    return {key: value for key, value in batch.items() if isinstance(value, torch.Tensor)}
+
+
+def _summarize_nonfinite_batch(batch: dict[str, Any], *, step: int, loss_value: float) -> dict[str, Any]:
+    attention_mask = batch.get("attention_mask")
+    tokens_in_batch = None
+    if attention_mask is not None and hasattr(attention_mask, "sum"):
+        try:
+            tokens_in_batch = int(attention_mask.sum().item())
+        except Exception:
+            tokens_in_batch = None
+    provenance_entries: list[dict[str, Any]] = []
+    raw_provenance = batch.get("provenance_json")
+    if isinstance(raw_provenance, str):
+        raw_values = [raw_provenance]
+    elif isinstance(raw_provenance, list):
+        raw_values = [value for value in raw_provenance if isinstance(value, str)]
+    else:
+        raw_values = []
+    for raw_value in raw_values[:3]:
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            provenance_entries.append(parsed)
+    return {
+        "step": step,
+        "loss": loss_value,
+        "tokens_in_batch": tokens_in_batch,
+        "examples_in_batch": _infer_batch_size(batch),
+        "provenance": provenance_entries,
+    }
+
+
 def build_dataloader(dataset, batch_size: int, shuffle: bool = True):
     _, dist, DataLoader = _require_torch()
     sampler = None
@@ -90,21 +167,39 @@ def evaluate_language_model(model, dataloader, max_batches: int | None) -> dict[
     device = next(model.parameters()).device
     model.eval()
     losses = []
+    batches_evaluated = 0
+    examples_evaluated = 0
     with torch.no_grad():
         for batch_index, batch in enumerate(dataloader):
             if max_batches is not None and batch_index >= max_batches:
                 break
             batch = _to_device(batch, device)
-            outputs = model(**batch)
+            outputs = model(**_model_inputs(batch))
             losses.append(outputs.loss.detach())
+            batches_evaluated += 1
+            examples_evaluated += _infer_batch_size(batch)
     if not losses:
-        return {"loss": math.nan, "perplexity": math.nan}
+        return {
+            "loss": math.nan,
+            "perplexity": math.nan,
+            "batches_evaluated": 0,
+            "examples_evaluated": 0,
+        }
     loss = torch.stack(losses).mean()
-    if dist.is_initialized():
+    if dist is not None and dist.is_initialized():
         dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+        counts = torch.tensor([batches_evaluated, examples_evaluated], device=device, dtype=torch.long)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        batches_evaluated = int(counts[0].item())
+        examples_evaluated = int(counts[1].item())
     scalar_loss = float(loss.item())
     model.train()
-    return {"loss": scalar_loss, "perplexity": math.exp(min(scalar_loss, 20.0))}
+    return {
+        "loss": scalar_loss,
+        "perplexity": math.exp(min(scalar_loss, 20.0)),
+        "batches_evaluated": batches_evaluated,
+        "examples_evaluated": examples_evaluated,
+    }
 
 
 def maybe_compile_model(model, enabled: bool):
@@ -135,6 +230,14 @@ def save_run_metadata(train_config: TrainConfig, output_dir: str, extra: dict[st
     path.write_text(json.dumps(payload, indent=2))
 
 
+def save_stage_summary(output_dir: str, payload: dict[str, Any]) -> None:
+    if not is_main_process():
+        return
+    path = Path(output_dir) / "stage_summary.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2))
+
+
 def run_training(
     model,
     train_loader,
@@ -149,8 +252,17 @@ def run_training(
     eval_fn: Callable[[Any, Any, int | None], dict[str, Any]] | None = None,
     eval_control: EvalControl | None = None,
     save_final_checkpoint: bool = False,
+    train_event_printer: Callable[[dict[str, Any]], None] | None = None,
+    eval_event_printer: Callable[[dict[str, Any]], None] | None = None,
+    checkpoint_metadata: dict[str, Any] | None = None,
 ) -> TrainState:
     torch, _, _ = _require_torch()
+    batch_config = validate_effective_batch_size(train_config)
+    if is_main_process():
+        print(
+            dump_rounded_json({"batch_config": batch_config}),
+            flush=True,
+        )
     stage_start_time = time.perf_counter()
     state = TrainState()
     last_saved_step = -1
@@ -177,10 +289,47 @@ def run_training(
             state.examples_seen = persisted.get("examples_seen", state.examples_seen)
             state.best_eval_loss = persisted.get("best_eval_loss", state.best_eval_loss)
             state.best_eval_step = persisted.get("best_eval_step", state.best_eval_step)
+            state.nonfinite_loss_steps = persisted.get("nonfinite_loss_steps", state.nonfinite_loss_steps)
+            state.nonfinite_event_samples = list(
+                persisted.get("nonfinite_event_samples", state.nonfinite_event_samples)
+            )
     model = maybe_compile_model(model, train_config.compile_model)
 
     micro_step = 0
     token_budget_reached = False
+
+    def _current_checkpoint_metadata() -> dict[str, Any] | None:
+        if checkpoint_metadata is None:
+            return None
+        payload = dict(checkpoint_metadata)
+        blockers = list(payload.get("promotion_blockers", []))
+        if state.nonfinite_loss_steps > 0 and "nonfinite_loss_seen" not in blockers:
+            blockers.append("nonfinite_loss_seen")
+        payload["promotion_blockers"] = blockers
+        payload["artifact_status"] = derive_artifact_status(
+            blockers,
+            base_status=str(payload.get("artifact_status", "promotable")),
+        )
+        payload["promotion_eligible"] = payload["artifact_status"] == "promotable"
+        payload["nonfinite_loss_steps"] = state.nonfinite_loss_steps
+        payload["nonfinite_event_samples"] = list(state.nonfinite_event_samples)
+        return payload
+
+    def _checkpoint_extra_state() -> dict[str, Any]:
+        payload = {
+            "train_state": {
+                "tokens_seen": state.tokens_seen,
+                "examples_seen": state.examples_seen,
+                "best_eval_loss": state.best_eval_loss,
+                "best_eval_step": state.best_eval_step,
+                "nonfinite_loss_steps": state.nonfinite_loss_steps,
+                "nonfinite_event_samples": list(state.nonfinite_event_samples),
+            }
+        }
+        current_metadata = _current_checkpoint_metadata()
+        if current_metadata is not None:
+            payload["checkpoint_metadata"] = current_metadata
+        return payload
 
     def _append_eval_history(payload: dict[str, Any]) -> None:
         if eval_control is None or eval_control.eval_history_path is None or not is_main_process():
@@ -202,14 +351,7 @@ def run_training(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                extra_state={
-                    "train_state": {
-                        "tokens_seen": state.tokens_seen,
-                        "examples_seen": state.examples_seen,
-                        "best_eval_loss": state.best_eval_loss,
-                        "best_eval_step": state.best_eval_step,
-                    }
-                },
+                extra_state=_checkpoint_extra_state(),
             )
         barrier()
         return target
@@ -245,8 +387,6 @@ def run_training(
             max_eval_batches = eval_control.validation_max_batches
         metrics = evaluator(model, val_loader, max_eval_batches)
         payload: dict[str, Any] = {"step": step, "eval": metrics}
-        if final_eval:
-            payload["final_eval"] = True
         if initial_eval:
             payload["initial_eval"] = True
         if eval_control is not None:
@@ -256,15 +396,14 @@ def run_training(
             payload["train_dataset_size"] = eval_control.train_dataset_size
             payload["validation_dataset_size"] = eval_control.validation_dataset_size
             payload["train_examples_seen"] = state.examples_seen
-            payload["validation_examples_evaluated"] = metrics.get(
-                "examples_evaluated", eval_control.validation_dataset_size
-            )
+            payload["validation_batches_evaluated"] = metrics.get("batches_evaluated")
+            payload["validation_examples_evaluated"] = metrics.get("examples_evaluated")
         progress = _stage_progress(completed_steps=min(max(step, 0), train_config.max_steps))
         payload["progress_percent"] = (
-            None if progress.fraction_complete is None else round(progress.fraction_complete * 100.0, 1)
+            None if progress.fraction_complete is None else round(progress.fraction_complete * 100.0, 2)
         )
-        payload["stage_elapsed_sec"] = round(progress.elapsed_seconds, 3)
-        payload["stage_eta_sec"] = None if progress.remaining_seconds is None else round(progress.remaining_seconds, 3)
+        payload["stage_elapsed_sec"] = round(progress.elapsed_seconds, 2)
+        payload["stage_eta_sec"] = None if progress.remaining_seconds is None else round(progress.remaining_seconds, 2)
         payload["progress_summary"] = progress.summary
         improved = (
             not math.isnan(float(metrics.get((eval_control.eval_metric_key if eval_control else "loss"), math.nan)))
@@ -297,7 +436,18 @@ def run_training(
                 extra_payload = eval_payload_callback(model, step, final_eval, state, metrics)
                 if extra_payload:
                     payload.update(extra_payload)
-            print(json.dumps(payload))
+                    if bool(extra_payload.get("should_stop_training")):
+                        should_stop_training = True
+                        if is_main_process() and eval_control is not None:
+                            print(
+                                f"WebbGPT: stopping {eval_control.stage_name} early because a qualitative gate requested termination.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+            if eval_event_printer is not None:
+                eval_event_printer(payload)
+            else:
+                print(dump_rounded_json(payload))
         _append_eval_history(payload)
         best_path = None
         if improved:
@@ -310,9 +460,8 @@ def run_training(
                     "train_dataset_size": eval_control.train_dataset_size,
                     "validation_dataset_size": eval_control.validation_dataset_size,
                     "train_examples_seen": state.examples_seen,
-                    "validation_examples_evaluated": metrics.get(
-                        "examples_evaluated", eval_control.validation_dataset_size
-                    ),
+                    "validation_batches_evaluated": metrics.get("batches_evaluated"),
+                    "validation_examples_evaluated": metrics.get("examples_evaluated"),
                     "metrics": metrics,
                     "selection_metric": metric_key,
                     "selection_value": selection_value,
@@ -329,8 +478,11 @@ def run_training(
                         else previous_best_value - selection_value
                     ),
                     "best_step_so_far": state.best_eval_step,
-                    "qualitative_samples": payload.get("qualitative_samples"),
                 }
+                if payload.get("samples") is not None:
+                    selection_payload["samples"] = payload.get("samples")
+                elif payload.get("qualitative_samples") is not None:
+                    selection_payload["qualitative_samples"] = payload.get("qualitative_samples")
                 _write_selection_metadata(best_path, selection_payload)
                 candidate_name = f"candidate-step-{step:08d}"
                 candidate_path = checkpoint_manager.save_named(
@@ -339,14 +491,7 @@ def run_training(
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
-                    extra_state={
-                        "train_state": {
-                            "tokens_seen": state.tokens_seen,
-                            "examples_seen": state.examples_seen,
-                            "best_eval_loss": state.best_eval_loss,
-                            "best_eval_step": state.best_eval_step,
-                        }
-                    },
+                    extra_state=_checkpoint_extra_state(),
                 )
                 _write_selection_metadata(candidate_path, selection_payload)
                 update_topk_candidates(
@@ -364,10 +509,8 @@ def run_training(
         ):
             should_stop_training = True
             if is_main_process():
-                progress = _stage_progress()
                 print(
-                    f"WebbGPT: stopping {eval_control.stage_name} early after {no_improvement_evals} validation evals without a new best checkpoint. "
-                    f"[{progress.summary}]",
+                    f"WebbGPT: stopping {eval_control.stage_name} early after {no_improvement_evals} validation evals without a new best checkpoint.",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -381,11 +524,9 @@ def run_training(
         ):
             should_stop_training = True
             if is_main_process():
-                progress = _stage_progress()
                 print(
                     f"WebbGPT: stopping {eval_control.stage_name} early because training loss fell below "
-                    f"{eval_control.overfit_train_loss_threshold} while validation degraded for {worsening_evals} evals. "
-                    f"[{progress.summary}]",
+                    f"{eval_control.overfit_train_loss_threshold} while validation degraded for {worsening_evals} evals.",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -420,8 +561,25 @@ def run_training(
             start_time = time.perf_counter()
             batch = _to_device(batch, device)
             with scaler_context:
-                outputs = model(**batch)
-                loss = outputs.loss / train_config.gradient_accumulation_steps
+                outputs = model(**_model_inputs(batch))
+                raw_loss = outputs.loss
+            raw_loss_value = float(raw_loss.item())
+            if not math.isfinite(raw_loss_value):
+                state.nonfinite_loss_steps += 1
+                if len(state.nonfinite_event_samples) < MAX_NONFINITE_EVENT_SAMPLES:
+                    state.nonfinite_event_samples.append(
+                        _summarize_nonfinite_batch(batch, step=state.step, loss_value=raw_loss_value)
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                if is_main_process():
+                    print(
+                        f"WebbGPT: skipping non-finite training loss at step {state.step} "
+                        f"(count={state.nonfinite_loss_steps}).",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+            loss = raw_loss / train_config.gradient_accumulation_steps
             loss.backward()
             tokens_this_batch = int(batch["attention_mask"].sum().item())
             state.tokens_seen += tokens_this_batch
@@ -438,27 +596,27 @@ def run_training(
                 if state.step % train_config.log_every_steps == 0 and is_main_process():
                     elapsed = time.perf_counter() - start_time
                     progress = _stage_progress(completed_steps=min(state.step + 1, train_config.max_steps))
-                    print(
-                        json.dumps(
-                            {
-                                "step": state.step,
-                                "loss": last_train_loss,
-                                "lr": float(scheduler.get_last_lr()[0]),
-                                "tokens_seen": state.tokens_seen,
-                                "step_time_sec": elapsed,
-                                "progress_percent": (
-                                    None
-                                    if progress.fraction_complete is None
-                                    else round(progress.fraction_complete * 100.0, 1)
-                                ),
-                                "stage_elapsed_sec": round(progress.elapsed_seconds, 3),
-                                "stage_eta_sec": (
-                                    None if progress.remaining_seconds is None else round(progress.remaining_seconds, 3)
-                                ),
-                                "progress_summary": progress.summary,
-                            }
-                        )
-                    )
+                    payload = {
+                        "step": state.step,
+                        "loss": last_train_loss,
+                        "lr": float(scheduler.get_last_lr()[0]),
+                        "tokens_seen": state.tokens_seen,
+                        "step_time_sec": round(elapsed, 2),
+                        "progress_percent": (
+                            None
+                            if progress.fraction_complete is None
+                            else round(progress.fraction_complete * 100.0, 2)
+                        ),
+                        "stage_elapsed_sec": round(progress.elapsed_seconds, 2),
+                        "stage_eta_sec": (
+                            None if progress.remaining_seconds is None else round(progress.remaining_seconds, 2)
+                        ),
+                        "progress_summary": progress.summary,
+                    }
+                    if train_event_printer is not None:
+                        train_event_printer(payload)
+                    else:
+                        print(dump_rounded_json(payload))
 
                 if _should_run_scheduled_eval(state.step):
                     _run_eval(state.step, final_eval=False)
@@ -475,14 +633,7 @@ def run_training(
                             model=model,
                             optimizer=optimizer,
                             scheduler=scheduler,
-                            extra_state={
-                                "train_state": {
-                                    "tokens_seen": state.tokens_seen,
-                                    "examples_seen": state.examples_seen,
-                                    "best_eval_loss": state.best_eval_loss,
-                                    "best_eval_step": state.best_eval_step,
-                                }
-                            },
+                            extra_state=_checkpoint_extra_state(),
                         )
                         last_saved_step = state.step
                     barrier()
@@ -518,14 +669,7 @@ def run_training(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                extra_state={
-                    "train_state": {
-                        "tokens_seen": state.tokens_seen,
-                        "examples_seen": state.examples_seen,
-                        "best_eval_loss": state.best_eval_loss,
-                        "best_eval_step": state.best_eval_step,
-                    }
-                },
+                extra_state=_checkpoint_extra_state(),
             )
         barrier()
     return state

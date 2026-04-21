@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -136,6 +137,9 @@ class CheckpointManager:
             "pid": os.getpid(),
         }
         torch.save(payload, tmp_target / "checkpoint.pt")
+        checkpoint_metadata = payload["extra_state"].get("checkpoint_metadata")
+        if checkpoint_metadata is not None:
+            (tmp_target / "checkpoint_metadata.json").write_text(json.dumps(checkpoint_metadata, indent=2))
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
         tmp_target.replace(target)
@@ -172,3 +176,70 @@ class CheckpointManager:
             return
         for path in checkpoints[:-self.keep_last_n]:
             shutil.rmtree(path, ignore_errors=True)
+
+
+def load_checkpoint_metadata(path: str | Path) -> dict[str, Any] | None:
+    metadata_path = Path(path) / "checkpoint_metadata.json"
+    if not metadata_path.exists():
+        return None
+    return json.loads(metadata_path.read_text())
+
+
+def load_stage_summary(path: str | Path) -> dict[str, Any] | None:
+    summary_path = Path(path) / "stage_summary.json"
+    if not summary_path.exists():
+        return None
+    return json.loads(summary_path.read_text())
+
+
+def load_artifact_trust(path: str | Path) -> dict[str, Any]:
+    target = Path(path)
+    for candidate in (
+        target / "artifact_trust.json",
+        target / "stage_summary.json",
+        target / "checkpoint_metadata.json",
+    ):
+        if candidate.exists():
+            payload = json.loads(candidate.read_text())
+            return {
+                "artifact_status": payload.get("artifact_status", "promotable"),
+                "promotion_blockers": list(payload.get("promotion_blockers", [])),
+                "promotion_eligible": bool(payload.get("promotion_eligible", False)),
+                "source_path": str(candidate),
+            }
+    return {
+        "artifact_status": "promotable",
+        "promotion_blockers": [],
+        "promotion_eligible": True,
+        "source_path": "",
+    }
+
+
+def _infer_stage_from_path(path: str | Path) -> str | None:
+    known_stages = {"pretrain", "continue", "sft", "dpo", "preference", "validation"}
+    for part in Path(path).parts:
+        if part in known_stages:
+            return part
+    return None
+
+
+def resolve_parent_lineage(
+    checkpoint_path: str | Path | None,
+    *,
+    nominal_parent_stage: str | None = None,
+) -> dict[str, Any]:
+    if checkpoint_path is None:
+        return {
+            "parent_stage": nominal_parent_stage,
+            "parent_checkpoint_path": None,
+        }
+    target = Path(checkpoint_path)
+    payload = load_checkpoint_metadata(target) or load_stage_summary(target) or {}
+    actual_stage = payload.get("stage") or _infer_stage_from_path(target)
+    lineage = {
+        "parent_stage": actual_stage or nominal_parent_stage,
+        "parent_checkpoint_path": str(target),
+    }
+    if nominal_parent_stage and actual_stage and nominal_parent_stage != actual_stage:
+        lineage["lineage_via_skipped_stage"] = nominal_parent_stage
+    return lineage

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from config import TokenizerConfig
-from progress import format_progress_summary
+from train.console import format_scalar
 
 
 def _require_sentencepiece():
@@ -135,13 +135,60 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes} B"
 
 
-def _heartbeat(stop_event: threading.Event, interval_seconds: float, start_time: float) -> None:
+def _log_tokenizer_event(
+    *,
+    status: str,
+    input_file_count: int,
+    input_bytes: int,
+    vocab_size: int,
+    model_type: str,
+    model_path: Path,
+    metadata_path: Path,
+    elapsed_seconds: float,
+    remaining_seconds: float | None,
+) -> None:
+    fields: list[tuple[str, object]] = [
+        ("status", status),
+        ("input_files", input_file_count),
+        ("input_bytes", _format_bytes(input_bytes)),
+        ("vocab_size", vocab_size),
+        ("model_type", model_type),
+        ("progress_percent", 100.0 if status == "finished" else None),
+        ("stage_elapsed_sec", elapsed_seconds),
+        ("stage_eta_sec", remaining_seconds),
+        ("model_path", str(model_path)),
+        ("metadata_path", str(metadata_path)),
+    ]
+    rendered = "; ".join(
+        f"{name}: {format_scalar(value, key=name)}"
+        for name, value in fields
+    )
+    print(f"WebbGPT: tokenizer; {rendered}", file=sys.stderr, flush=True)
+
+
+def _heartbeat(
+    stop_event: threading.Event,
+    interval_seconds: float,
+    start_time: float,
+    *,
+    input_file_count: int,
+    input_bytes: int,
+    vocab_size: int,
+    model_type: str,
+    model_path: Path,
+    metadata_path: Path,
+) -> None:
     while not stop_event.wait(interval_seconds):
-        print(
-            "WebbGPT: tokenizer training is still running. SentencePiece can stay quiet for long stretches during BPE optimization. "
-            f"[{format_progress_summary(fraction_complete=None, elapsed_seconds=time.monotonic() - start_time)}]",
-            file=sys.stderr,
-            flush=True,
+        _log_tokenizer_event(
+            status="running",
+            input_file_count=input_file_count,
+            input_bytes=input_bytes,
+            vocab_size=vocab_size,
+            model_type=model_type,
+            model_path=model_path,
+            metadata_path=metadata_path,
+            elapsed_seconds=time.monotonic() - start_time,
+            remaining_seconds=None,
         )
 
 
@@ -188,16 +235,33 @@ def train_tokenizer(
     command = " ".join(f"--{key}={value}" for key, value in args.items())
     existing_files, total_bytes = _describe_input_files(input_files)
     stage_start_time = time.monotonic()
-    print(
-        "WebbGPT: starting tokenizer training "
-        f"on {existing_files} file(s), {_format_bytes(total_bytes)} total. "
-        "SentencePiece may go quiet for a while after its initial logs; that is normal. "
-        f"[{format_progress_summary(fraction_complete=None, elapsed_seconds=0.0)}]",
-        file=sys.stderr,
-        flush=True,
+    model_path = model_prefix.with_suffix(".model")
+    meta_path = model_prefix.with_suffix(".tokenizer.json")
+    _log_tokenizer_event(
+        status="starting",
+        input_file_count=existing_files,
+        input_bytes=total_bytes,
+        vocab_size=config.vocab_size,
+        model_type=config.model_type,
+        model_path=model_path,
+        metadata_path=meta_path,
+        elapsed_seconds=0.0,
+        remaining_seconds=None,
     )
     stop_event = threading.Event()
-    heartbeat = threading.Thread(target=_heartbeat, args=(stop_event, 20.0, stage_start_time), daemon=True)
+    heartbeat = threading.Thread(
+        target=_heartbeat,
+        args=(stop_event, 20.0, stage_start_time),
+        kwargs={
+            "input_file_count": existing_files,
+            "input_bytes": total_bytes,
+            "vocab_size": config.vocab_size,
+            "model_type": config.model_type,
+            "model_path": model_path,
+            "metadata_path": meta_path,
+        },
+        daemon=True,
+    )
     heartbeat.start()
     try:
         spm.SentencePieceTrainer.Train(command)
@@ -226,12 +290,16 @@ def train_tokenizer(
     finally:
         stop_event.set()
         heartbeat.join(timeout=1.0)
-    meta_path = model_prefix.with_suffix(".tokenizer.json")
     meta_path.write_text(json.dumps(config.to_dict(), indent=2))
-    print(
-        f"WebbGPT: tokenizer training finished. Wrote {model_prefix.with_suffix('.model')} and {meta_path}. "
-        f"[{format_progress_summary(fraction_complete=1.0, elapsed_seconds=time.monotonic() - stage_start_time, remaining_seconds=0.0)}]",
-        file=sys.stderr,
-        flush=True,
+    _log_tokenizer_event(
+        status="finished",
+        input_file_count=existing_files,
+        input_bytes=total_bytes,
+        vocab_size=config.vocab_size,
+        model_type=config.model_type,
+        model_path=model_path,
+        metadata_path=meta_path,
+        elapsed_seconds=time.monotonic() - stage_start_time,
+        remaining_seconds=0.0,
     )
-    return model_prefix.with_suffix(".model")
+    return model_path

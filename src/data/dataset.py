@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,11 +24,13 @@ from data.prepared import (
     encode_sft_messages,
     load_prepared_manifest,
     load_buffer_rows,
+    load_metadata_rows,
     load_seen_hashes,
     prepared_resume_dir,
     prepared_resume_state_path,
     remove_resume_artifacts,
     save_buffer_rows,
+    save_metadata_rows,
     save_prepared_manifest,
     save_resume_state,
     stage_has_partial_outputs,
@@ -34,12 +38,73 @@ from data.prepared import (
 )
 from data.preprocess import clean_document
 from data.schemas import DocumentRecord, PreferenceExample, SFTExample
-from progress import build_progress_snapshot
 from tokenizer import SentencePieceTokenizer
 
 
 PREPARE_DOC_SNAPSHOT_INTERVAL = 1_000
 PREPARE_EXAMPLE_SNAPSHOT_INTERVAL = 100
+STANDARD_SFT_METADATA_FIELDS = ("behavior_bucket", "quality_tier")
+STANDARD_PREFERENCE_METADATA_FIELDS = ("chosen_quality_tier", "negative_type")
+LOCAL_MVP_PRETRAIN_DOMAIN_FAMILIES = {
+    "advising_planning_prose",
+    "catalog_grounding_prose",
+    "webb_domain_seed_prose",
+}
+LOCAL_MVP_PRETRAIN_DOMAIN_SOURCE_NAMES = {
+    "advising_expanded_corpus",
+    "advising_seed",
+    "catalog_expanded_corpus",
+    "catalog_seed",
+    "education_seed",
+    "handbook_catalog_distinction_corpus",
+    "local_mvp_domain_seed",
+    "philosophy_seed",
+    "webb_domain_seed_mix",
+    "webb_public_seed",
+}
+LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE = 0.01
+LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS = 500_000
+# The SFT planner trims overrepresented buckets globally after candidate collection.
+# Targets are row-share goals first; label-token shares are diagnostics unless a bucket's
+# token share drifts badly enough to surface in review.
+SFT_BUCKET_TARGETS: dict[str, dict[str, float]] = {
+    "constructive_direct": {
+        "target_row_share": 0.68,
+        "target_label_token_share": 0.78,
+        "min_examples": 96,
+    },
+    "clarifying_question": {
+        "target_row_share": 0.20,
+        "target_label_token_share": 0.15,
+        "min_examples": 48,
+    },
+    "informative_abstention": {
+        "target_row_share": 0.08,
+        "target_label_token_share": 0.05,
+        "min_examples": 16,
+    },
+    "hard_refusal": {
+        "target_row_share": 0.04,
+        "target_label_token_share": 0.02,
+        "min_examples": 8,
+    },
+}
+SFT_BALANCING_WARMUP_EXAMPLES = 40
+PROMOTABLE_DPO_CHOSEN_QUALITY_TIERS = {
+    "human_curated",
+    "human_edited_from_model",
+    "approved_template",
+}
+PROMOTABLE_DPO_NEGATIVE_TYPES = {
+    "hallucinated_specifics",
+    "shallow_refusal",
+    "vague_filler",
+    "fake_citation",
+    "repetitive_template_collapse",
+    "overconfident_ungrounded",
+    "generic_greeting",
+    "missing_verification",
+}
 
 
 def _progress(message: str) -> None:
@@ -137,6 +202,174 @@ def _coerce_optional_text(value: Any) -> str | None:
         return None
     text = _normalize_text(str(value))
     return text or None
+
+
+def _collect_standard_metadata(
+    item: dict[str, Any],
+    *,
+    metadata_fields: list[str],
+    extra_fields: tuple[str, ...],
+) -> dict[str, Any]:
+    metadata = {field: item.get(field) for field in metadata_fields}
+    for field in extra_fields:
+        if field not in metadata and field in item:
+            metadata[field] = item.get(field)
+    return metadata
+
+
+def _counter_to_sorted_dict(counter: Counter[str]) -> dict[str, int]:
+    return {key: int(counter[key]) for key in sorted(counter)}
+
+
+def _share_dict(counter: Counter[str], total: int) -> dict[str, float]:
+    if total <= 0:
+        return {}
+    return {key: round(counter[key] / total, 6) for key in sorted(counter)}
+
+
+def _sft_bucket_targets(bucket: str) -> dict[str, float]:
+    return SFT_BUCKET_TARGETS.get(bucket, SFT_BUCKET_TARGETS["constructive_direct"])
+
+
+def _sft_target_row_share(bucket: str) -> float:
+    return float(_sft_bucket_targets(bucket).get("target_row_share", 0.0))
+
+
+def _sft_target_label_token_share(bucket: str) -> float:
+    return float(_sft_bucket_targets(bucket).get("target_label_token_share", 0.0))
+
+
+def _sft_min_examples(bucket: str) -> int:
+    return int(_sft_bucket_targets(bucket).get("min_examples", 0))
+
+
+def _coerce_behavior_bucket(metadata: dict[str, Any]) -> str:
+    bucket = _coerce_optional_text(metadata.get("behavior_bucket"))
+    return bucket or "unspecified"
+
+
+def _coerce_quality_tier(metadata: dict[str, Any], *, default: str = "unspecified") -> str:
+    tier = _coerce_optional_text(metadata.get("quality_tier"))
+    return tier or default
+
+
+def _assistant_response_text(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if str(message.get("role", "")).strip() == "assistant":
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return _normalize_text(content)
+            return _normalize_text(str(content))
+    return ""
+
+
+def _normalize_behavior_bucket(value: str | None) -> str | None:
+    normalized = _coerce_optional_text(value)
+    if normalized is None:
+        return None
+    alias_map = {
+        "constructive": "constructive_direct",
+        "constructive_direct": "constructive_direct",
+        "direct_answer": "constructive_direct",
+        "informative_abstention": "informative_abstention",
+        "abstention": "informative_abstention",
+        "clarifying_question": "clarifying_question",
+        "clarifying": "clarifying_question",
+        "comparison_question": "clarifying_question",
+        "hard_refusal": "hard_refusal",
+        "refusal": "hard_refusal",
+    }
+    return alias_map.get(normalized)
+
+
+def _infer_behavior_bucket(messages: list[dict[str, str]], metadata: dict[str, Any]) -> str:
+    explicit_bucket = _normalize_behavior_bucket(metadata.get("behavior_bucket"))
+    if explicit_bucket is not None:
+        return explicit_bucket
+    response = _assistant_response_text(messages).lower()
+    if not response:
+        return "hard_refusal"
+    if any(
+        phrase in response
+        for phrase in (
+            "i can't help with that",
+            "i cannot help with that",
+            "i won't help with that",
+            "i will not help with that",
+            "i can't comply",
+            "i cannot comply",
+        )
+    ):
+        return "hard_refusal"
+    if response.endswith("?") or any(
+        phrase in response
+        for phrase in (
+            "tell me ",
+            "share ",
+            "which two",
+            "what are your goals",
+            "what kind of work",
+            "what interests you",
+        )
+    ):
+        return "clarifying_question"
+    if any(
+        phrase in response
+        for phrase in (
+            "could not verify",
+            "couldn't verify",
+            "could not find",
+            "couldn't find",
+            "do not want to guess",
+            "don't want to guess",
+            "avoid guessing",
+            "what is missing",
+            "not in the current",
+            "check the current catalog",
+            "check the latest catalog",
+            "ask an advisor",
+        )
+    ):
+        return "informative_abstention"
+    return "constructive_direct"
+
+
+def _coerce_chosen_quality_tier(metadata: dict[str, Any]) -> str:
+    tier = _coerce_optional_text(metadata.get("chosen_quality_tier"))
+    return tier or "model_unreviewed"
+
+
+def _coerce_negative_type(metadata: dict[str, Any]) -> str:
+    negative = _coerce_optional_text(metadata.get("negative_type"))
+    return negative or "unspecified"
+
+
+def _source_family(source: DataSourceConfig) -> str:
+    family = _coerce_optional_text(source.family)
+    return family or source.name
+
+
+def _token_share(count: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return count / total
+
+
+def _top_ngram_families(text: str, *, n: int = 4, limit: int = 6) -> list[str]:
+    words = [part for part in text.split() if part]
+    if len(words) < n:
+        return []
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for index in range(len(words) - n + 1):
+        phrase = " ".join(words[index : index + n]).lower()
+        if phrase in seen_set:
+            continue
+        seen.append(phrase)
+        seen_set.add(phrase)
+        if len(seen) >= limit:
+            break
+    return seen
 
 
 def _message_group_id(
@@ -464,6 +697,7 @@ class DatasetBuilder:
                 "name": source.name,
                 "raw_records_consumed": 0,
                 "accepted_records": 0,
+                "restart_count": 0,
             }
             for source in sources
         ]
@@ -566,7 +800,7 @@ class DatasetBuilder:
             extra={
                 "pad_token_id": pad_token_id,
                 "eos_token_id": eos_token_id,
-                "packing_version": "checkpointable-v1",
+                "packing_version": "checkpointable-v2-short-window-guard",
             },
         )
         action, payload = self._resolve_prepare_target(
@@ -586,6 +820,7 @@ class DatasetBuilder:
         resume_workspace.mkdir(parents=True, exist_ok=True)
         resume_state_path = prepared_resume_state_path(manifest_path)
         rows_buffer_path = resume_workspace / "rows-buffer.npy"
+        metadata_buffer_path = resume_workspace / "metadata-buffer.jsonl"
         stage_start_time = time.monotonic()
 
         if action == "resume":
@@ -597,21 +832,37 @@ class DatasetBuilder:
                     "Re-run with --force-rebuild."
                 )
             rows = load_buffer_rows(state.get("rows_buffer_path"))
+            metadata_rows = load_metadata_rows(state.get("metadata_buffer_path"))
             packer = PackedSequencePacker(
                 sequence_length=self.config.sequence_length,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 current=(state.get("packer_state") or {}).get("current", []),
+                current_metadata=(state.get("packer_state") or {}).get("current_metadata", []),
+                dropped_short_windows=int(
+                    (state.get("packer_state") or {}).get("dropped_short_windows", 0)
+                ),
             )
             shards = list(state.get("shards", []))
             shard_index = int(state.get("next_shard_index", len(shards)))
             num_sequences = int(state.get("num_sequences", 0))
             num_tokens = int(state.get("num_tokens", 0))
             dedupe_hash_chunks = list(state.get("dedupe_hash_chunks", []))
+            source_audit_states = [
+                self._restore_lm_audit_state(source, snapshot)
+                for source, snapshot in zip(
+                    sources,
+                    list(state.get("source_audit_states", [])),
+                    strict=False,
+                )
+            ]
+            if len(source_audit_states) != len(sources):
+                source_audit_states = [self._new_lm_audit_state(source) for source in sources]
             seen_hashes = load_seen_hashes(dedupe_hash_chunks) if any(source.deduplicate for source in sources) else set()
         else:
             source_progress = self._initial_source_progress(sources)
             rows: list[list[int]] = []
+            metadata_rows: list[dict[str, Any]] = []
             packer = PackedSequencePacker(
                 sequence_length=self.config.sequence_length,
                 pad_token_id=pad_token_id,
@@ -623,15 +874,10 @@ class DatasetBuilder:
             num_tokens = 0
             dedupe_hash_chunks: list[str] = []
             seen_hashes: set[str] = set()
-
-        def _stage_summary() -> str:
-            return build_progress_snapshot(
-                time.monotonic() - stage_start_time,
-                (num_tokens, token_budget),
-            ).summary
+            source_audit_states = [self._new_lm_audit_state(source) for source in sources]
 
         def _stage_progress(message: str) -> None:
-            _progress(f"{message} [{_stage_summary()}]")
+            _progress(message)
 
         if action == "resume":
             _stage_progress(
@@ -655,8 +901,11 @@ class DatasetBuilder:
                     dedupe_hash_chunks.append(chunk_path)
                 pending_hashes = []
             buffer_path = save_buffer_rows(rows_buffer_path, rows)
+            metadata_buffer = save_metadata_rows(metadata_buffer_path, metadata_rows)
             if buffer_path is None and rows_buffer_path.exists():
                 rows_buffer_path.unlink()
+            if metadata_buffer is None and metadata_buffer_path.exists():
+                metadata_buffer_path.unlink()
             save_resume_state(
                 resume_state_path,
                 {
@@ -672,97 +921,152 @@ class DatasetBuilder:
                     "token_budget": token_budget,
                     "source_snapshots": source_snapshots,
                     "source_progress": source_progress,
+                    "source_audit_states": [
+                        self._serialize_lm_audit_state(audit_state)
+                        for audit_state in source_audit_states
+                    ],
                     "shards": shards,
                     "next_shard_index": shard_index,
                     "num_sequences": num_sequences,
                     "num_tokens": num_tokens,
                     "packer_state": packer.state_dict(),
                     "rows_buffer_path": buffer_path,
+                    "metadata_buffer_path": metadata_buffer,
                     "dedupe_hash_chunks": dedupe_hash_chunks,
                 },
             )
             consumed_since_snapshot = 0
 
         def flush_completed_shard(*, final: bool = False) -> None:
-            nonlocal rows, shard_index
+            nonlocal rows, metadata_rows, shard_index
             if not rows:
                 return
             shard_path = shard_dir / f"shard-{shard_index:05d}.npy"
+            metadata_path = shard_dir / f"metadata-{shard_index:05d}.jsonl"
             save_buffer_rows(shard_path, rows)
-            shards.append({"path": str(shard_path), "rows": len(rows)})
+            save_metadata_rows(metadata_path, metadata_rows)
+            shards.append({"path": str(shard_path), "metadata_path": str(metadata_path), "rows": len(rows)})
             message_prefix = "final shard" if final else "shard"
             _stage_progress(
                 f"WebbGPT: preparing {stage}: wrote {message_prefix} {shard_index + 1} "
                 f"({num_sequences:,} sequences, {num_tokens:,} packed tokens so far)."
             )
             rows = []
+            metadata_rows = []
             shard_index += 1
             snapshot_state()
 
         token_budget_reached = token_budget is not None and num_tokens >= token_budget
-        for source_index, source in enumerate(sources):
-            progress = source_progress[source_index]
-            kept_records = int(progress.get("accepted_records", 0))
-            if token_budget_reached:
-                break
+        use_weighted_mix = len(sources) > 1 and any(abs(float(source.weight) - 1.0) > 1e-6 for source in sources)
+        if use_weighted_mix:
             _stage_progress(
-                f"WebbGPT: preparing {stage} source {source.name} "
-                f"({source.format}) from {_source_location(source)}."
+                f"WebbGPT: preparing {stage} with weighted source mixing across {len(sources)} sources."
             )
-            for item in self._load_source_records(
-                source,
-                raw_records_consumed=int(progress.get("raw_records_consumed", 0)),
+            for source, cleaned_record, token_ids, _audit in self._iter_weighted_tokenized_documents(
+                sources,
+                tokenizer=tokenizer,
+                source_progress=source_progress,
+                source_audits=source_audit_states,
+                seen_hashes=seen_hashes,
             ):
-                progress["raw_records_consumed"] = int(progress.get("raw_records_consumed", 0)) + 1
                 consumed_since_snapshot += 1
-                text = item.get(source.text_field, "")
-                if isinstance(text, str):
-                    record = DocumentRecord(
-                        text=text,
-                        source=source.name,
-                        metadata={field: item.get(field) for field in source.metadata_fields},
-                    )
-                    cleaned = clean_document(record, self.config, source, seen_hashes)
-                    if cleaned.record is not None:
-                        kept_records += 1
-                        progress["accepted_records"] = kept_records
-                        if cleaned.record.document_id and source.deduplicate:
-                            pending_hashes.append(cleaned.record.document_id)
-                        token_ids = tokenizer.encode(cleaned.record.text, add_bos=True, add_eos=True)
-                        for sequence in packer.push(token_ids):
-                            rows.append(sequence)
-                            num_sequences += 1
-                            num_tokens += sum(token != pad_token_id for token in sequence)
-                            if len(rows) >= self.config.prepared_shard_size:
-                                flush_completed_shard()
-                            if token_budget is not None and num_tokens >= token_budget:
-                                token_budget_reached = True
-                                break
-                        if kept_records % 1000 == 0:
-                            _stage_progress(
-                                f"WebbGPT: preparing {stage} source {source.name}: "
-                                f"kept {kept_records:,} documents so far."
-                            )
+                if cleaned_record.document_id and source.deduplicate:
+                    pending_hashes.append(cleaned_record.document_id)
+                sequence_metadata = {
+                    "source": source.name,
+                    "family": _source_family(source),
+                    "document_id": cleaned_record.document_id or "",
+                }
+                for sequence, packed_metadata in packer.push_with_metadata(token_ids, sequence_metadata):
+                    rows.append(sequence)
+                    metadata_rows.append(packed_metadata)
+                    num_sequences += 1
+                    num_tokens += sum(token != pad_token_id for token in sequence)
+                    if len(rows) >= self.config.prepared_shard_size:
+                        flush_completed_shard()
+                    if token_budget is not None and num_tokens >= token_budget:
+                        token_budget_reached = True
+                        break
                 if consumed_since_snapshot >= PREPARE_DOC_SNAPSHOT_INTERVAL:
                     snapshot_state()
                 if token_budget_reached:
                     break
-            _stage_progress(
-                f"WebbGPT: preparing {stage} source {source.name}: "
-                f"finished with {kept_records:,} documents kept."
-            )
+            for source_index, source in enumerate(sources):
+                kept_records = int(source_progress[source_index].get("accepted_records", 0))
+                _stage_progress(
+                    f"WebbGPT: preparing {stage} source {source.name}: "
+                    f"finished with {kept_records:,} documents kept."
+                )
+        else:
+            for source_index, source in enumerate(sources):
+                progress = source_progress[source_index]
+                kept_records = int(progress.get("accepted_records", 0))
+                if token_budget_reached:
+                    break
+                _stage_progress(
+                    f"WebbGPT: preparing {stage} source {source.name} "
+                    f"({source.format}) from {_source_location(source)}."
+                )
+                for cleaned_record, token_ids in self._iter_tokenized_documents_for_source(
+                    source,
+                    tokenizer=tokenizer,
+                    seen_hashes=seen_hashes,
+                    raw_records_consumed=int(progress.get("raw_records_consumed", 0)),
+                    audit_state=source_audit_states[source_index],
+                    progress_state=progress,
+                ):
+                    consumed_since_snapshot += 1
+                    if cleaned_record.document_id and source.deduplicate:
+                        pending_hashes.append(cleaned_record.document_id)
+                    kept_records = int(progress.get("accepted_records", 0))
+                    sequence_metadata = {
+                        "source": source.name,
+                        "family": _source_family(source),
+                        "document_id": cleaned_record.document_id or "",
+                    }
+                    for sequence, packed_metadata in packer.push_with_metadata(token_ids, sequence_metadata):
+                        rows.append(sequence)
+                        metadata_rows.append(packed_metadata)
+                        num_sequences += 1
+                        num_tokens += sum(token != pad_token_id for token in sequence)
+                        if len(rows) >= self.config.prepared_shard_size:
+                            flush_completed_shard()
+                        if token_budget is not None and num_tokens >= token_budget:
+                            token_budget_reached = True
+                            break
+                    if kept_records % 1000 == 0 and kept_records > 0:
+                        _stage_progress(
+                            f"WebbGPT: preparing {stage} source {source.name}: "
+                            f"kept {kept_records:,} documents so far."
+                        )
+                    if consumed_since_snapshot >= PREPARE_DOC_SNAPSHOT_INTERVAL:
+                        snapshot_state()
+                    if token_budget_reached:
+                        break
+                _stage_progress(
+                    f"WebbGPT: preparing {stage} source {source.name}: "
+                    f"finished with {kept_records:,} documents kept."
+                )
 
         if not token_budget_reached:
-            for sequence in packer.finish():
+            for sequence, packed_metadata in packer.finish_with_metadata():
                 rows.append(sequence)
+                metadata_rows.append(packed_metadata)
                 num_sequences += 1
                 num_tokens += sum(token != pad_token_id for token in sequence)
                 if len(rows) >= self.config.prepared_shard_size:
                     flush_completed_shard()
 
         flush_completed_shard(final=True)
+        diagnostics = self._lm_source_diagnostics(
+            source_audit_states,
+            total_tokens=num_tokens,
+            total_documents=sum(int(progress.get("accepted_records", 0)) for progress in source_progress),
+            stage=stage,
+        )
+        diagnostics["too_short_packed_sequences"] = int(packer.dropped_short_windows)
         manifest = {
-            "version": "1.0",
+            "version": "2.0",
             "stage": stage,
             "kind": "packed_lm",
             "input_fingerprint": input_fingerprint,
@@ -773,6 +1077,7 @@ class DatasetBuilder:
             "num_sequences": num_sequences,
             "num_tokens": num_tokens,
             "source_snapshots": source_snapshots,
+            "diagnostics": diagnostics,
             "shards": shards,
         }
         save_prepared_manifest(manifest_path, manifest)
@@ -782,6 +1087,218 @@ class DatasetBuilder:
             f"({num_sequences:,} sequences across {len(shards):,} shards, {num_tokens:,} packed tokens)."
         )
         return manifest
+
+    def _should_keep_sft_example(
+        self,
+        *,
+        bucket: str,
+        label_token_count: int,
+        assistant_text: str,
+    ) -> tuple[bool, str | None]:
+        response = assistant_text.lower().strip()
+        if bucket == "hard_refusal" and (
+            response in {"i can't say that.", "i cant say that.", "i can’t say that."}
+            or response in {"i can't help you.", "i can’t help you.", "i can't help you to help."}
+        ):
+            return False, "generic_refusal"
+        if bucket == "informative_abstention" and label_token_count < 24:
+            return False, "too_short_abstention"
+        return True, None
+
+    def _planned_sft_example_total(
+        self,
+        candidate_bucket_counts: Counter[str],
+    ) -> int:
+        total_candidates = sum(int(count) for count in candidate_bucket_counts.values())
+        if total_candidates <= SFT_BALANCING_WARMUP_EXAMPLES:
+            return total_candidates
+        floor_total = sum(
+            min(int(candidate_bucket_counts[bucket]), _sft_min_examples(bucket))
+            for bucket in candidate_bucket_counts
+        )
+        feasible_limits: list[int] = []
+        for bucket, available in candidate_bucket_counts.items():
+            target_share = _sft_target_row_share(bucket)
+            minimum_examples = _sft_min_examples(bucket)
+            if target_share <= 0.0 or int(available) < max(minimum_examples, 1):
+                continue
+            feasible_limits.append(max(0, math.floor(int(available) / target_share)))
+        if not feasible_limits:
+            return total_candidates
+        return min(total_candidates, max(floor_total, min(feasible_limits)))
+
+    def _planned_sft_bucket_quotas(
+        self,
+        candidate_bucket_counts: Counter[str],
+        *,
+        planned_total_examples: int,
+    ) -> Counter[str]:
+        quotas: Counter[str] = Counter()
+        if planned_total_examples <= 0:
+            return quotas
+        for bucket, available in candidate_bucket_counts.items():
+            quotas[bucket] = min(int(available), _sft_min_examples(bucket))
+        remaining_slots = planned_total_examples - sum(quotas.values())
+        if remaining_slots < 0:
+            overflow = -remaining_slots
+            reducible = sorted(
+                candidate_bucket_counts,
+                key=lambda bucket: (_sft_target_row_share(bucket), bucket),
+                reverse=True,
+            )
+            for bucket in reducible:
+                minimum = min(int(candidate_bucket_counts[bucket]), _sft_min_examples(bucket))
+                removable = max(0, int(quotas[bucket]) - minimum)
+                if removable <= 0:
+                    continue
+                delta = min(removable, overflow)
+                quotas[bucket] -= delta
+                overflow -= delta
+                if overflow <= 0:
+                    break
+            remaining_slots = planned_total_examples - sum(quotas.values())
+        while remaining_slots > 0:
+            eligible = [
+                bucket
+                for bucket, available in candidate_bucket_counts.items()
+                if int(quotas[bucket]) < int(available)
+            ]
+            if not eligible:
+                break
+            selected_bucket = max(
+                eligible,
+                key=lambda bucket: (
+                    _sft_target_row_share(bucket) - (quotas[bucket] / max(planned_total_examples, 1)),
+                    _sft_target_row_share(bucket),
+                    int(candidate_bucket_counts[bucket]) - int(quotas[bucket]),
+                    bucket != "constructive_direct",
+                    bucket,
+                ),
+            )
+            quotas[selected_bucket] += 1
+            remaining_slots -= 1
+        return quotas
+
+    def _ordered_sft_bucket_indices(
+        self,
+        bucket: str,
+        indices: list[int],
+    ) -> list[int]:
+        if bucket == "informative_abstention":
+            # Keep the planner quotas unchanged, but let the newest abstention
+            # examples fill the bucket first so iterative prompt-adjacent fixes
+            # are not crowded out by older verbose rows.
+            return sorted(indices, reverse=True)
+        return list(indices)
+
+    def _select_sft_candidate_indices(
+        self,
+        candidate_metadata_rows: list[dict[str, Any]],
+    ) -> tuple[list[int], dict[str, Any]]:
+        candidate_bucket_indices: dict[str, list[int]] = {}
+        candidate_bucket_counts: Counter[str] = Counter()
+        candidate_bucket_label_tokens: Counter[str] = Counter()
+        for index, metadata in enumerate(candidate_metadata_rows):
+            bucket = str(metadata.get("behavior_bucket", "unspecified"))
+            candidate_bucket_indices.setdefault(bucket, []).append(index)
+            candidate_bucket_counts[bucket] += 1
+            candidate_bucket_label_tokens[bucket] += int(metadata.get("label_token_count", 0))
+        planned_total_examples = self._planned_sft_example_total(candidate_bucket_counts)
+        quotas = self._planned_sft_bucket_quotas(
+            candidate_bucket_counts,
+            planned_total_examples=planned_total_examples,
+        )
+        selected_indices: list[int] = []
+        selected_bucket_counts: Counter[str] = Counter()
+        selected_bucket_label_tokens: Counter[str] = Counter()
+        distribution_reject_counts: Counter[str] = Counter()
+        for bucket in sorted(candidate_bucket_indices):
+            indices = self._ordered_sft_bucket_indices(
+                bucket,
+                candidate_bucket_indices[bucket],
+            )
+            keep_count = min(len(indices), int(quotas[bucket]))
+            selected_bucket_counts[bucket] = keep_count
+            if keep_count > 0:
+                kept_indices = indices[:keep_count]
+                selected_indices.extend(kept_indices)
+                for index in kept_indices:
+                    selected_bucket_label_tokens[bucket] += int(
+                        candidate_metadata_rows[index].get("label_token_count", 0)
+                    )
+            if keep_count < len(indices):
+                distribution_reject_counts[bucket] = len(indices) - keep_count
+        selected_indices.sort()
+        selected_examples = len(selected_indices)
+        selected_label_tokens = sum(selected_bucket_label_tokens.values())
+        bucket_targets: dict[str, dict[str, float]] = {}
+        observed_buckets = sorted(set(candidate_bucket_counts) | set(SFT_BUCKET_TARGETS))
+        for bucket in observed_buckets:
+            bucket_targets[bucket] = {
+                "target_row_share": round(_sft_target_row_share(bucket), 6),
+                "target_label_token_share": round(_sft_target_label_token_share(bucket), 6),
+                "candidate_examples": int(candidate_bucket_counts[bucket]),
+                "candidate_label_tokens": int(candidate_bucket_label_tokens[bucket]),
+                "accepted_examples": int(selected_bucket_counts[bucket]),
+                "accepted_label_tokens": int(selected_bucket_label_tokens[bucket]),
+                "distribution_rejects": int(distribution_reject_counts[bucket]),
+                "realized_row_share": round(
+                    _token_share(int(selected_bucket_counts[bucket]), selected_examples),
+                    6,
+                ),
+                "realized_label_token_share": round(
+                    _token_share(int(selected_bucket_label_tokens[bucket]), selected_label_tokens),
+                    6,
+                ),
+                "distribution_gap": round(
+                    _sft_target_row_share(bucket)
+                    - _token_share(int(selected_bucket_counts[bucket]), selected_examples),
+                    6,
+                ),
+            }
+        return selected_indices, {
+            "planned_total_examples": planned_total_examples,
+            "candidate_bucket_counts": candidate_bucket_counts,
+            "candidate_bucket_label_tokens": candidate_bucket_label_tokens,
+            "selected_bucket_counts": selected_bucket_counts,
+            "selected_bucket_label_tokens": selected_bucket_label_tokens,
+            "distribution_reject_counts": distribution_reject_counts,
+            "bucket_targets": bucket_targets,
+        }
+
+    def _validate_preference_metadata(
+        self,
+        examples: list[PreferenceExample],
+    ) -> dict[str, Any]:
+        invalid_quality_tiers: Counter[str] = Counter()
+        invalid_negative_types: Counter[str] = Counter()
+        approved_template_count = 0
+        for example in examples:
+            quality_tier = _coerce_chosen_quality_tier(example.metadata)
+            negative_type = _coerce_negative_type(example.metadata)
+            if quality_tier not in PROMOTABLE_DPO_CHOSEN_QUALITY_TIERS:
+                invalid_quality_tiers[quality_tier] += 1
+            if negative_type not in PROMOTABLE_DPO_NEGATIVE_TYPES:
+                invalid_negative_types[negative_type] += 1
+            if quality_tier == "approved_template":
+                approved_template_count += 1
+        total_examples = len(examples)
+        template_share = approved_template_count / max(total_examples, 1)
+        blockers: list[str] = []
+        if invalid_quality_tiers:
+            blockers.append("invalid_chosen_quality_tier")
+        if invalid_negative_types:
+            blockers.append("invalid_negative_type")
+        if template_share > 0.25:
+            blockers.append("approved_template_share_too_high")
+        return {
+            "valid_for_promotion": not blockers,
+            "promotion_blockers": blockers,
+            "invalid_quality_tiers": _counter_to_sorted_dict(invalid_quality_tiers),
+            "invalid_negative_types": _counter_to_sorted_dict(invalid_negative_types),
+            "approved_template_count": approved_template_count,
+            "approved_template_share": round(template_share, 6),
+        }
 
     def _prepare_sft_stage(
         self,
@@ -820,8 +1337,7 @@ class DatasetBuilder:
         resume_state_path = prepared_resume_state_path(manifest_path)
         input_buffer_path = resume_workspace / "input-buffer.npy"
         label_buffer_path = resume_workspace / "label-buffer.npy"
-        stage_start_time = time.monotonic()
-
+        metadata_buffer_path = resume_workspace / "metadata-buffer.jsonl"
         if action == "resume":
             state = payload or {}
             source_progress = list(state.get("source_progress", []))
@@ -830,31 +1346,42 @@ class DatasetBuilder:
                     f"Prepared-data resume state at {resume_state_path} no longer matches the configured source list. "
                     "Re-run with --force-rebuild."
                 )
-            input_rows = load_buffer_rows(state.get("input_buffer_path"))
-            label_rows = load_buffer_rows(state.get("label_buffer_path"))
+            candidate_input_rows = load_buffer_rows(state.get("input_buffer_path"))
+            candidate_label_rows = load_buffer_rows(state.get("label_buffer_path"))
+            candidate_metadata_rows = load_metadata_rows(state.get("metadata_buffer_path"))
             shards = list(state.get("shards", []))
             shard_index = int(state.get("next_shard_index", len(shards)))
-            num_examples = int(state.get("num_examples", 0))
-            num_label_tokens = int(state.get("num_label_tokens", 0))
+            candidate_source_row_counts = Counter(state.get("source_row_counts", {}))
+            candidate_source_label_token_counts = Counter(state.get("source_label_token_counts", {}))
+            candidate_bucket_row_counts = Counter(state.get("bucket_row_counts", {}))
+            candidate_bucket_label_token_counts = Counter(state.get("bucket_label_token_counts", {}))
+            skipped_bucket_counts = Counter(state.get("skipped_bucket_counts", {}))
+            skipped_reason_counts = Counter(state.get("skipped_reason_counts", {}))
+            candidate_prompt_signature_counts = Counter(state.get("prompt_signature_counts", {}))
+            truncated_examples = int(state.get("truncated_examples", 0))
         else:
             source_progress = self._initial_source_progress(sources)
-            input_rows = []
-            label_rows = []
+            candidate_input_rows = []
+            candidate_label_rows = []
+            candidate_metadata_rows = []
             shards = []
             shard_index = 0
-            num_examples = 0
-            num_label_tokens = 0
-
-        def _stage_summary() -> str:
-            return build_progress_snapshot(time.monotonic() - stage_start_time).summary
+            candidate_source_row_counts = Counter()
+            candidate_source_label_token_counts = Counter()
+            candidate_bucket_row_counts = Counter()
+            candidate_bucket_label_token_counts = Counter()
+            skipped_bucket_counts = Counter()
+            skipped_reason_counts = Counter()
+            candidate_prompt_signature_counts = Counter()
+            truncated_examples = 0
 
         def _stage_progress(message: str) -> None:
-            _progress(f"{message} [{_stage_summary()}]")
+            _progress(message)
 
         if action == "resume":
             _stage_progress(
                 f"WebbGPT: resuming prepared stage {stage} "
-                f"from {len(shards):,} shard(s) and {num_examples:,} examples."
+                f"from {len(shards):,} shard(s) and {len(candidate_metadata_rows):,} collected candidates."
             )
         else:
             _stage_progress(f"WebbGPT: starting fresh prepared stage {stage}.")
@@ -863,16 +1390,19 @@ class DatasetBuilder:
 
         def snapshot_state() -> None:
             nonlocal consumed_since_snapshot
-            input_buffer = save_buffer_rows(input_buffer_path, input_rows)
-            label_buffer = save_buffer_rows(label_buffer_path, label_rows)
+            input_buffer = save_buffer_rows(input_buffer_path, candidate_input_rows)
+            label_buffer = save_buffer_rows(label_buffer_path, candidate_label_rows)
+            metadata_buffer = save_metadata_rows(metadata_buffer_path, candidate_metadata_rows)
             if input_buffer is None and input_buffer_path.exists():
                 input_buffer_path.unlink()
             if label_buffer is None and label_buffer_path.exists():
                 label_buffer_path.unlink()
+            if metadata_buffer is None and metadata_buffer_path.exists():
+                metadata_buffer_path.unlink()
             save_resume_state(
                 resume_state_path,
                 {
-                    "version": "1.0",
+                    "version": "2.0",
                     "stage": stage,
                     "kind": "sft",
                     "input_fingerprint": input_fingerprint,
@@ -884,27 +1414,50 @@ class DatasetBuilder:
                     "source_progress": source_progress,
                     "shards": shards,
                     "next_shard_index": shard_index,
-                    "num_examples": num_examples,
-                    "num_label_tokens": num_label_tokens,
+                    "num_examples": len(candidate_metadata_rows),
+                    "num_label_tokens": sum(
+                        int(row.get("label_token_count", 0))
+                        for row in candidate_metadata_rows
+                    ),
                     "input_buffer_path": input_buffer,
                     "label_buffer_path": label_buffer,
+                    "metadata_buffer_path": metadata_buffer,
+                    "source_row_counts": dict(candidate_source_row_counts),
+                    "source_label_token_counts": dict(candidate_source_label_token_counts),
+                    "bucket_row_counts": dict(candidate_bucket_row_counts),
+                    "bucket_label_token_counts": dict(candidate_bucket_label_token_counts),
+                    "skipped_bucket_counts": dict(skipped_bucket_counts),
+                    "skipped_reason_counts": dict(skipped_reason_counts),
+                    "prompt_signature_counts": dict(candidate_prompt_signature_counts),
+                    "truncated_examples": truncated_examples,
                 },
             )
             consumed_since_snapshot = 0
 
-        def flush_completed_shard(*, final: bool = False) -> None:
-            nonlocal input_rows, label_rows, shard_index
-            if not input_rows:
+        def flush_completed_shard(
+            shard_input_rows: list[list[int]],
+            shard_label_rows: list[list[int]],
+            shard_metadata_rows: list[dict[str, Any]],
+            *,
+            final: bool = False,
+            num_examples: int,
+            num_label_tokens: int,
+        ) -> None:
+            nonlocal shard_index
+            if not shard_input_rows:
                 return
             input_path = shard_dir / f"input_ids-{shard_index:05d}.npy"
             label_path = shard_dir / f"labels-{shard_index:05d}.npy"
-            save_buffer_rows(input_path, input_rows)
-            save_buffer_rows(label_path, label_rows)
+            metadata_path = shard_dir / f"metadata-{shard_index:05d}.jsonl"
+            save_buffer_rows(input_path, shard_input_rows)
+            save_buffer_rows(label_path, shard_label_rows)
+            save_metadata_rows(metadata_path, shard_metadata_rows)
             shards.append(
                 {
                     "input_ids_path": str(input_path),
                     "labels_path": str(label_path),
-                    "rows": len(input_rows),
+                    "metadata_path": str(metadata_path),
+                    "rows": len(shard_input_rows),
                 }
             )
             message_prefix = "final shard" if final else "shard"
@@ -912,10 +1465,7 @@ class DatasetBuilder:
                 f"WebbGPT: preparing {stage}: wrote {message_prefix} {shard_index + 1} "
                 f"({num_examples:,} examples, {num_label_tokens:,} supervised tokens so far)."
             )
-            input_rows = []
-            label_rows = []
             shard_index += 1
-            snapshot_state()
 
         for source_index, source in enumerate(sources):
             progress = source_progress[source_index]
@@ -939,29 +1489,117 @@ class DatasetBuilder:
                         continue
                     messages = [*prompt_messages, {"role": "assistant", "content": response}]
                 input_ids, labels = encode_sft_messages(messages, tokenizer, self.config.sequence_length)
-                input_rows.append(input_ids)
-                label_rows.append(labels)
+                metadata = _collect_standard_metadata(
+                    item,
+                    metadata_fields=source.metadata_fields,
+                    extra_fields=STANDARD_SFT_METADATA_FIELDS,
+                )
+                prompt_hash = _prompt_signature_hash(messages)
+                bucket = _infer_behavior_bucket(messages, metadata)
+                label_token_count = sum(label != -100 for label in labels)
+                truncated = sum(token != tokenizer.token_to_id("<pad>") for token in input_ids) >= self.config.sequence_length
+                keep_example, skipped_reason = self._should_keep_sft_example(
+                    bucket=bucket,
+                    label_token_count=label_token_count,
+                    assistant_text=_assistant_response_text(messages),
+                )
+                if not keep_example:
+                    skipped_bucket_counts[bucket] += 1
+                    skipped_reason_counts[skipped_reason or "filtered"] += 1
+                    if consumed_since_snapshot >= PREPARE_EXAMPLE_SNAPSHOT_INTERVAL:
+                        snapshot_state()
+                    continue
+                candidate_input_rows.append(input_ids)
+                candidate_label_rows.append(labels)
+                candidate_metadata_rows.append(
+                    {
+                        "example_id": _message_example_id(source, item, messages),
+                        "split_group_id": _message_group_id(source, item, messages),
+                        "source": source.name,
+                        "prompt_signature_hash": prompt_hash,
+                        "behavior_bucket": bucket,
+                        "quality_tier": _coerce_quality_tier(metadata),
+                        "label_token_count": label_token_count,
+                    }
+                )
                 accepted_records += 1
                 progress["accepted_records"] = accepted_records
-                num_examples += 1
-                num_label_tokens += sum(label != -100 for label in labels)
-                if len(input_rows) >= self.config.prepared_shard_size:
-                    flush_completed_shard()
+                candidate_source_row_counts[source.name] += 1
+                candidate_source_label_token_counts[source.name] += label_token_count
+                candidate_bucket_row_counts[bucket] += 1
+                candidate_bucket_label_token_counts[bucket] += label_token_count
+                candidate_prompt_signature_counts[prompt_hash] += 1
+                if truncated:
+                    truncated_examples += 1
                 if accepted_records % 500 == 0:
                     _stage_progress(
                         f"WebbGPT: preparing {stage} source {source.name}: "
-                        f"loaded {accepted_records:,} SFT examples so far."
+                        f"collected {accepted_records:,} valid SFT candidates so far."
                     )
                 if consumed_since_snapshot >= PREPARE_EXAMPLE_SNAPSHOT_INTERVAL:
                     snapshot_state()
             _stage_progress(
                 f"WebbGPT: preparing {stage} source {source.name}: "
-                f"finished with {accepted_records:,} SFT examples."
+                f"finished with {accepted_records:,} valid SFT candidates."
             )
-
-        flush_completed_shard(final=True)
+        selected_indices, planner = self._select_sft_candidate_indices(candidate_metadata_rows)
+        selected_input_rows = [candidate_input_rows[index] for index in selected_indices]
+        selected_label_rows = [candidate_label_rows[index] for index in selected_indices]
+        selected_metadata_rows = [candidate_metadata_rows[index] for index in selected_indices]
+        num_examples = len(selected_metadata_rows)
+        num_label_tokens = sum(int(row.get("label_token_count", 0)) for row in selected_metadata_rows)
+        source_row_counts = Counter(str(row.get("source", "prepared")) for row in selected_metadata_rows)
+        source_label_token_counts: Counter[str] = Counter()
+        bucket_row_counts = Counter(str(row.get("behavior_bucket", "unspecified")) for row in selected_metadata_rows)
+        bucket_label_token_counts: Counter[str] = Counter()
+        selected_prompt_signature_counts: Counter[str] = Counter()
+        for row in selected_metadata_rows:
+            source_name = str(row.get("source", "prepared"))
+            bucket_name = str(row.get("behavior_bucket", "unspecified"))
+            label_token_count = int(row.get("label_token_count", 0))
+            source_label_token_counts[source_name] += label_token_count
+            bucket_label_token_counts[bucket_name] += label_token_count
+            prompt_hash = str(row.get("prompt_signature_hash", ""))
+            if prompt_hash:
+                selected_prompt_signature_counts[prompt_hash] += 1
+        shard_input_rows: list[list[int]] = []
+        shard_label_rows: list[list[int]] = []
+        shard_metadata_rows: list[dict[str, Any]] = []
+        emitted_examples = 0
+        emitted_label_tokens = 0
+        for input_ids, labels, metadata in zip(
+            selected_input_rows,
+            selected_label_rows,
+            selected_metadata_rows,
+            strict=False,
+        ):
+            shard_input_rows.append(input_ids)
+            shard_label_rows.append(labels)
+            shard_metadata_rows.append(metadata)
+            emitted_examples += 1
+            emitted_label_tokens += int(metadata.get("label_token_count", 0))
+            if len(shard_input_rows) >= self.config.prepared_shard_size:
+                flush_completed_shard(
+                    shard_input_rows,
+                    shard_label_rows,
+                    shard_metadata_rows,
+                    num_examples=emitted_examples,
+                    num_label_tokens=emitted_label_tokens,
+                )
+                shard_input_rows = []
+                shard_label_rows = []
+                shard_metadata_rows = []
+        flush_completed_shard(
+            shard_input_rows,
+            shard_label_rows,
+            shard_metadata_rows,
+            final=True,
+            num_examples=emitted_examples,
+            num_label_tokens=emitted_label_tokens,
+        )
+        duplicate_prompt_count = sum(count - 1 for count in selected_prompt_signature_counts.values() if count > 1)
         manifest = {
-            "version": "1.0",
+            "version": "2.0",
             "stage": stage,
             "kind": "sft",
             "input_fingerprint": input_fingerprint,
@@ -971,6 +1609,58 @@ class DatasetBuilder:
             "num_examples": num_examples,
             "num_label_tokens": num_label_tokens,
             "source_snapshots": source_snapshots,
+            "diagnostics": {
+                "planned_total_examples": int(planner["planned_total_examples"]),
+                "candidate_examples": len(candidate_metadata_rows),
+                "candidate_label_tokens": sum(
+                    int(row.get("label_token_count", 0))
+                    for row in candidate_metadata_rows
+                ),
+                "per_source_rows": _counter_to_sorted_dict(source_row_counts),
+                "per_source_label_tokens": _counter_to_sorted_dict(source_label_token_counts),
+                "per_source_row_share": _share_dict(source_row_counts, num_examples),
+                "per_source_label_token_share": _share_dict(source_label_token_counts, num_label_tokens),
+                "candidate_per_source_rows": _counter_to_sorted_dict(candidate_source_row_counts),
+                "candidate_per_source_label_tokens": _counter_to_sorted_dict(candidate_source_label_token_counts),
+                "candidate_per_source_row_share": _share_dict(candidate_source_row_counts, len(candidate_metadata_rows)),
+                "candidate_per_source_label_token_share": _share_dict(
+                    candidate_source_label_token_counts,
+                    sum(
+                        int(row.get("label_token_count", 0))
+                        for row in candidate_metadata_rows
+                    ),
+                ),
+                "per_bucket_rows": _counter_to_sorted_dict(bucket_row_counts),
+                "per_bucket_label_tokens": _counter_to_sorted_dict(bucket_label_token_counts),
+                "per_bucket_row_share": _share_dict(bucket_row_counts, num_examples),
+                "per_bucket_label_token_share": _share_dict(bucket_label_token_counts, num_label_tokens),
+                "candidate_per_bucket_rows": _counter_to_sorted_dict(planner["candidate_bucket_counts"]),
+                "candidate_per_bucket_label_tokens": _counter_to_sorted_dict(planner["candidate_bucket_label_tokens"]),
+                "candidate_per_bucket_row_share": _share_dict(
+                    planner["candidate_bucket_counts"],
+                    len(candidate_metadata_rows),
+                ),
+                "candidate_per_bucket_label_token_share": _share_dict(
+                    planner["candidate_bucket_label_tokens"],
+                    sum(
+                        int(row.get("label_token_count", 0))
+                        for row in candidate_metadata_rows
+                    ),
+                ),
+                "bucket_planner_targets": planner["bucket_targets"],
+                "distribution_reject_bucket_rows": _counter_to_sorted_dict(planner["distribution_reject_counts"]),
+                "skipped_bucket_rows": _counter_to_sorted_dict(skipped_bucket_counts),
+                "skipped_reason_rows": _counter_to_sorted_dict(skipped_reason_counts),
+                "truncated_examples": truncated_examples,
+                "truncation_rate": 0.0 if len(candidate_metadata_rows) <= 0 else round(truncated_examples / len(candidate_metadata_rows), 6),
+                "prompt_signature_unique_count": len(selected_prompt_signature_counts),
+                "prompt_signature_duplicate_count": duplicate_prompt_count,
+            },
+            "trust": {
+                "artifact_status": "promotable",
+                "promotion_blockers": [],
+                "supports_prompt_overlap_check": True,
+            },
             "shards": shards,
         }
         save_prepared_manifest(manifest_path, manifest)
@@ -1018,8 +1708,7 @@ class DatasetBuilder:
         resume_state_path = prepared_resume_state_path(manifest_path)
         chosen_buffer_path = resume_workspace / "chosen-buffer.npy"
         rejected_buffer_path = resume_workspace / "rejected-buffer.npy"
-        stage_start_time = time.monotonic()
-
+        metadata_buffer_path = resume_workspace / "metadata-buffer.jsonl"
         if action == "resume":
             state = payload or {}
             source_progress = list(state.get("source_progress", []))
@@ -1030,22 +1719,31 @@ class DatasetBuilder:
                 )
             chosen_rows = load_buffer_rows(state.get("chosen_buffer_path"))
             rejected_rows = load_buffer_rows(state.get("rejected_buffer_path"))
+            metadata_rows = load_metadata_rows(state.get("metadata_buffer_path"))
             shards = list(state.get("shards", []))
             shard_index = int(state.get("next_shard_index", len(shards)))
             num_examples = int(state.get("num_examples", 0))
+            source_row_counts = Counter(state.get("source_row_counts", {}))
+            source_token_counts = Counter(state.get("source_token_counts", {}))
+            negative_type_counts = Counter(state.get("negative_type_counts", {}))
+            prompt_signature_counts = Counter(state.get("prompt_signature_counts", {}))
+            truncated_examples = int(state.get("truncated_examples", 0))
         else:
             source_progress = self._initial_source_progress(sources)
             chosen_rows = []
             rejected_rows = []
+            metadata_rows = []
             shards = []
             shard_index = 0
             num_examples = 0
-
-        def _stage_summary() -> str:
-            return build_progress_snapshot(time.monotonic() - stage_start_time).summary
+            source_row_counts = Counter()
+            source_token_counts = Counter()
+            negative_type_counts = Counter()
+            prompt_signature_counts = Counter()
+            truncated_examples = 0
 
         def _stage_progress(message: str) -> None:
-            _progress(f"{message} [{_stage_summary()}]")
+            _progress(message)
 
         if action == "resume":
             _stage_progress(
@@ -1061,14 +1759,17 @@ class DatasetBuilder:
             nonlocal consumed_since_snapshot
             chosen_buffer = save_buffer_rows(chosen_buffer_path, chosen_rows)
             rejected_buffer = save_buffer_rows(rejected_buffer_path, rejected_rows)
+            metadata_buffer = save_metadata_rows(metadata_buffer_path, metadata_rows)
             if chosen_buffer is None and chosen_buffer_path.exists():
                 chosen_buffer_path.unlink()
             if rejected_buffer is None and rejected_buffer_path.exists():
                 rejected_buffer_path.unlink()
+            if metadata_buffer is None and metadata_buffer_path.exists():
+                metadata_buffer_path.unlink()
             save_resume_state(
                 resume_state_path,
                 {
-                    "version": "1.0",
+                    "version": "2.0",
                     "stage": stage,
                     "kind": "preference",
                     "input_fingerprint": input_fingerprint,
@@ -1083,22 +1784,31 @@ class DatasetBuilder:
                     "num_examples": num_examples,
                     "chosen_buffer_path": chosen_buffer,
                     "rejected_buffer_path": rejected_buffer,
+                    "metadata_buffer_path": metadata_buffer,
+                    "source_row_counts": dict(source_row_counts),
+                    "source_token_counts": dict(source_token_counts),
+                    "negative_type_counts": dict(negative_type_counts),
+                    "prompt_signature_counts": dict(prompt_signature_counts),
+                    "truncated_examples": truncated_examples,
                 },
             )
             consumed_since_snapshot = 0
 
         def flush_completed_shard(*, final: bool = False) -> None:
-            nonlocal chosen_rows, rejected_rows, shard_index
+            nonlocal chosen_rows, rejected_rows, metadata_rows, shard_index
             if not chosen_rows:
                 return
             chosen_path = shard_dir / f"chosen_input_ids-{shard_index:05d}.npy"
             rejected_path = shard_dir / f"rejected_input_ids-{shard_index:05d}.npy"
+            metadata_path = shard_dir / f"metadata-{shard_index:05d}.jsonl"
             save_buffer_rows(chosen_path, chosen_rows)
             save_buffer_rows(rejected_path, rejected_rows)
+            save_metadata_rows(metadata_path, metadata_rows)
             shards.append(
                 {
                     "chosen_input_ids_path": str(chosen_path),
                     "rejected_input_ids_path": str(rejected_path),
+                    "metadata_path": str(metadata_path),
                     "rows": len(chosen_rows),
                 }
             )
@@ -1109,6 +1819,7 @@ class DatasetBuilder:
             )
             chosen_rows = []
             rejected_rows = []
+            metadata_rows = []
             shard_index += 1
             snapshot_state()
 
@@ -1129,11 +1840,43 @@ class DatasetBuilder:
                     if consumed_since_snapshot >= PREPARE_EXAMPLE_SNAPSHOT_INTERVAL:
                         snapshot_state()
                     continue
-                chosen_rows.append(encode_preference_example(prompt, chosen, tokenizer, self.config.sequence_length))
-                rejected_rows.append(encode_preference_example(prompt, rejected, tokenizer, self.config.sequence_length))
+                chosen_input_ids = encode_preference_example(prompt, chosen, tokenizer, self.config.sequence_length)
+                rejected_input_ids = encode_preference_example(prompt, rejected, tokenizer, self.config.sequence_length)
+                metadata = _collect_standard_metadata(
+                    item,
+                    metadata_fields=source.metadata_fields,
+                    extra_fields=STANDARD_PREFERENCE_METADATA_FIELDS,
+                )
+                prompt_hash = _prompt_signature_hash(prompt)
+                chosen_token_count = sum(token != tokenizer.token_to_id("<pad>") for token in chosen_input_ids)
+                rejected_token_count = sum(token != tokenizer.token_to_id("<pad>") for token in rejected_input_ids)
+                truncated = (
+                    chosen_token_count >= self.config.sequence_length
+                    or rejected_token_count >= self.config.sequence_length
+                )
+                chosen_rows.append(chosen_input_ids)
+                rejected_rows.append(rejected_input_ids)
+                metadata_rows.append(
+                    {
+                        "example_id": _preference_example_id(source, item, prompt, chosen, rejected),
+                        "split_group_id": _message_group_id(source, item, prompt),
+                        "source": source.name,
+                        "prompt_signature_hash": prompt_hash,
+                        "chosen_quality_tier": _coerce_chosen_quality_tier(metadata),
+                        "negative_type": _coerce_negative_type(metadata),
+                        "chosen_token_count": chosen_token_count,
+                        "rejected_token_count": rejected_token_count,
+                    }
+                )
                 accepted_records += 1
                 progress["accepted_records"] = accepted_records
                 num_examples += 1
+                source_row_counts[source.name] += 1
+                source_token_counts[source.name] += chosen_token_count + rejected_token_count
+                negative_type_counts[_coerce_negative_type(metadata)] += 1
+                prompt_signature_counts[prompt_hash] += 1
+                if truncated:
+                    truncated_examples += 1
                 if len(chosen_rows) >= self.config.prepared_shard_size:
                     flush_completed_shard()
                 if accepted_records % 500 == 0:
@@ -1149,8 +1892,9 @@ class DatasetBuilder:
             )
 
         flush_completed_shard(final=True)
+        duplicate_prompt_count = sum(count - 1 for count in prompt_signature_counts.values() if count > 1)
         manifest = {
-            "version": "1.0",
+            "version": "2.0",
             "stage": stage,
             "kind": "preference",
             "input_fingerprint": input_fingerprint,
@@ -1159,6 +1903,23 @@ class DatasetBuilder:
             "pad_token_id": tokenizer.token_to_id("<pad>"),
             "num_examples": num_examples,
             "source_snapshots": source_snapshots,
+            "diagnostics": {
+                "per_source_rows": _counter_to_sorted_dict(source_row_counts),
+                "per_source_tokens": _counter_to_sorted_dict(source_token_counts),
+                "per_source_row_share": _share_dict(source_row_counts, num_examples),
+                "per_source_token_share": _share_dict(source_token_counts, sum(source_token_counts.values())),
+                "per_negative_type_rows": _counter_to_sorted_dict(negative_type_counts),
+                "per_negative_type_row_share": _share_dict(negative_type_counts, num_examples),
+                "truncated_examples": truncated_examples,
+                "truncation_rate": 0.0 if num_examples <= 0 else round(truncated_examples / num_examples, 6),
+                "prompt_signature_unique_count": len(prompt_signature_counts),
+                "prompt_signature_duplicate_count": duplicate_prompt_count,
+            },
+            "trust": {
+                "artifact_status": "promotable",
+                "promotion_blockers": [],
+                "supports_prompt_overlap_check": True,
+            },
             "shards": shards,
         }
         save_prepared_manifest(manifest_path, manifest)
@@ -1250,9 +2011,786 @@ class DatasetBuilder:
             return dataset
         return dataset
 
+    def _new_lm_audit_state(self, source: DataSourceConfig) -> dict[str, Any]:
+        return {
+            "source": source.name,
+            "family": _source_family(source),
+            "weight": float(source.weight),
+            "target_share": 0.0,
+            "raw_records": 0,
+            "kept_documents": 0,
+            "kept_tokens": 0,
+            "dropped_reasons": Counter(),
+            "repeated_documents": 0,
+            "restart_count": 0,
+            "unique_document_ids": set(),
+            "phrase_counter": Counter(),
+        }
+
+    def _serialize_lm_audit_state(self, audit_state: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "source": str(audit_state["source"]),
+            "family": str(audit_state["family"]),
+            "weight": float(audit_state["weight"]),
+            "target_share": float(audit_state.get("target_share", 0.0)),
+            "raw_records": int(audit_state["raw_records"]),
+            "kept_documents": int(audit_state["kept_documents"]),
+            "kept_tokens": int(audit_state["kept_tokens"]),
+            "dropped_reasons": dict(audit_state["dropped_reasons"]),
+            "repeated_documents": int(audit_state["repeated_documents"]),
+            "restart_count": int(audit_state.get("restart_count", 0)),
+            "phrase_counter": dict(audit_state["phrase_counter"]),
+        }
+
+    def _restore_lm_audit_state(
+        self,
+        source: DataSourceConfig,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        audit_state = self._new_lm_audit_state(source)
+        if snapshot is None:
+            return audit_state
+        audit_state["target_share"] = float(snapshot.get("target_share", audit_state["target_share"]))
+        audit_state["raw_records"] = int(snapshot.get("raw_records", 0))
+        audit_state["kept_documents"] = int(snapshot.get("kept_documents", 0))
+        audit_state["kept_tokens"] = int(snapshot.get("kept_tokens", 0))
+        audit_state["dropped_reasons"] = Counter(snapshot.get("dropped_reasons", {}))
+        audit_state["repeated_documents"] = int(snapshot.get("repeated_documents", 0))
+        audit_state["restart_count"] = int(snapshot.get("restart_count", 0))
+        audit_state["phrase_counter"] = Counter(snapshot.get("phrase_counter", {}))
+        return audit_state
+
+    def _realizable_lm_token_capacity(
+        self,
+        *,
+        kept_documents: int,
+        kept_tokens: int,
+        repeated_documents: int,
+    ) -> int:
+        if kept_documents <= 0 or kept_tokens <= 0:
+            return 0
+        repeat_cap = float(self.config.lm_max_source_repeat_rate)
+        if repeat_cap >= 1.0:
+            return kept_tokens
+        unique_documents = max(kept_documents - repeated_documents, 0)
+        if unique_documents <= 0:
+            return kept_tokens
+        if repeat_cap <= 0.0:
+            max_documents = unique_documents
+        else:
+            max_documents = int(math.floor(unique_documents / max(1.0 - repeat_cap, 1e-8) + 1e-8))
+        average_tokens = kept_tokens / max(kept_documents, 1)
+        return max(kept_tokens, int(math.floor(average_tokens * max_documents + 1e-8)))
+
+    def _effective_target_token_allocations(
+        self,
+        source_reports: list[dict[str, Any]],
+        *,
+        total_tokens: int,
+    ) -> list[float]:
+        if total_tokens <= 0 or not source_reports:
+            return [0.0 for _ in source_reports]
+        configured_targets = [max(float(report.get("target_share", 0.0)), 0.0) for report in source_reports]
+        capacities = [
+            float(
+                self._realizable_lm_token_capacity(
+                    kept_documents=int(report.get("kept_documents", 0)),
+                    kept_tokens=int(report.get("kept_tokens", 0)),
+                    repeated_documents=int(report.get("repeated_documents", 0)),
+                )
+            )
+            for report in source_reports
+        ]
+        allocations = [0.0 for _ in source_reports]
+        remaining = set(range(len(source_reports)))
+        remaining_tokens = float(total_tokens)
+        while remaining and remaining_tokens > 0.0:
+            total_target = sum(configured_targets[index] for index in remaining)
+            if total_target <= 0.0:
+                break
+            capped_any = False
+            for index in list(remaining):
+                desired_tokens = remaining_tokens * configured_targets[index] / total_target
+                if desired_tokens > capacities[index] + 1e-8:
+                    allocations[index] = capacities[index]
+                    remaining_tokens -= capacities[index]
+                    remaining.remove(index)
+                    capped_any = True
+            if not capped_any:
+                for index in remaining:
+                    allocations[index] = remaining_tokens * configured_targets[index] / total_target
+                remaining.clear()
+        if remaining and remaining_tokens > 0.0:
+            equal_share = remaining_tokens / max(len(remaining), 1)
+            for index in remaining:
+                allocations[index] = min(equal_share, capacities[index])
+        return allocations
+
+    def _finalize_lm_source_reports(
+        self,
+        source_reports: list[dict[str, Any]],
+        *,
+        total_tokens: int,
+        total_documents: int,
+    ) -> None:
+        effective_target_tokens = self._effective_target_token_allocations(
+            source_reports,
+            total_tokens=total_tokens,
+        )
+        for index, report in enumerate(source_reports):
+            report["token_share"] = round(_token_share(int(report["kept_tokens"]), total_tokens), 6)
+            report["document_share"] = round(_token_share(int(report["kept_documents"]), total_documents), 6)
+            report["share_gap"] = round(float(report["target_share"]) - float(report["token_share"]), 6)
+            realizable_capacity = self._realizable_lm_token_capacity(
+                kept_documents=int(report.get("kept_documents", 0)),
+                kept_tokens=int(report.get("kept_tokens", 0)),
+                repeated_documents=int(report.get("repeated_documents", 0)),
+            )
+            effective_target_share = _token_share(int(round(effective_target_tokens[index])), total_tokens)
+            configured_target_tokens = float(report["target_share"]) * max(total_tokens, 0)
+            report["effective_target_share"] = round(effective_target_share, 6)
+            report["effective_share_gap"] = round(
+                float(report["effective_target_share"]) - float(report["token_share"]),
+                6,
+            )
+            report["realizable_token_capacity"] = int(realizable_capacity)
+            report["realizability_limited"] = realizable_capacity + 1e-8 < configured_target_tokens
+
+    def _is_local_mvp_domain_source_report(self, report: dict[str, Any]) -> bool:
+        source = str(report.get("source", ""))
+        family = str(report.get("family", ""))
+        return (
+            source in LOCAL_MVP_PRETRAIN_DOMAIN_SOURCE_NAMES
+            or family in LOCAL_MVP_PRETRAIN_DOMAIN_FAMILIES
+        )
+
+    def _pretrain_domain_contribution_summary(
+        self,
+        source_reports: list[dict[str, Any]],
+        *,
+        total_tokens: int,
+        total_documents: int,
+    ) -> dict[str, Any]:
+        domain_reports = [
+            report for report in source_reports if self._is_local_mvp_domain_source_report(report)
+        ]
+        domain_tokens = sum(int(report.get("kept_tokens", 0)) for report in domain_reports)
+        domain_documents = sum(int(report.get("kept_documents", 0)) for report in domain_reports)
+        token_share = _token_share(domain_tokens, total_tokens)
+        document_share = _token_share(domain_documents, total_documents)
+        configured_target_share = sum(float(report.get("target_share", 0.0)) for report in domain_reports)
+        effective_target_share = sum(float(report.get("effective_target_share", 0.0)) for report in domain_reports)
+        family_tokens: Counter[str] = Counter()
+        for report in domain_reports:
+            family_tokens[str(report.get("family", ""))] += int(report.get("kept_tokens", 0))
+        failures: list[str] = []
+        if domain_tokens < LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS:
+            failures.append("domain_tokens_too_low")
+        if token_share < LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE:
+            failures.append("domain_share_too_low")
+        return {
+            "passed": not failures,
+            "severity": "pass" if not failures else "warning",
+            "failures": failures,
+            "minimum_token_share": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE,
+            "minimum_tokens": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS,
+            "domain_tokens": domain_tokens,
+            "domain_documents": domain_documents,
+            "token_share": round(token_share, 6),
+            "document_share": round(document_share, 6),
+            "configured_target_share": round(configured_target_share, 6),
+            "configured_share_gap": round(configured_target_share - token_share, 6),
+            "effective_target_share": round(effective_target_share, 6),
+            "effective_share_gap": round(effective_target_share - token_share, 6),
+            "source_count": len(domain_reports),
+            "source_names": [str(report.get("source", "")) for report in domain_reports],
+            "family_token_share": {
+                family: round(_token_share(tokens, total_tokens), 6)
+                for family, tokens in sorted(family_tokens.items())
+            },
+            "realizability_limited_sources": [
+                str(report.get("source", ""))
+                for report in domain_reports
+                if bool(report.get("realizability_limited", False))
+            ],
+            "all_domain_sources_realizability_limited": bool(domain_reports)
+            and all(bool(report.get("realizability_limited", False)) for report in domain_reports),
+        }
+
+    def _lm_source_diagnostics(
+        self,
+        source_audit_states: list[dict[str, Any]],
+        *,
+        total_tokens: int,
+        total_documents: int,
+        stage: str | None = None,
+    ) -> dict[str, Any]:
+        source_reports: list[dict[str, Any]] = []
+        family_counts: Counter[str] = Counter()
+        phrase_counter: Counter[str] = Counter()
+        for audit_state in source_audit_states:
+            kept_documents = int(audit_state["kept_documents"])
+            kept_tokens = int(audit_state["kept_tokens"])
+            if kept_documents > 0:
+                family_counts[str(audit_state["family"])] += 1
+            phrase_counter.update(audit_state["phrase_counter"])
+            source_reports.append(
+                {
+                    "source": str(audit_state["source"]),
+                    "family": str(audit_state["family"]),
+                    "weight": float(audit_state["weight"]),
+                    "target_share": round(float(audit_state.get("target_share", 0.0)), 6),
+                    "raw_records": int(audit_state["raw_records"]),
+                    "kept_documents": kept_documents,
+                    "kept_tokens": kept_tokens,
+                    "repeated_documents": int(audit_state["repeated_documents"]),
+                    "restart_count": int(audit_state.get("restart_count", 0)),
+                    "repeat_rate": round(
+                        int(audit_state["repeated_documents"]) / max(kept_documents, 1),
+                        6,
+                    ),
+                    "dropped_reasons": _counter_to_sorted_dict(audit_state["dropped_reasons"]),
+                }
+            )
+        self._finalize_lm_source_reports(
+            source_reports,
+            total_tokens=total_tokens,
+            total_documents=total_documents,
+        )
+        diagnostics = {
+            "per_source": source_reports,
+            "source_family_count": sum(1 for count in family_counts.values() if count > 0),
+            "max_single_source_token_share": round(
+                max((float(report["token_share"]) for report in source_reports), default=0.0),
+                6,
+            ),
+            "max_repeat_rate": round(
+                max((float(report["repeat_rate"]) for report in source_reports), default=0.0),
+                6,
+            ),
+            "top_repeated_phrases": [
+                {"phrase": phrase, "count": count}
+                for phrase, count in phrase_counter.most_common(10)
+            ],
+        }
+        if stage == "pretrain":
+            diagnostics["domain_contribution"] = self._pretrain_domain_contribution_summary(
+                source_reports,
+                total_tokens=total_tokens,
+                total_documents=total_documents,
+            )
+        return diagnostics
+
+    def _audit_prepared_lm_stage(
+        self,
+        stage: str,
+        sources: list[DataSourceConfig],
+    ) -> dict[str, Any]:
+        source_reports: list[dict[str, Any]] = []
+        total_documents = 0
+        total_tokens = 0
+        family_counts: Counter[str] = Counter()
+        phrase_counter: Counter[str] = Counter()
+        for source in sources:
+            manifest = load_prepared_manifest(source.path)
+            kind = manifest.get("kind")
+            if kind != "packed_lm":
+                raise RuntimeError(
+                    f"Prepared source {source.path} has kind {kind!r}, expected 'packed_lm'."
+                )
+            manifest_stage = str(manifest.get("stage", ""))
+            if manifest_stage != stage:
+                raise RuntimeError(
+                    f"Prepared source {source.path} has stage {manifest_stage!r}, expected {stage!r}."
+                )
+            diagnostics = manifest.get("diagnostics", {})
+            prepared_reports = diagnostics.get("per_source", [])
+            if not isinstance(prepared_reports, list):
+                raise RuntimeError(
+                    f"Prepared source {source.path} is missing per-source LM diagnostics."
+                )
+            for report in prepared_reports:
+                kept_documents = int(report.get("kept_documents", 0))
+                kept_tokens = int(report.get("kept_tokens", 0))
+                repeated_documents = int(report.get("repeated_documents", 0))
+                family = str(report.get("family", source.name))
+                total_documents += kept_documents
+                total_tokens += kept_tokens
+                if kept_documents > 0:
+                    family_counts[family] += 1
+                source_reports.append(
+                    {
+                        "source": str(report.get("source", source.name)),
+                        "family": family,
+                        "weight": float(report.get("weight", source.weight)),
+                        "target_share": round(float(report.get("target_share", 0.0)), 6),
+                        "raw_records": int(report.get("raw_records", 0)),
+                        "kept_documents": kept_documents,
+                        "kept_tokens": kept_tokens,
+                        "repeated_documents": repeated_documents,
+                        "restart_count": int(report.get("restart_count", 0)),
+                        "repeat_rate": round(repeated_documents / max(kept_documents, 1), 6),
+                        "dropped_reasons": dict(report.get("dropped_reasons", {})),
+                    }
+                )
+            for row in diagnostics.get("top_repeated_phrases", []):
+                phrase = row.get("phrase")
+                if not isinstance(phrase, str) or not phrase:
+                    continue
+                phrase_counter[phrase] += int(row.get("count", 0))
+        self._finalize_lm_source_reports(
+            source_reports,
+            total_tokens=total_tokens,
+            total_documents=total_documents,
+        )
+        max_source_share = max((float(report["token_share"]) for report in source_reports), default=0.0)
+        max_repeat_rate = max((float(report["repeat_rate"]) for report in source_reports), default=0.0)
+        audit = {
+            "stage": stage,
+            "total_documents": total_documents,
+            "total_clean_tokens": total_tokens,
+            "source_reports": source_reports,
+            "source_family_count": sum(1 for count in family_counts.values() if count > 0),
+            "max_single_source_token_share": round(max_source_share, 6),
+            "max_repeat_rate": round(max_repeat_rate, 6),
+            "top_repeated_phrases": [
+                {"phrase": phrase, "count": count}
+                for phrase, count in phrase_counter.most_common(10)
+            ],
+        }
+        if stage == "pretrain":
+            audit["domain_contribution"] = self._pretrain_domain_contribution_summary(
+                source_reports,
+                total_tokens=total_tokens,
+                total_documents=total_documents,
+            )
+        return audit
+
+    def _iter_tokenized_documents_for_source(
+        self,
+        source: DataSourceConfig,
+        *,
+        tokenizer: SentencePieceTokenizer,
+        seen_hashes: set[str] | None,
+        raw_records_consumed: int = 0,
+        audit_state: dict[str, Any] | None = None,
+        progress_state: dict[str, Any] | None = None,
+        allow_reentry: bool = False,
+        max_kept_documents: int | None = None,
+    ) -> Iterable[tuple[DocumentRecord, list[int]]]:
+        kept_in_iterator = 0
+        source_seen_ids = (
+            set(audit_state.get("unique_document_ids", set()))
+            if allow_reentry and audit_state is not None
+            else set()
+        )
+        for item in self._load_source_records(source, raw_records_consumed=raw_records_consumed):
+            if audit_state is not None:
+                audit_state["raw_records"] += 1
+            if progress_state is not None:
+                progress_state["raw_records_consumed"] = int(progress_state.get("raw_records_consumed", 0)) + 1
+            text = item.get(source.text_field, "")
+            if not isinstance(text, str):
+                if audit_state is not None:
+                    audit_state["dropped_reasons"]["non_text"] += 1
+                continue
+            record = DocumentRecord(
+                text=text,
+                source=source.name,
+                metadata={field: item.get(field) for field in source.metadata_fields},
+            )
+            if allow_reentry and source.deduplicate and seen_hashes is not None:
+                # On a restart, allow repeats from this source while still blocking
+                # duplicates that were first introduced by other sources.
+                cleaned = clean_document(record, self.config, source, None)
+                if cleaned.record is not None:
+                    document_id = cleaned.record.document_id or ""
+                    if document_id and document_id in seen_hashes and document_id not in source_seen_ids:
+                        cleaned = type(cleaned)(record=None, dropped_reason="duplicate")
+                    elif document_id:
+                        seen_hashes.add(document_id)
+            else:
+                cleaned = clean_document(record, self.config, source, seen_hashes)
+            if cleaned.record is None:
+                if audit_state is not None:
+                    audit_state["dropped_reasons"][cleaned.dropped_reason or "dropped"] += 1
+                continue
+            token_ids = tokenizer.encode(cleaned.record.text, add_bos=True, add_eos=True)
+            if len(token_ids) <= 1:
+                if audit_state is not None:
+                    audit_state["dropped_reasons"]["too_short_tokenized"] += 1
+                continue
+            if audit_state is not None:
+                document_id = cleaned.record.document_id or ""
+                if document_id and document_id in audit_state["unique_document_ids"]:
+                    audit_state["repeated_documents"] += 1
+                if document_id:
+                    audit_state["unique_document_ids"].add(document_id)
+                audit_state["kept_documents"] += 1
+                audit_state["kept_tokens"] += len(token_ids)
+                for phrase in _top_ngram_families(cleaned.record.text):
+                    audit_state["phrase_counter"][phrase] += 1
+            if progress_state is not None:
+                progress_state["accepted_records"] = int(progress_state.get("accepted_records", 0)) + 1
+            kept_in_iterator += 1
+            yield cleaned.record, token_ids
+            if max_kept_documents is not None and kept_in_iterator >= max_kept_documents:
+                return
+
+    def _weighted_lm_source_iterators(
+        self,
+        sources: list[DataSourceConfig],
+        *,
+        tokenizer: SentencePieceTokenizer,
+        source_progress: list[dict[str, Any]] | None = None,
+        source_audits: list[dict[str, Any]] | None = None,
+        seen_hashes: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        states: list[dict[str, Any]] = []
+        total_weight = sum(max(float(source.weight), 1e-8) for source in sources)
+        for index, source in enumerate(sources):
+            audit_state = (
+                self._new_lm_audit_state(source)
+                if source_audits is None
+                else source_audits[index]
+            )
+            audit_state["target_share"] = max(float(source.weight), 1e-8) / max(total_weight, 1e-8)
+            progress_state = None if source_progress is None else source_progress[index]
+            state = {
+                "source": source,
+                "audit": audit_state,
+                "progress": progress_state,
+            }
+
+            def iterator_factory(
+                *,
+                _source: DataSourceConfig = source,
+                _audit_state: dict[str, Any] = audit_state,
+                _progress_state: dict[str, Any] | None = progress_state,
+                raw_records_consumed: int,
+                allow_reentry: bool,
+                max_kept_documents: int | None = None,
+            ) -> Iterable[tuple[DocumentRecord, list[int]]]:
+                return self._iter_tokenized_documents_for_source(
+                    _source,
+                    tokenizer=tokenizer,
+                    seen_hashes=seen_hashes,
+                    raw_records_consumed=raw_records_consumed,
+                    audit_state=_audit_state,
+                    progress_state=_progress_state,
+                    allow_reentry=allow_reentry,
+                    max_kept_documents=max_kept_documents,
+                )
+
+            restart_count = 0 if progress_state is None else int(progress_state.get("restart_count", 0))
+            current_raw_records = 0 if progress_state is None else int(progress_state.get("raw_records_consumed", 0))
+            reentry_limit = (
+                self._remaining_weighted_restart_documents(state)
+                if restart_count > 0
+                else None
+            )
+            state["iterator_factory"] = iterator_factory
+            state["iterator"] = iter(
+                iterator_factory(
+                    raw_records_consumed=current_raw_records,
+                    allow_reentry=restart_count > 0,
+                    max_kept_documents=reentry_limit,
+                )
+            )
+            states.append(state)
+        return states
+
+    def _source_hits_share_cap(self, state: dict[str, Any], active_states: list[dict[str, Any]]) -> bool:
+        total_tokens = sum(int(item["audit"]["kept_tokens"]) for item in active_states)
+        if total_tokens < self.config.lm_weighted_source_token_budget:
+            return False
+        source_tokens = int(state["audit"]["kept_tokens"])
+        share = _token_share(source_tokens, total_tokens)
+        if share <= self.config.lm_max_source_token_share:
+            return False
+        other_tokens = [
+            int(item["audit"]["kept_tokens"])
+            for item in active_states
+            if item is not state
+        ]
+        return any(tokens < source_tokens for tokens in other_tokens)
+
+    def _source_hits_repeat_cap(self, state: dict[str, Any], active_states: list[dict[str, Any]]) -> bool:
+        kept_documents = int(state["audit"]["kept_documents"])
+        if kept_documents <= 0:
+            return False
+        repeat_rate = int(state["audit"]["repeated_documents"]) / max(kept_documents, 1)
+        if repeat_rate <= self.config.lm_max_source_repeat_rate:
+            return False
+        other_documents = [
+            int(item["audit"]["kept_documents"])
+            for item in active_states
+            if item is not state
+        ]
+        return any(documents > 0 for documents in other_documents)
+
+    def _weighted_source_priority(
+        self,
+        state: dict[str, Any],
+        all_states: list[dict[str, Any]],
+    ) -> tuple[float, float, float, float]:
+        source_tokens = int(state["audit"]["kept_tokens"])
+        total_tokens = sum(int(item["audit"]["kept_tokens"]) for item in all_states)
+        target_share = float(state["audit"].get("target_share", 0.0))
+        if total_tokens <= 0 or target_share <= 0.0:
+            return (0.0, target_share, 0.0, -float(source_tokens))
+        realized_share = _token_share(source_tokens, total_tokens)
+        deficit = target_share - realized_share
+        weighted_ratio = realized_share / max(target_share, 1e-8)
+        return (
+            deficit,
+            -weighted_ratio,
+            target_share,
+            -float(source_tokens),
+        )
+
+    def _weighted_source_share_gap_tokens(
+        self,
+        state: dict[str, Any],
+        all_states: list[dict[str, Any]],
+    ) -> float:
+        source_tokens = int(state["audit"]["kept_tokens"])
+        total_tokens = sum(int(item["audit"]["kept_tokens"]) for item in all_states)
+        target_share = float(state["audit"].get("target_share", 0.0))
+        if total_tokens <= 0 or target_share <= 0.0:
+            return 0.0
+        realized_share = _token_share(source_tokens, total_tokens)
+        return max(0.0, (target_share - realized_share) * total_tokens)
+
+    def _remaining_weighted_restart_documents(self, state: dict[str, Any]) -> int:
+        kept_documents = int(state["audit"]["kept_documents"])
+        repeated_documents = int(state["audit"]["repeated_documents"])
+        if kept_documents <= 0:
+            return 0
+        repeat_cap = float(self.config.lm_max_source_repeat_rate)
+        if repeat_cap <= 0.0:
+            return 0
+        if repeat_cap >= 1.0:
+            return len(state["audit"].get("unique_document_ids", set())) or kept_documents
+        remaining = (repeat_cap * kept_documents - repeated_documents) / max(1.0 - repeat_cap, 1e-8)
+        if remaining <= 0.0:
+            return 0
+        cycle_size = len(state["audit"].get("unique_document_ids", set()))
+        budget = int(math.floor(remaining + 1e-8))
+        if cycle_size > 0:
+            budget = min(budget, cycle_size)
+        return max(budget, 0)
+
+    def _source_can_restart_weighted(
+        self,
+        state: dict[str, Any],
+        all_states: list[dict[str, Any]],
+    ) -> bool:
+        kept_documents = int(state["audit"]["kept_documents"])
+        kept_tokens = int(state["audit"]["kept_tokens"])
+        if kept_documents <= 0 or kept_tokens <= 0:
+            return False
+        if self._source_hits_share_cap(state, all_states):
+            return False
+        if self._source_hits_repeat_cap(state, all_states):
+            return False
+        restart_budget = self._remaining_weighted_restart_documents(state)
+        if restart_budget <= 0:
+            return False
+        average_document_tokens = kept_tokens / max(kept_documents, 1)
+        return self._weighted_source_share_gap_tokens(state, all_states) >= max(average_document_tokens, 1.0)
+
+    def _restart_weighted_source(
+        self,
+        state: dict[str, Any],
+        all_states: list[dict[str, Any]],
+    ) -> bool:
+        if not self._source_can_restart_weighted(state, all_states):
+            return False
+        restart_budget = self._remaining_weighted_restart_documents(state)
+        if restart_budget <= 0:
+            return False
+        progress_state = state.get("progress")
+        if progress_state is not None:
+            progress_state["raw_records_consumed"] = 0
+            progress_state["restart_count"] = int(progress_state.get("restart_count", 0)) + 1
+        state["audit"]["restart_count"] = int(state["audit"].get("restart_count", 0)) + 1
+        iterator_factory = state.get("iterator_factory")
+        if iterator_factory is None:
+            return False
+        state["iterator"] = iter(
+            iterator_factory(
+                raw_records_consumed=0,
+                allow_reentry=True,
+                max_kept_documents=restart_budget,
+            )
+        )
+        return True
+
+    def _iter_weighted_tokenized_documents(
+        self,
+        sources: list[DataSourceConfig],
+        *,
+        tokenizer: SentencePieceTokenizer,
+        source_progress: list[dict[str, Any]] | None = None,
+        source_audits: list[dict[str, Any]] | None = None,
+        seen_hashes: set[str] | None = None,
+    ) -> Iterable[tuple[DataSourceConfig, DocumentRecord, list[int], dict[str, Any]]]:
+        states = self._weighted_lm_source_iterators(
+            sources,
+            tokenizer=tokenizer,
+            source_progress=source_progress,
+            source_audits=source_audits,
+            seen_hashes=seen_hashes,
+        )
+        active = list(states)
+        dormant: list[dict[str, Any]] = []
+        while active or dormant:
+            for state in list(dormant):
+                if self._restart_weighted_source(state, states):
+                    dormant.remove(state)
+                    active.append(state)
+            if not active:
+                break
+            eligible = [
+                state
+                for state in active
+                if not self._source_hits_share_cap(state, active)
+                and not self._source_hits_repeat_cap(state, active)
+            ]
+            if not eligible:
+                eligible = [state for state in active if not self._source_hits_repeat_cap(state, active)]
+            if not eligible:
+                eligible = list(active)
+            selected = max(
+                eligible,
+                key=lambda state: self._weighted_source_priority(state, states),
+            )
+            try:
+                document, token_ids = next(selected["iterator"])
+            except StopIteration:
+                active.remove(selected)
+                dormant.append(selected)
+                continue
+            yield selected["source"], document, token_ids, selected["audit"]
+
+    def audit_lm_stage(self, stage: str) -> dict[str, Any]:
+        sources = self._stage_sources(stage)
+        self._require_stage_sources(stage, sources)
+        if self._uses_prepared_sources(sources):
+            return self._audit_prepared_lm_stage(stage, sources)
+        tokenizer = SentencePieceTokenizer(self.config.tokenizer_path)
+        source_reports: list[dict[str, Any]] = []
+        total_documents = 0
+        total_tokens = 0
+        family_counts: Counter[str] = Counter()
+        phrase_counter: Counter[str] = Counter()
+        shared_seen_hashes: set[str] = set()
+        total_weight = sum(max(float(source.weight), 1e-8) for source in sources)
+        for source in sources:
+            audit_state = self._new_lm_audit_state(source)
+            audit_state["target_share"] = max(float(source.weight), 1e-8) / max(total_weight, 1e-8)
+            for _record, _token_ids in self._iter_tokenized_documents_for_source(
+                source,
+                tokenizer=tokenizer,
+                seen_hashes=shared_seen_hashes,
+                audit_state=audit_state,
+            ):
+                pass
+            kept_documents = int(audit_state["kept_documents"])
+            kept_tokens = int(audit_state["kept_tokens"])
+            total_documents += kept_documents
+            total_tokens += kept_tokens
+            if kept_documents > 0:
+                family_counts[str(audit_state["family"])] += 1
+            phrase_counter.update(audit_state["phrase_counter"])
+            source_reports.append(
+                {
+                    "source": source.name,
+                    "family": audit_state["family"],
+                    "weight": float(source.weight),
+                    "target_share": round(float(audit_state.get("target_share", 0.0)), 6),
+                    "raw_records": int(audit_state["raw_records"]),
+                    "kept_documents": kept_documents,
+                    "kept_tokens": kept_tokens,
+                    "repeated_documents": int(audit_state["repeated_documents"]),
+                    "restart_count": int(audit_state.get("restart_count", 0)),
+                    "repeat_rate": round(
+                        int(audit_state["repeated_documents"]) / max(kept_documents, 1),
+                        6,
+                    ),
+                    "dropped_reasons": _counter_to_sorted_dict(audit_state["dropped_reasons"]),
+                }
+            )
+        self._finalize_lm_source_reports(
+            source_reports,
+            total_tokens=total_tokens,
+            total_documents=total_documents,
+        )
+        max_source_share = max((float(report["token_share"]) for report in source_reports), default=0.0)
+        max_repeat_rate = max((float(report["repeat_rate"]) for report in source_reports), default=0.0)
+        audit = {
+            "stage": stage,
+            "total_documents": total_documents,
+            "total_clean_tokens": total_tokens,
+            "source_reports": source_reports,
+            "source_family_count": sum(1 for count in family_counts.values() if count > 0),
+            "max_single_source_token_share": round(max_source_share, 6),
+            "max_repeat_rate": round(max_repeat_rate, 6),
+            "top_repeated_phrases": [
+                {"phrase": phrase, "count": count}
+                for phrase, count in phrase_counter.most_common(10)
+            ],
+        }
+        if stage == "pretrain":
+            audit["domain_contribution"] = self._pretrain_domain_contribution_summary(
+                source_reports,
+                total_tokens=total_tokens,
+                total_documents=total_documents,
+            )
+        return audit
+
+    def assess_continue_readiness(self) -> dict[str, Any]:
+        audit = self.audit_lm_stage("continue")
+        clean_tokens = int(audit["total_clean_tokens"])
+        required_tokens = int(
+            max(
+                0,
+                round(
+                    float(self.config.continue_readiness_min_clean_token_fraction)
+                    * int(self.config.continued_pretraining_token_budget)
+                ),
+            )
+        )
+        failures: list[str] = []
+        if clean_tokens < required_tokens:
+            failures.append("insufficient_clean_tokens")
+        if int(audit["total_documents"]) < self.config.continue_readiness_min_documents:
+            failures.append("insufficient_documents")
+        if int(audit["source_family_count"]) < self.config.continue_readiness_min_source_families:
+            failures.append("insufficient_source_families")
+        if float(audit["max_single_source_token_share"]) > self.config.continue_readiness_max_single_source_share:
+            failures.append("single_source_share_too_high")
+        if float(audit["max_repeat_rate"]) > self.config.continue_readiness_max_repeat_rate:
+            failures.append("repeat_rate_too_high")
+        return {
+            "passed": not failures,
+            "failures": failures,
+            "required_clean_tokens": required_tokens,
+            "audit": audit,
+        }
+
     def _iter_documents(
         self, sources: list[DataSourceConfig], *, stage: str | None = None
     ) -> Iterable[DocumentRecord]:
+        tokenizer = SentencePieceTokenizer(self.config.tokenizer_path)
+        if len(sources) > 1 and any(abs(float(source.weight) - 1.0) > 1e-6 for source in sources):
+            for _source, document, _token_ids, _audit in self._iter_weighted_tokenized_documents(
+                sources,
+                tokenizer=tokenizer,
+            ):
+                yield document
+            return
         seen_hashes: set[str] = set()
         for source in sources:
             yielded_records = 0
@@ -1262,24 +2800,20 @@ class DatasetBuilder:
                     f"WebbGPT: preparing {stage} source {source.name} "
                     f"({source.format}) from {location}."
                 )
-            for item in self._load_source_records(source):
-                text = item.get(source.text_field, "")
-                if not isinstance(text, str):
-                    continue
-                record = DocumentRecord(
-                    text=text,
-                    source=source.name,
-                    metadata={field: item.get(field) for field in source.metadata_fields},
-                )
-                cleaned = clean_document(record, self.config, source, seen_hashes)
-                if cleaned.record is not None:
-                    yielded_records += 1
-                    if stage is not None and yielded_records % 1000 == 0:
-                        _progress(
-                            f"WebbGPT: preparing {stage} source {source.name}: "
-                            f"kept {yielded_records:,} documents so far."
-                        )
-                    yield cleaned.record
+            audit_state = self._new_lm_audit_state(source)
+            for document, _token_ids in self._iter_tokenized_documents_for_source(
+                source,
+                tokenizer=tokenizer,
+                seen_hashes=seen_hashes,
+                audit_state=audit_state,
+            ):
+                yielded_records += 1
+                if stage is not None and yielded_records % 1000 == 0:
+                    _progress(
+                        f"WebbGPT: preparing {stage} source {source.name}: "
+                        f"kept {yielded_records:,} documents so far."
+                    )
+                yield document
             if stage is not None:
                 _progress(
                     f"WebbGPT: preparing {stage} source {source.name}: "
@@ -1312,12 +2846,22 @@ class DatasetBuilder:
                         f"WebbGPT: preparing {stage} source {source.name}: "
                         f"loaded {yielded_examples:,} SFT examples so far."
                     )
+                metadata = _collect_standard_metadata(
+                    item,
+                    metadata_fields=source.metadata_fields,
+                    extra_fields=STANDARD_SFT_METADATA_FIELDS,
+                )
                 yield SFTExample(
                     messages=messages,
                     source=source.name,
                     example_id=_message_example_id(source, item, messages),
                     split_group_id=_message_group_id(source, item, messages),
-                    metadata={field: item.get(field) for field in source.metadata_fields},
+                    metadata={
+                        **metadata,
+                        "behavior_bucket": _infer_behavior_bucket(messages, metadata),
+                        "quality_tier": _coerce_quality_tier(metadata),
+                        "prompt_signature_hash": _prompt_signature_hash(messages),
+                    },
                 )
             if stage is not None:
                 _progress(
@@ -1344,6 +2888,11 @@ class DatasetBuilder:
                         f"WebbGPT: preparing {stage} source {source.name}: "
                         f"loaded {yielded_examples:,} preference examples so far."
                     )
+                metadata = _collect_standard_metadata(
+                    item,
+                    metadata_fields=source.metadata_fields,
+                    extra_fields=STANDARD_PREFERENCE_METADATA_FIELDS,
+                )
                 yield PreferenceExample(
                     prompt=prompt,
                     chosen=chosen,
@@ -1351,7 +2900,12 @@ class DatasetBuilder:
                     source=source.name,
                     example_id=_preference_example_id(source, item, prompt, chosen, rejected),
                     split_group_id=_message_group_id(source, item, prompt),
-                    metadata={field: item.get(field) for field in source.metadata_fields},
+                    metadata={
+                        **metadata,
+                        "chosen_quality_tier": _coerce_chosen_quality_tier(metadata),
+                        "negative_type": _coerce_negative_type(metadata),
+                        "prompt_signature_hash": _prompt_signature_hash(prompt),
+                    },
                 )
             if stage is not None:
                 _progress(
@@ -1504,6 +3058,22 @@ class DatasetBuilder:
             PreferenceDataset(train_examples, self.config.tokenizer_path, self.config.sequence_length),
             PreferenceDataset(validation_examples, self.config.tokenizer_path, self.config.sequence_length),
         )
+
+    def validate_preference_datasets(self, *datasets) -> dict[str, Any]:
+        combined_examples: list[PreferenceExample] = []
+        for dataset in datasets:
+            examples = getattr(dataset, "examples", None)
+            if examples is None:
+                return {
+                    "valid_for_promotion": False,
+                    "promotion_blockers": ["behavior_eval_untrusted"],
+                    "invalid_quality_tiers": {},
+                    "invalid_negative_types": {},
+                    "approved_template_count": 0,
+                    "approved_template_share": 0.0,
+                }
+            combined_examples.extend(examples)
+        return self._validate_preference_metadata(combined_examples)
 
     def build_validation(self):
         self._require_stage_sources("validation", self.config.validation_sources)

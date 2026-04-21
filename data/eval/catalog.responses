@@ -1,6 +1,6 @@
-{"messages": [{"role": "user", "content": "How does CS 101 work?"}], "expected_course_codes": ["CS 101"], "requires_citation": true}
-{"messages": [{"role": "user", "content": "What is PHIL 101?"}], "expected_course_codes": ["PHIL 101"], "requires_citation": true}
-{"messages": [{"role": "user", "content": "Tell me about CS101."}], "expected_course_codes": ["CS 101"], "requires_citation": true}
-{"messages": [{"role": "user", "content": "Which course surveys ethics, metaphysics, and epistemology?"}], "expected_course_codes": ["PHIL 101"], "requires_citation": true}
-{"messages": [{"role": "user", "content": "Is cs-101 the introductory programming class?"}], "expected_course_codes": ["CS 101"], "requires_citation": true}
-{"messages": [{"role": "user", "content": "Which intro course focuses on big philosophical questions and argument?"}], "expected_course_codes": ["PHIL 101"], "requires_citation": true}
+{"messages": [{"role": "user", "content": "What does AdvSt Chemistry require?"}], "expected_course_codes": ["AdvSt Chemistry"], "requires_citation": true}
+{"messages": [{"role": "user", "content": "What is Technology and Innovation Seminar I?"}], "expected_course_codes": ["Technology and Innovation Seminar I"], "requires_citation": true}
+{"messages": [{"role": "user", "content": "Tell me about Hon Museum Research."}], "expected_course_codes": ["Hon Museum Research"], "requires_citation": true}
+{"messages": [{"role": "user", "content": "Which Webb course covers advanced computer science with HMC?"}], "expected_course_codes": ["HMC / Webb Advanced Courses in Computer Science"], "requires_citation": true}
+{"messages": [{"role": "user", "content": "What is AdvSt Paleontology?"}], "expected_course_codes": ["AdvSt Paleontology"], "requires_citation": true}
+{"messages": [{"role": "user", "content": "Which Webb course follows Art AB in the visual arts sequence?"}], "expected_course_codes": ["Advanced Art"], "requires_citation": true}

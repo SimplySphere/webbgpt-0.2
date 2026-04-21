@@ -25,6 +25,7 @@ from config import (
     save_payload,
 )
 from config.io import load_config, save_config
+from train.console import dump_rounded_json
 
 
 SAFE_DEFAULT_TEST_PATHS = [
@@ -37,6 +38,44 @@ SAFE_DEFAULT_TEST_PATHS = [
     "src/tests/test_train_loop.py",
     "src/tests/test_webb_grounding.py",
 ]
+
+PROFILE_RUNTIME_MANUAL_PROFILES = frozenset({"local-mvp", "remote-3b", "remote-7b"})
+LEGACY_PROFILE_CHECKPOINT_DIRS = {
+    "local-mvp": Path("artifacts/checkpoints-local-mvp"),
+    "remote-3b": Path("artifacts/checkpoints"),
+    "remote-7b": Path("artifacts/checkpoints-7b"),
+}
+
+
+def _artifact_trust(path: str | Path) -> dict[str, object]:
+    from train.checkpoint import load_artifact_trust
+
+    return load_artifact_trust(path)
+
+
+def _require_trusted_artifact(
+    path: str | Path,
+    *,
+    action: str,
+    force_untrusted: bool = False,
+) -> dict[str, object]:
+    trust = _artifact_trust(path)
+    status = str(trust.get("artifact_status", "promotable"))
+    blockers = list(trust.get("promotion_blockers", []))
+    if status == "promotable" or force_untrusted:
+        if status != "promotable":
+            print(
+                f"WebbGPT: forcing {action} with {status} artifact at {path} "
+                f"(blockers: {', '.join(blockers) or 'none'}).",
+                file=sys.stderr,
+                flush=True,
+            )
+        return trust
+    raise RuntimeError(
+        f"Refusing to {action} from non-promotable artifact at {path}. "
+        f"artifact_status={status}; blockers={', '.join(blockers) or 'none'}. "
+        "Re-run with --force-untrusted only for local debugging."
+    )
 
 
 def _build_tokenizer_corpus_worker(
@@ -145,32 +184,41 @@ def _parse_args() -> argparse.Namespace:
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--force-rebuild", action="store_true")
 
+    audit = subparsers.add_parser("audit-data", help="Audit LM corpus sources for a stage")
+    audit.add_argument("--config", required=True)
+    audit.add_argument("--stage", choices=["pretrain", "continue", "validation"], required=True)
+
     train_pre = subparsers.add_parser("train-pretrain", help="Run base pretraining")
     train_pre.add_argument("--model-config", required=True)
     train_pre.add_argument("--data-config", required=True)
     train_pre.add_argument("--train-config", required=True)
+    train_pre.add_argument("--force-rebuild", action="store_true")
 
     train_continue = subparsers.add_parser("train-continue", help="Run continued pretraining")
     train_continue.add_argument("--model-config", required=True)
     train_continue.add_argument("--data-config", required=True)
     train_continue.add_argument("--train-config", required=True)
+    train_continue.add_argument("--force-rebuild", action="store_true")
 
     train_sft = subparsers.add_parser("train-sft", help="Run supervised fine-tuning")
     train_sft.add_argument("--model-config", required=True)
     train_sft.add_argument("--data-config", required=True)
     train_sft.add_argument("--train-config", required=True)
+    train_sft.add_argument("--force-rebuild", action="store_true")
 
     train_dpo = subparsers.add_parser("train-dpo", help="Run DPO alignment")
     train_dpo.add_argument("--model-config", required=True)
     train_dpo.add_argument("--data-config", required=True)
     train_dpo.add_argument("--train-config", required=True)
     train_dpo.add_argument("--reference-checkpoint", required=True)
+    train_dpo.add_argument("--force-rebuild", action="store_true")
 
     eval_parser = subparsers.add_parser("eval", help="Run evaluation")
     eval_parser.add_argument("--model-config", required=True)
     eval_parser.add_argument("--data-config", required=True)
     eval_parser.add_argument("--eval-config", required=True)
     eval_parser.add_argument("--checkpoint", required=True)
+    eval_parser.add_argument("--force-untrusted", action="store_true")
 
     ingest_webb_site = subparsers.add_parser("ingest-webb-site", help="Ingest Webb HTML sources")
     ingest_webb_site.add_argument("--dsn", required=True)
@@ -206,11 +254,13 @@ def _parse_args() -> argparse.Namespace:
     serve = subparsers.add_parser("serve", help="Launch serving API")
     serve.add_argument("--serve-config", required=True)
     serve.add_argument("--sync-on-start", action="store_true")
+    serve.add_argument("--force-untrusted", action="store_true")
 
     export = subparsers.add_parser("export-hf", help="Export a checkpoint to HF-style format")
     export.add_argument("--model-config", required=True)
     export.add_argument("--checkpoint", required=True)
     export.add_argument("--output", required=True)
+    export.add_argument("--force-untrusted", action="store_true")
 
     init_cfg = subparsers.add_parser("init-config", help="Write example configs")
     init_cfg.add_argument("--output-dir", default="configs")
@@ -798,21 +848,24 @@ def _write_default_configs(output_dir: str) -> None:
                 max_steps=400_000,
                 continued_max_steps=50_000,
                 sft_max_steps=20_000,
+                sft_max_epochs=5,
                 dpo_max_steps=10_000,
                 sft_validation_min_examples=16,
                 dpo_validation_min_examples=16,
                 sft_evals_per_epoch=4,
+                sft_min_eval_interval_steps=25,
                 dpo_evals_per_epoch=4,
                 sft_early_stopping_patience_evals=2,
                 dpo_early_stopping_patience_evals=2,
                 sft_best_min_delta=0.02,
+                sft_sample_every_steps=100,
                 dpo_best_min_delta=0.005,
                 dpo_enable_lm_health_eval=True,
                 allow_weak_posttrain_validation=False,
                 token_budget=None,
             ).to_dict(),
             "checkpoint": {
-                "output_dir": "artifacts/checkpoints",
+                "output_dir": "artifacts/runs/remote-3b/checkpoints/pretrain",
                 "save_every_steps": 500,
                 "keep_last_n": 5,
                 "async_write": False,
@@ -928,10 +981,13 @@ def _write_default_configs(output_dir: str) -> None:
                 sft_warmup_steps=10,
                 sft_validation_min_examples=16,
                 require_explicit_sft_validation=True,
+                sft_max_epochs=5,
                 sft_evals_per_epoch=4,
+                sft_min_eval_interval_steps=25,
                 sft_early_stopping_patience_evals=2,
                 sft_best_min_delta=0.02,
                 sft_max_steps=200,
+                sft_sample_every_steps=100,
                 dpo_learning_rate=2.5e-5,
                 dpo_min_learning_rate=2.5e-6,
                 dpo_warmup_steps=10,
@@ -953,7 +1009,7 @@ def _write_default_configs(output_dir: str) -> None:
                 activation_checkpointing=False,
             ).to_dict(),
             "checkpoint": {
-                "output_dir": "artifacts/checkpoints-local-mvp",
+                "output_dir": "artifacts/runs/local-mvp/checkpoints/pretrain",
                 "save_every_steps": 25,
                 "keep_last_n": 3,
                 "async_write": False,
@@ -1051,14 +1107,17 @@ def _write_default_configs(output_dir: str) -> None:
                 max_steps=500_000,
                 continued_max_steps=60_000,
                 sft_max_steps=30_000,
+                sft_max_epochs=5,
                 dpo_max_steps=15_000,
                 sft_validation_min_examples=16,
                 dpo_validation_min_examples=16,
                 sft_evals_per_epoch=4,
+                sft_min_eval_interval_steps=25,
                 dpo_evals_per_epoch=4,
                 sft_early_stopping_patience_evals=2,
                 dpo_early_stopping_patience_evals=2,
                 sft_best_min_delta=0.02,
+                sft_sample_every_steps=100,
                 dpo_best_min_delta=0.005,
                 dpo_enable_lm_health_eval=True,
                 allow_weak_posttrain_validation=False,
@@ -1071,7 +1130,7 @@ def _write_default_configs(output_dir: str) -> None:
                 activation_checkpointing=True,
             ).to_dict(),
             "checkpoint": {
-                "output_dir": "artifacts/checkpoints-7b",
+                "output_dir": "artifacts/runs/remote-7b/checkpoints/pretrain",
                 "save_every_steps": 500,
                 "keep_last_n": 5,
                 "async_write": False,
@@ -1223,14 +1282,17 @@ def _write_default_configs(output_dir: str) -> None:
                 max_steps=20,
                 continued_max_steps=20,
                 sft_max_steps=20,
+                sft_max_epochs=5,
                 dpo_max_steps=20,
                 sft_validation_min_examples=16,
                 dpo_validation_min_examples=16,
                 sft_evals_per_epoch=4,
+                sft_min_eval_interval_steps=25,
                 dpo_evals_per_epoch=4,
                 sft_early_stopping_patience_evals=2,
                 dpo_early_stopping_patience_evals=2,
                 sft_best_min_delta=0.02,
+                sft_sample_every_steps=100,
                 dpo_best_min_delta=0.005,
                 dpo_enable_lm_health_eval=True,
                 allow_weak_posttrain_validation=False,
@@ -1435,10 +1497,10 @@ def _write_default_local_examples() -> None:
         },
         {
             "messages": [
-                {"role": "user", "content": "Compare philosophy and computer science as majors."},
+                {"role": "user", "content": "Compare AdvSt Chemistry and Technology and Innovation Seminar I as course options."},
                 {
                     "role": "assistant",
-                    "content": "Philosophy emphasizes reasoning, argument, and writing, while computer science emphasizes computation, systems, and programming. They overlap in logic and problem solving.",
+                    "content": "AdvSt Chemistry emphasizes advanced laboratory chemistry and quantitative science work. Technology and Innovation Seminar I emphasizes design, technology, and applied problem solving tied to math placement. They overlap in problem solving but ask for different preparation and workload.",
                 },
             ]
         },
@@ -1587,10 +1649,10 @@ def _write_default_local_examples() -> None:
         },
         {
             "messages": [
-                {"role": "user", "content": "Compare philosophy and computer science as majors."},
+                {"role": "user", "content": "Compare AdvSt Chemistry and Technology and Innovation Seminar I as course options."},
                 {
                     "role": "assistant",
-                    "content": "Philosophy focuses on reasoning, interpretation, and argument. Computer science focuses on computation, programming, and systems. Philosophy is often writing-heavy, while computer science is usually more quantitative and technical.",
+                    "content": "AdvSt Chemistry is a lab-centered advanced science course with quantitative chemistry work. Technology and Innovation Seminar I is a design-oriented math and computer science option. A useful comparison should start with the student's interests, current math placement, workload tolerance, and goals.",
                 },
             ]
         },
@@ -1616,19 +1678,19 @@ def _write_default_local_examples() -> None:
         },
         {
             "messages": [
-                {"role": "user", "content": "Should I take CS 101 or PHIL 101 first?"},
+                {"role": "user", "content": "Should I take AdvSt Chemistry or Technology and Innovation Seminar I first?"},
                 {
                     "role": "assistant",
-                    "content": "That depends on your goals. If you want programming exposure, CS 101 is the better first step. If you want a discussion-based course about big questions and argument, PHIL 101 may be the better fit.",
+                    "content": "That depends on your goals, current math placement, and workload. AdvSt Chemistry is the better fit for advanced laboratory chemistry, while Technology and Innovation Seminar I is better for design and applied technology work.",
                 },
             ]
         },
         {
             "messages": [
-                {"role": "user", "content": "How does CS 101 work?"},
+                {"role": "user", "content": "How does AdvSt Chemistry work?"},
                 {
                     "role": "assistant",
-                    "content": "CS 101 is an introductory programming course. I should answer with grounded catalog details and include a citation when catalog facts are used.",
+                    "content": "AdvSt Chemistry is an advanced Webb science course. I should answer with grounded catalog details and include a citation when catalog facts are used.",
                 },
             ]
         },
@@ -1687,7 +1749,7 @@ def _write_default_local_examples() -> None:
         },
         {
             "messages": [
-                {"role": "user", "content": "How does PHIL 101 work?"},
+                {"role": "user", "content": "How does Hon Museum Research work?"},
                 {
                     "role": "assistant",
                     "content": "If I use catalog facts, I should explain them clearly in plain English and include a citation instead of answering from memory.",
@@ -1714,10 +1776,10 @@ def _write_default_local_examples() -> None:
         },
         {
             "messages": [
-                {"role": "user", "content": "What do you do if I ask about BIO 404 and it is not in the catalog?"},
+                {"role": "user", "content": "What do you do if I ask about Honors Robotics Lab and it is not in the catalog?"},
                 {
                     "role": "assistant",
-                    "content": "I should say I could not find BIO 404 in the catalog, avoid guessing the prerequisites, and suggest checking the current catalog or an advisor.",
+                    "content": "I should say I could not find Honors Robotics Lab in the catalog, avoid guessing the prerequisites, and suggest checking the current catalog or an advisor.",
                 },
             ]
         },
@@ -1802,13 +1864,13 @@ def _write_default_local_examples() -> None:
             "rejected": "Pick whichever one sounds cooler.",
         },
         {
-            "prompt": [{"role": "user", "content": "How does CS101 work?"}],
-            "chosen": "I should use the catalog entry for CS 101, explain it in plain English, and include a citation instead of free-associating.",
+            "prompt": [{"role": "user", "content": "How does AdvSt Chemistry work?"}],
+            "chosen": "I should use the Webb catalog entry for AdvSt Chemistry, explain it in plain English, and include a citation instead of free-associating.",
             "rejected": "I should answer from vague memory without citing the catalog.",
         },
         {
-            "prompt": [{"role": "user", "content": "What are the prerequisites for BIO 404?"}],
-            "chosen": "If the catalog does not show BIO 404, I should say I could not find it and avoid inventing a prerequisite chain.",
+            "prompt": [{"role": "user", "content": "What are the prerequisites for Honors Robotics Lab?"}],
+            "chosen": "If the Webb catalog does not show Honors Robotics Lab, I should say I could not find it and avoid inventing a prerequisite chain.",
             "rejected": "I should infer a plausible prerequisite chain and state it confidently.",
         },
     ]
@@ -1844,13 +1906,13 @@ def _write_default_local_examples() -> None:
             "rejected": "I should fill in the gaps with whatever seems likely.",
         },
         {
-            "prompt": [{"role": "user", "content": "How does CS 101 work?"}],
-            "chosen": "I should use the catalog entry, explain it clearly, and include a citation if I rely on catalog facts.",
+            "prompt": [{"role": "user", "content": "How does Hon Museum Research work?"}],
+            "chosen": "I should use the Webb catalog entry, explain it clearly, and include a citation if I rely on catalog facts.",
             "rejected": "I should answer from vague memory and skip the citation.",
         },
         {
-            "prompt": [{"role": "user", "content": "What are the prerequisites for MATH 999?"}],
-            "chosen": "If I cannot find MATH 999 in the catalog, I should say so and avoid inventing a prerequisite chain.",
+            "prompt": [{"role": "user", "content": "What are the prerequisites for Technology and Innovation Seminar III?"}],
+            "chosen": "If I cannot find Technology and Innovation Seminar III in the Webb catalog, I should say so and avoid inventing a prerequisite chain.",
             "rejected": "I should guess that it probably requires calculus and linear algebra.",
         },
     ]
@@ -1866,9 +1928,9 @@ def _write_default_local_examples() -> None:
             "rejected": "I should immediately pick one major without asking anything.",
         },
         {
-            "prompt": [{"role": "user", "content": "What should you do if the catalog does not list ECON 404?"}],
-            "chosen": "I should say I could not verify ECON 404 in the catalog and avoid inventing prerequisites or course details.",
-            "rejected": "I should make up a likely catalog description for ECON 404.",
+            "prompt": [{"role": "user", "content": "What should you do if the Webb catalog does not list Honors Robotics Lab?"}],
+            "chosen": "I should say I could not verify Honors Robotics Lab in the Webb catalog and avoid inventing prerequisites or course details.",
+            "rejected": "I should make up a likely catalog description for Honors Robotics Lab.",
         },
         {
             "prompt": [{"role": "user", "content": "Explain a prerequisite briefly."}],
@@ -1973,8 +2035,8 @@ def _write_default_local_examples() -> None:
             "pass_score": 1.0,
         },
         {
-            "messages": [{"role": "user", "content": "Compare philosophy and computer science."}],
-            "expected_substrings": ["philosophy", "computer science"],
+            "messages": [{"role": "user", "content": "Compare AdvSt Chemistry and Technology and Innovation Seminar I."}],
+            "expected_substrings": ["chemistry", "technology"],
             "pass_score": 1.0,
         },
         {
@@ -1983,8 +2045,8 @@ def _write_default_local_examples() -> None:
             "pass_score": 1.0,
         },
         {
-            "messages": [{"role": "user", "content": "Should I take CS 101 or PHIL 101 first?"}],
-            "expected_substrings": ["cs 101", "phil 101"],
+            "messages": [{"role": "user", "content": "Should I take AdvSt Chemistry or Technology and Innovation Seminar I first?"}],
+            "expected_substrings": ["chemistry", "technology"],
             "forbidden_substrings": ["what would you like to work on"],
             "pass_score": 1.0,
         },
@@ -2020,7 +2082,7 @@ def _write_default_local_examples() -> None:
             "tags": ["domain", "advising"],
         },
         {
-            "messages": [{"role": "user", "content": "If the catalog does not list ECON 404, how should you respond?"}],
+            "messages": [{"role": "user", "content": "If the Webb catalog does not list Honors Robotics Lab, how should you respond?"}],
             "tags": ["domain", "grounded"],
         },
         {
@@ -2038,69 +2100,69 @@ def _write_default_local_examples() -> None:
     ]
     catalog_benchmarks = [
         {
-            "messages": [{"role": "user", "content": "How does CS 101 work?"}],
-            "expected_course_codes": ["CS 101"],
+            "messages": [{"role": "user", "content": "What does AdvSt Chemistry require?"}],
+            "expected_course_codes": ["AdvSt Chemistry"],
             "requires_citation": True,
         },
         {
-            "messages": [{"role": "user", "content": "What is PHIL 101?"}],
-            "expected_course_codes": ["PHIL 101"],
+            "messages": [{"role": "user", "content": "What is Technology and Innovation Seminar I?"}],
+            "expected_course_codes": ["Technology and Innovation Seminar I"],
             "requires_citation": True,
         },
         {
-            "messages": [{"role": "user", "content": "Tell me about CS101."}],
-            "expected_course_codes": ["CS 101"],
+            "messages": [{"role": "user", "content": "Tell me about Hon Museum Research."}],
+            "expected_course_codes": ["Hon Museum Research"],
             "requires_citation": True,
         },
         {
-            "messages": [{"role": "user", "content": "Which course surveys ethics, metaphysics, and epistemology?"}],
-            "expected_course_codes": ["PHIL 101"],
+            "messages": [{"role": "user", "content": "Which Webb course covers advanced computer science with HMC?"}],
+            "expected_course_codes": ["HMC / Webb Advanced Courses in Computer Science"],
             "requires_citation": True,
         },
         {
-            "messages": [{"role": "user", "content": "Is cs-101 the introductory programming class?"}],
-            "expected_course_codes": ["CS 101"],
+            "messages": [{"role": "user", "content": "What is AdvSt Paleontology?"}],
+            "expected_course_codes": ["AdvSt Paleontology"],
             "requires_citation": True,
         },
         {
-            "messages": [{"role": "user", "content": "Which intro course focuses on big philosophical questions and argument?"}],
-            "expected_course_codes": ["PHIL 101"],
+            "messages": [{"role": "user", "content": "Which Webb course follows Art AB in the visual arts sequence?"}],
+            "expected_course_codes": ["Advanced Art"],
             "requires_citation": True,
         },
     ]
     missing_catalog_benchmarks = [
         {
-            "messages": [{"role": "user", "content": "What are the prerequisites for BIO 404?"}],
+            "messages": [{"role": "user", "content": "What are the prerequisites for Honors Robotics Lab?"}],
             "expected_course_codes": [],
             "expects_abstention": True,
             "requires_citation": False,
         },
         {
-            "messages": [{"role": "user", "content": "Tell me the current seats available for MATH 999."}],
+            "messages": [{"role": "user", "content": "Tell me the current seats available for AdvSt Chemistry."}],
             "expected_course_codes": [],
             "expects_abstention": True,
             "requires_citation": False,
         },
         {
-            "messages": [{"role": "user", "content": "Does CS 404 exist in the catalog?"}],
+            "messages": [{"role": "user", "content": "Does Technology and Innovation Seminar III exist in the Webb catalog?"}],
             "expected_course_codes": [],
             "expects_abstention": True,
             "requires_citation": False,
         },
         {
-            "messages": [{"role": "user", "content": "What is PHIL 404?"}],
+            "messages": [{"role": "user", "content": "What is Advanced Marine Biology Expedition at Webb?"}],
             "expected_course_codes": [],
             "expects_abstention": True,
             "requires_citation": False,
         },
         {
-            "messages": [{"role": "user", "content": "Can you confirm whether CS999 is offered this term?"}],
+            "messages": [{"role": "user", "content": "Can you confirm whether Honors Robotics Lab is offered this term?"}],
             "expected_course_codes": [],
             "expects_abstention": True,
             "requires_citation": False,
         },
         {
-            "messages": [{"role": "user", "content": "What are the prerequisites for BIO404 this fall?"}],
+            "messages": [{"role": "user", "content": "What are the prerequisites for Webb Entrepreneurship 404?"}],
             "expected_course_codes": [],
             "expects_abstention": True,
             "requires_citation": False,
@@ -2131,66 +2193,99 @@ def _write_default_local_examples() -> None:
     catalog_dir.mkdir(parents=True, exist_ok=True)
     catalog_payload = {
         "institutions": [
-            {"id": "demo-u", "name": "Demo University", "website": "https://example.edu"}
+            {"id": "webb", "name": "The Webb Schools", "website": "https://www.webb.org"}
         ],
         "terms": [
             {
-                "id": "demo-u-2025-fall",
-                "institution_id": "demo-u",
-                "code": "2025FA",
-                "title": "Fall 2025",
-                "starts_on": "2025-08-25",
-                "ends_on": "2025-12-12",
+                "id": "webb-2026-27",
+                "institution_id": "webb",
+                "code": "2026-27",
+                "title": "2026-27 Course Catalog",
+                "starts_on": "2026-08-01",
+                "ends_on": "2027-06-30",
             }
         ],
         "programs": [
             {
-                "id": "demo-u-cs-bs",
-                "institution_id": "demo-u",
-                "code": "CS-BS",
-                "title": "B.S. in Computer Science",
-                "description": "An undergraduate program focused on computing systems, theory, and software.",
-                "requirements": {"minimum_credits": 120},
+                "id": "webb-course-catalog",
+                "institution_id": "webb",
+                "code": "WEBB-CATALOG",
+                "title": "Webb Course Catalog",
+                "description": "Webb's course catalog describes graduation requirements, course planning, departments, course offerings, prerequisites, and workload expectations.",
+                "requirements": {"minimum_credits": 20, "source": "data/webb/mock/course_catalog_2025_26.html"},
             }
         ],
         "courses": [
             {
-                "id": "demo-u-cs101",
-                "institution_id": "demo-u",
-                "program_id": "demo-u-cs-bs",
-                "code": "CS 101",
-                "title": "Introduction to Programming",
-                "description": "Learn programming fundamentals with Python and problem solving.",
-                "credits": 4.0,
-                "prerequisites": None,
-                "attributes": {"level": "introductory"},
+                "id": "webb-advst-chemistry",
+                "institution_id": "webb",
+                "program_id": "webb-course-catalog",
+                "code": "AdvSt Chemistry",
+                "title": "AdvSt Chemistry",
+                "description": "A project-based advanced chemistry course built around an in-depth study of general chemistry and a significant laboratory component. The catalog lists B+ or better in Integrated Math II or Honors Integrated Math II, with Precalculus concurrent, as the prerequisite.",
+                "credits": 1.0,
+                "prerequisites": {"text": "B+ or better in Integrated Math II or Honors Integrated Math II; Precalculus concurrent"},
+                "attributes": {"department": "Science", "workload": "1.25", "source": "data/webb/mock/course_catalog_2025_26.html"},
             },
             {
-                "id": "demo-u-phil101",
-                "institution_id": "demo-u",
-                "program_id": None,
-                "code": "PHIL 101",
-                "title": "Introduction to Philosophy",
-                "description": "Survey major questions in ethics, metaphysics, and epistemology.",
-                "credits": 4.0,
-                "prerequisites": None,
-                "attributes": {"level": "introductory"},
+                "id": "webb-technology-innovation-seminar-i",
+                "institution_id": "webb",
+                "program_id": "webb-course-catalog",
+                "code": "Technology and Innovation Seminar I",
+                "title": "Technology and Innovation Seminar I",
+                "description": "A Webb mathematics and computer science course listed with a concurrent level-appropriate math course prerequisite and workload 1.",
+                "credits": 1.0,
+                "prerequisites": {"text": "Concurrent level-appropriate math course"},
+                "attributes": {"department": "Mathematics & Computer Science", "workload": "1", "source": "data/webb/mock/course_catalog_2025_26.html"},
+            },
+            {
+                "id": "webb-hon-museum-research",
+                "institution_id": "webb",
+                "program_id": "webb-course-catalog",
+                "code": "Hon Museum Research",
+                "title": "Hon Museum Research",
+                "description": "This course builds on skills learned in Honors Paleontology and focuses on scientific study of fossils, research communication, fossil data interpretation, and formal scientific reporting using Alf Museum collections.",
+                "credits": 1.0,
+                "prerequisites": {"text": "Hon Paleontology or concurrent second science"},
+                "attributes": {"department": "Science", "workload": "1", "source": "data/webb/mock/science_2026_27.html"},
+            },
+            {
+                "id": "webb-hmc-advanced-cs",
+                "institution_id": "webb",
+                "program_id": "webb-course-catalog",
+                "code": "HMC / Webb Advanced Courses in Computer Science",
+                "title": "HMC / Webb Advanced Courses in Computer Science",
+                "description": "An advanced mathematics and computer science offering in the Webb catalog. The catalog lists concurrent level-appropriate math as the prerequisite and workload 1.25.",
+                "credits": 1.0,
+                "prerequisites": {"text": "Concurrent level-appropriate math course"},
+                "attributes": {"department": "Mathematics & Computer Science", "workload": "1.25", "source": "data/webb/mock/course_catalog_2025_26.html"},
+            },
+            {
+                "id": "webb-advst-paleontology",
+                "institution_id": "webb",
+                "program_id": "webb-course-catalog",
+                "code": "AdvSt Paleontology",
+                "title": "AdvSt Paleontology",
+                "description": "An advanced original-research course on fossils in the Alf Museum collection. Students review paleontological literature, collect and analyze original data, write formal manuscripts, and present their work.",
+                "credits": 1.0,
+                "prerequisites": {"text": "Hon Museum Research or concurrent second science"},
+                "attributes": {"department": "Science", "workload": "1.25", "source": "data/webb/mock/science_2026_27.html"},
+            },
+            {
+                "id": "webb-advanced-art",
+                "institution_id": "webb",
+                "program_id": "webb-course-catalog",
+                "code": "Advanced Art",
+                "title": "Advanced Art",
+                "description": "A Webb fine arts course in the visual arts sequence. The catalog lists Art AB as the prerequisite and workload 1.",
+                "credits": 1.0,
+                "prerequisites": {"text": "Art AB"},
+                "attributes": {"department": "Fine Arts", "workload": "1", "source": "data/webb/mock/course_catalog_2025_26.html"},
             },
         ],
-        "sections": [
-            {
-                "id": "demo-u-cs101-001",
-                "course_id": "demo-u-cs101",
-                "term_id": "demo-u-2025-fall",
-                "instructor": "Ada Instructor",
-                "meeting_times": {"days": ["Mon", "Wed"], "time": "10:00-11:15"},
-                "seats_total": 30,
-                "seats_available": 5,
-                "modality": "in_person",
-            }
-        ],
+        "sections": [],
     }
-    _write_seed_file(catalog_dir / "catalog.json", json.dumps(catalog_payload, indent=2) + "\n")
+    _write_seed_file(catalog_dir / "webb_catalog.json", json.dumps(catalog_payload, indent=2) + "\n")
 
     continue_documents: list[str] = []
     for corpus_path in (
@@ -2257,12 +2352,16 @@ def _write_default_local_examples() -> None:
     )
 
 
-def _latest_checkpoint_dir(output_dir: str) -> str:
-    candidates = sorted(
+def _completed_checkpoint_dirs(output_dir: str | Path) -> list[Path]:
+    return sorted(
         path
         for path in Path(output_dir).glob("step-*")
         if path.is_dir() and not path.name.endswith(".tmp")
     )
+
+
+def _latest_checkpoint_dir(output_dir: str | Path) -> str:
+    candidates = _completed_checkpoint_dirs(output_dir)
     if not candidates:
         raise RuntimeError(f"No completed checkpoints were found in {output_dir}.")
     return str(candidates[-1])
@@ -2347,6 +2446,18 @@ def _profile_checkpoint_dir(profile: str, stage: str) -> Path:
     return _profile_artifact_root(profile) / "checkpoints" / stage
 
 
+def _profile_prepared_dir(profile: str) -> Path:
+    return _profile_artifact_root(profile) / "prepared"
+
+
+def _uses_profile_runtime_layout(profile: str | None) -> bool:
+    return profile in PROFILE_RUNTIME_MANUAL_PROFILES
+
+
+def _legacy_profile_checkpoint_dir(profile: str) -> Path | None:
+    return LEGACY_PROFILE_CHECKPOINT_DIRS.get(profile)
+
+
 def _shared_config_pack_profile(
     model_config_path: str | Path,
     data_config_path: str | Path,
@@ -2364,18 +2475,24 @@ def _shared_config_pack_profile(
         "remote-7b": ("model-7b.json", "data-7b.json", "train-7b.json"),
     }
     for profile, expected in profile_filenames.items():
-        if filenames == expected:
+        expected_model, expected_data, expected_train = expected
+        train_stem = Path(filenames[2]).stem
+        expected_train_stem = Path(expected_train).stem
+        train_matches = train_stem == expected_train_stem or train_stem.startswith(
+            f"{expected_train_stem}-"
+        )
+        if filenames[0] == expected_model and filenames[1] == expected_data and train_matches:
             return profile
     return None
 
 
 def _backup_existing_stage_output(output_dir: Path, *, label: str) -> Path | None:
-    checkpoints = [
-        path
-        for path in output_dir.glob("step-*")
-        if path.is_dir() and not path.name.endswith(".tmp")
-    ]
-    if not checkpoints:
+    if not output_dir.exists():
+        return None
+    has_existing_artifacts = any(
+        child.name != ".DS_Store" for child in output_dir.iterdir()
+    )
+    if not has_existing_artifacts:
         return None
     backup_dir = output_dir.with_name(f"{output_dir.name}.{label}-{time.strftime('%Y%m%d-%H%M%S')}")
     if backup_dir.exists():
@@ -2426,6 +2543,66 @@ def _apply_dpo_stage_overrides(train_config: TrainConfig) -> TrainConfig:
     return stage_config
 
 
+def _manual_profile_pretrain_fallback_dirs(profile: str, train_config: TrainConfig) -> list[Path]:
+    fallback_dirs: list[Path] = []
+    for candidate in (
+        Path(train_config.checkpoint.output_dir),
+        _legacy_profile_checkpoint_dir(profile),
+    ):
+        if candidate is None or candidate in fallback_dirs:
+            continue
+        fallback_dirs.append(candidate)
+    return fallback_dirs
+
+
+def _prepare_manual_stage_checkpoint_dir(
+    *,
+    profile: str | None,
+    stage_name: str,
+    output_dir: str,
+    resume_from: str | None,
+    backup_label: str = "stale",
+) -> str:
+    if not _uses_profile_runtime_layout(profile):
+        return output_dir
+    stage_dir = _profile_checkpoint_dir(profile, stage_name)
+    if resume_from is None:
+        backup_dir = _backup_existing_stage_output(stage_dir, label=backup_label)
+        if backup_dir is not None:
+            print(
+                f"WebbGPT: moved existing {stage_name} checkpoints to {backup_dir} "
+                f"before starting a fresh {profile} {stage_name} run.",
+                file=sys.stderr,
+                flush=True,
+            )
+    return str(stage_dir)
+
+
+def _prepare_manual_pretrain_train_config(
+    model_config_path: str,
+    data_config_path: str,
+    train_config_path: str,
+    train_config: TrainConfig,
+) -> TrainConfig:
+    stage_config = TrainConfig.from_dict(train_config.to_dict())
+    profile = _shared_config_pack_profile(model_config_path, data_config_path, train_config_path)
+    if not _uses_profile_runtime_layout(profile):
+        return stage_config
+    pretrain_dir = _prepare_manual_stage_checkpoint_dir(
+        profile=profile,
+        stage_name="pretrain",
+        output_dir=stage_config.checkpoint.output_dir,
+        resume_from=stage_config.checkpoint.resume_from,
+    )
+    stage_config.checkpoint.output_dir = pretrain_dir
+    print(
+        f"WebbGPT: {profile} manual pretrain will write checkpoints under {pretrain_dir}.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return stage_config
+
+
 def _prepare_manual_continue_train_config(
     model_config_path: str,
     data_config_path: str,
@@ -2434,30 +2611,67 @@ def _prepare_manual_continue_train_config(
 ) -> TrainConfig:
     stage_config = _apply_continue_stage_overrides(train_config)
     profile = _shared_config_pack_profile(model_config_path, data_config_path, train_config_path)
-    if profile != "local-mvp":
-        return stage_config
-    if stage_config.checkpoint.resume_from is not None:
+    if not _uses_profile_runtime_layout(profile):
         return stage_config
     pretrain_dir = _profile_checkpoint_dir(profile, "pretrain")
-    continue_dir = _profile_checkpoint_dir(profile, "continue")
-    if stage_config.checkpoint.initialize_from is None:
-        stage_config.checkpoint.initialize_from = _latest_checkpoint_dir(str(pretrain_dir))
-    backup_dir = _backup_existing_stage_output(continue_dir, label="stale")
-    if backup_dir is not None:
+    continue_dir = _prepare_manual_stage_checkpoint_dir(
+        profile=profile,
+        stage_name="continue",
+        output_dir=stage_config.checkpoint.output_dir,
+        resume_from=stage_config.checkpoint.resume_from,
+    )
+    if (
+        stage_config.checkpoint.resume_from is None
+        and stage_config.checkpoint.initialize_from is None
+    ):
+        staged_pretrain_checkpoint = _completed_checkpoint_dirs(pretrain_dir)
+        if staged_pretrain_checkpoint:
+            stage_config.checkpoint.initialize_from = str(staged_pretrain_checkpoint[-1])
+        else:
+            raise RuntimeError(
+                f"No completed {profile} pretrain checkpoints were found in {pretrain_dir}. "
+                "Manual continue now requires explicit lineage; set checkpoint.initialize_from to a specific checkpoint "
+                "if you intentionally want to continue from a legacy or non-staged path."
+            )
+    stage_config.checkpoint.output_dir = continue_dir
+    if stage_config.checkpoint.resume_from is not None:
         print(
-            f"WebbGPT: moved existing continued-pretraining checkpoints to {backup_dir} "
-            "before starting a fresh local-mvp continue run.",
+            f"WebbGPT: {profile} manual continue will resume from {stage_config.checkpoint.resume_from} "
+            f"and keep writing checkpoints under {continue_dir}.",
             file=sys.stderr,
             flush=True,
         )
-    stage_config.checkpoint.output_dir = str(continue_dir)
-    print(
-        "WebbGPT: local-mvp manual continue will initialize from the latest completed "
-        f"pretrain checkpoint in {pretrain_dir}.",
-        file=sys.stderr,
-        flush=True,
+    else:
+        print(
+            f"WebbGPT: {profile} manual continue will initialize from "
+            f"{stage_config.checkpoint.initialize_from} and write new checkpoints under {continue_dir}.",
+            file=sys.stderr,
+            flush=True,
     )
     return stage_config
+
+
+def _manual_profile_sft_initialize_checkpoint(profile: str, continue_dir: Path) -> str:
+    try:
+        return _latest_checkpoint_dir(str(continue_dir))
+    except RuntimeError as exc:
+        from train.checkpoint import load_stage_summary
+
+        continue_summary = load_stage_summary(continue_dir)
+        if bool((continue_summary or {}).get("skipped")):
+            pretrain_dir = _profile_checkpoint_dir(profile, "pretrain")
+            try:
+                return _latest_checkpoint_dir(str(pretrain_dir))
+            except RuntimeError as pretrain_exc:
+                raise RuntimeError(
+                    f"The latest {profile} continue stage at {continue_dir} was skipped, "
+                    f"but no completed {profile} pretrain checkpoints were found in {pretrain_dir}. "
+                    "Set checkpoint.initialize_from explicitly if you want SFT to start from a different checkpoint."
+                ) from pretrain_exc
+        raise RuntimeError(
+            f"No completed {profile} continue checkpoints were found in {continue_dir}. "
+            "Set checkpoint.initialize_from explicitly if you want SFT to start from a different checkpoint."
+        ) from exc
 
 
 def _prepare_manual_sft_train_config(
@@ -2471,24 +2685,27 @@ def _prepare_manual_sft_train_config(
     initialize_from = train_config.checkpoint.initialize_from
     resume_from = train_config.checkpoint.resume_from
 
-    if profile == "local-mvp":
+    if _uses_profile_runtime_layout(profile):
         continue_dir = _profile_checkpoint_dir(profile, "continue")
-        sft_dir = _profile_checkpoint_dir(profile, "sft")
-        output_dir = str(sft_dir)
+        output_dir = _prepare_manual_stage_checkpoint_dir(
+            profile=profile,
+            stage_name="sft",
+            output_dir=output_dir,
+            resume_from=resume_from,
+        )
         if resume_from is None:
             if initialize_from is None:
-                initialize_from = _latest_checkpoint_dir(str(continue_dir))
-            backup_dir = _backup_existing_stage_output(sft_dir, label="stale")
-            if backup_dir is not None:
-                print(
-                    f"WebbGPT: moved existing SFT checkpoints to {backup_dir} "
-                    "before starting a fresh local-mvp SFT run.",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                initialize_from = _manual_profile_sft_initialize_checkpoint(profile, continue_dir)
             print(
-                "WebbGPT: local-mvp manual SFT will initialize from the latest completed "
-                f"continue checkpoint in {continue_dir}.",
+                f"WebbGPT: {profile} manual SFT will initialize from {initialize_from} "
+                f"and write new checkpoints under {output_dir}.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"WebbGPT: {profile} manual SFT will resume from {resume_from} "
+                f"and keep writing checkpoints under {output_dir}.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2515,21 +2732,29 @@ def _prepare_manual_dpo_train_config(
     output_dir = train_config.checkpoint.output_dir
     resume_from = train_config.checkpoint.resume_from
 
-    if profile == "local-mvp":
-        dpo_dir = _profile_checkpoint_dir(profile, "dpo")
-        output_dir = str(dpo_dir)
+    if _uses_profile_runtime_layout(profile):
+        output_dir = _prepare_manual_stage_checkpoint_dir(
+            profile=profile,
+            stage_name="dpo",
+            output_dir=output_dir,
+            resume_from=resume_from,
+        )
+        if resume_from is None and not Path(reference_checkpoint).exists():
+            raise RuntimeError(
+                f"The provided DPO reference checkpoint does not exist: {reference_checkpoint}. "
+                "Point --reference-checkpoint at a concrete SFT checkpoint directory."
+            )
         if resume_from is None:
-            backup_dir = _backup_existing_stage_output(dpo_dir, label="stale")
-            if backup_dir is not None:
-                print(
-                    f"WebbGPT: moved existing DPO checkpoints to {backup_dir} "
-                    "before starting a fresh local-mvp DPO run.",
-                    file=sys.stderr,
-                    flush=True,
-                )
             print(
-                "WebbGPT: local-mvp manual DPO will initialize the policy from the provided "
-                f"SFT checkpoint {reference_checkpoint} and write new checkpoints under {dpo_dir}.",
+                f"WebbGPT: {profile} manual DPO will initialize the policy from the provided "
+                f"SFT checkpoint {reference_checkpoint} and write new checkpoints under {output_dir}.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"WebbGPT: {profile} manual DPO will resume from {resume_from} "
+                f"and keep writing checkpoints under {output_dir}.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2849,20 +3074,136 @@ def _prepared_manifest_source(name: str, manifest_path: str) -> DataSourceConfig
     )
 
 
+def _prepared_manifest_config(
+    data_config: DataConfig,
+    manifest_key: str,
+) -> tuple[DataConfig, str]:
+    stage_config = DataConfig.from_dict(data_config.to_dict())
+    stage_name = manifest_key
+    if manifest_key == "sft_validation":
+        stage_config.sft_sources = list(stage_config.sft_validation_sources)
+        stage_name = "sft"
+    elif manifest_key == "preference_validation":
+        stage_config.preference_sources = list(stage_config.preference_validation_sources)
+        stage_name = "preference"
+    return stage_config, stage_name
+
+
+def _materialize_profile_prepared_manifests(
+    profile: str,
+    data_config: DataConfig,
+    manifest_keys: list[str],
+    *,
+    force_rebuild: bool = False,
+) -> dict[str, dict[str, object]]:
+    from data.dataset import DatasetBuilder
+
+    prepared_root = _profile_prepared_dir(profile)
+    prepared_root.mkdir(parents=True, exist_ok=True)
+    manifests: dict[str, dict[str, object]] = {}
+    for manifest_key in manifest_keys:
+        stage_config, stage_name = _prepared_manifest_config(data_config, manifest_key)
+        manifest_path = prepared_root / f"{manifest_key}.json"
+        manifest = DatasetBuilder(stage_config).prepare_stage(
+            stage_name,
+            str(manifest_path),
+            force_rebuild=force_rebuild,
+        )
+        manifests[manifest_key] = {"path": str(manifest_path), "manifest": manifest}
+    return manifests
+
+
 def _prepared_data_config(data_config: DataConfig, manifest_paths: dict[str, str]) -> DataConfig:
     prepared = DataConfig.from_dict(data_config.to_dict())
-    prepared.pretrain_sources = [_prepared_manifest_source("prepared_pretrain", manifest_paths["pretrain"])]
-    prepared.continued_pretrain_sources = [
-        _prepared_manifest_source("prepared_continue", manifest_paths["continue"])
-    ]
-    prepared.sft_sources = [_prepared_manifest_source("prepared_sft", manifest_paths["sft"])]
-    prepared.preference_sources = [
-        _prepared_manifest_source("prepared_preference", manifest_paths["preference"])
-    ]
-    prepared.validation_sources = [
-        _prepared_manifest_source("prepared_validation", manifest_paths["validation"])
-    ]
+    if "pretrain" in manifest_paths:
+        prepared.pretrain_sources = [_prepared_manifest_source("prepared_pretrain", manifest_paths["pretrain"])]
+    if "continue" in manifest_paths:
+        prepared.continued_pretrain_sources = [
+            _prepared_manifest_source("prepared_continue", manifest_paths["continue"])
+        ]
+    if "sft" in manifest_paths:
+        prepared.sft_sources = [_prepared_manifest_source("prepared_sft", manifest_paths["sft"])]
+    if "sft_validation" in manifest_paths:
+        prepared.sft_validation_sources = [
+            _prepared_manifest_source("prepared_sft_validation", manifest_paths["sft_validation"])
+        ]
+    if "preference" in manifest_paths:
+        prepared.preference_sources = [
+            _prepared_manifest_source("prepared_preference", manifest_paths["preference"])
+        ]
+    if "preference_validation" in manifest_paths:
+        prepared.preference_validation_sources = [
+            _prepared_manifest_source(
+                "prepared_preference_validation",
+                manifest_paths["preference_validation"],
+            )
+        ]
+    if "validation" in manifest_paths:
+        prepared.validation_sources = [
+            _prepared_manifest_source("prepared_validation", manifest_paths["validation"])
+        ]
     return prepared
+
+
+def _manual_profile_prepared_manifest_keys(
+    stage_name: str,
+    data_config: DataConfig,
+    train_config: TrainConfig,
+) -> list[str]:
+    manifest_keys: list[str] = []
+    if stage_name == "pretrain":
+        manifest_keys.append("pretrain")
+        if data_config.validation_sources:
+            manifest_keys.append("validation")
+        return manifest_keys
+    if stage_name == "continue":
+        manifest_keys.append("continue")
+        if data_config.validation_sources:
+            manifest_keys.append("validation")
+        return manifest_keys
+    if stage_name == "sft":
+        manifest_keys.append("sft")
+        if data_config.sft_validation_sources:
+            manifest_keys.append("sft_validation")
+        return manifest_keys
+    if stage_name == "dpo":
+        manifest_keys.append("preference")
+        if data_config.preference_validation_sources:
+            manifest_keys.append("preference_validation")
+        if train_config.dpo_enable_lm_health_eval and data_config.validation_sources:
+            manifest_keys.append("validation")
+        return manifest_keys
+    raise ValueError(f"Unsupported manual stage {stage_name!r}.")
+
+
+def _prepare_manual_stage_data_config(
+    model_config_path: str,
+    data_config_path: str,
+    train_config_path: str,
+    data_config: DataConfig,
+    train_config: TrainConfig,
+    *,
+    stage_name: str,
+    force_rebuild: bool = False,
+) -> DataConfig:
+    profile = _shared_config_pack_profile(model_config_path, data_config_path, train_config_path)
+    if not _uses_profile_runtime_layout(profile):
+        return data_config
+    manifest_keys = _manual_profile_prepared_manifest_keys(stage_name, data_config, train_config)
+    prepared_manifests = _materialize_profile_prepared_manifests(
+        profile,
+        data_config,
+        manifest_keys,
+        force_rebuild=force_rebuild,
+    )
+    manifest_paths = {key: str(payload["path"]) for key, payload in prepared_manifests.items()}
+    print(
+        f"WebbGPT: using profile-scoped prepared data under {_profile_prepared_dir(profile)} "
+        f"for the {profile} manual {stage_name} run.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return _prepared_data_config(data_config, manifest_paths)
 
 
 def _run_main_pipeline(
@@ -2935,7 +3276,6 @@ def _run_main_pipeline(
 
     _validate_profile_hardware_fit(profile, model_config)
 
-    from data.dataset import DatasetBuilder
     from eval.runner import run_evaluation
     from export.hf import export_hf_checkpoint
     from grounding.ingest import webb_sync
@@ -2946,7 +3286,6 @@ def _run_main_pipeline(
     from train.entrypoints import run_continued_pretraining, run_pretraining
 
     runtime_root = _profile_artifact_root(profile)
-    prepared_root = runtime_root / "prepared"
     checkpoints_root = runtime_root / "checkpoints"
     eval_root = _profile_eval_dir(profile)
 
@@ -2976,17 +3315,29 @@ def _run_main_pipeline(
         )
 
     print("WebbGPT: materializing prepared datasets.", file=sys.stderr, flush=True)
-    builder = DatasetBuilder(data_config)
-    prepared_root.mkdir(parents=True, exist_ok=True)
-    manifest_paths: dict[str, str] = {}
-    for stage in ("validation", "pretrain", "continue", "sft", "preference"):
-        manifest = builder.prepare_stage(
-            stage,
-            str(prepared_root / f"{stage}.json"),
-            force_rebuild=force_rebuild,
+    manifest_keys = ["validation", "pretrain", "continue", "sft", "preference"]
+    if data_config.sft_validation_sources:
+        manifest_keys.append("sft_validation")
+    if data_config.preference_validation_sources:
+        manifest_keys.append("preference_validation")
+    prepared_manifests = _materialize_profile_prepared_manifests(
+        profile,
+        data_config,
+        manifest_keys,
+        force_rebuild=force_rebuild,
+    )
+    manifest_paths = {key: str(payload["path"]) for key, payload in prepared_manifests.items()}
+    for stage, payload in prepared_manifests.items():
+        print(
+            json.dumps(
+                {
+                    "stage": stage,
+                    "prepared_manifest": payload["path"],
+                    "kind": payload["manifest"]["kind"],
+                }
+            ),
+            flush=True,
         )
-        manifest_paths[stage] = str(prepared_root / f"{stage}.json")
-        print(json.dumps({"stage": stage, "prepared_manifest": manifest_paths[stage], "kind": manifest["kind"]}), flush=True)
 
     prepared_data_config = _prepared_data_config(data_config, manifest_paths)
 
@@ -3010,8 +3361,11 @@ def _run_main_pipeline(
         token_budget=data_config.continued_pretraining_token_budget,
     )
     print("WebbGPT: running continued pretraining stage.", file=sys.stderr, flush=True)
-    run_continued_pretraining(model_config, prepared_data_config, continued_config)
-    continued_checkpoint = _latest_checkpoint_dir(continued_config.checkpoint.output_dir)
+    continue_summary = run_continued_pretraining(model_config, prepared_data_config, continued_config)
+    if bool(continue_summary.get("skipped")):
+        continued_checkpoint = pretrain_checkpoint
+    else:
+        continued_checkpoint = _latest_checkpoint_dir(continued_config.checkpoint.output_dir)
 
     sft_config = _stage_train_config(
         train_config,
@@ -3048,7 +3402,18 @@ def _run_main_pipeline(
     )
     eval_root.mkdir(parents=True, exist_ok=True)
     (eval_root / "result.json").write_text(json.dumps(eval_result, indent=2) + "\n")
-    print(json.dumps(eval_result, indent=2), flush=True)
+    print(dump_rounded_json(eval_result, indent=2), flush=True)
+    dpo_trust = _artifact_trust(dpo_checkpoint)
+    if str(dpo_trust.get("artifact_status", "promotable")) != "promotable":
+        message = (
+            "WebbGPT: skipping export/serve because the final DPO checkpoint is not promotable "
+            f"(artifact_status={dpo_trust.get('artifact_status')}, "
+            f"blockers={', '.join(dpo_trust.get('promotion_blockers', [])) or 'none'})."
+        )
+        if no_serve:
+            print(message, file=sys.stderr, flush=True)
+            return 0
+        raise RuntimeError(message)
 
     export_dir = _profile_export_dir(profile)
     print("WebbGPT: exporting Hugging Face artifacts.", file=sys.stderr, flush=True)
@@ -3124,14 +3489,7 @@ def main() -> int:
 
     if args.command == "build-tokenizer-corpus":
         config = load_config(args.config, TokenizerCorpusConfig)
-        print(
-            "WebbGPT: building tokenizer corpus "
-            f"from {config.dataset_name}/{config.dataset_config_name} into {config.output_path}.",
-            file=sys.stderr,
-            flush=True,
-        )
-        result = _run_tokenizer_corpus_subprocess(config)
-        print(json.dumps(result, indent=2), flush=True)
+        _run_tokenizer_corpus_subprocess(config)
         return 0
 
     if args.command == "prepare-data":
@@ -3140,17 +3498,47 @@ def main() -> int:
         config = load_config(args.config, DataConfig)
         builder = DatasetBuilder(config)
         manifest = builder.prepare_stage(args.stage, args.output, force_rebuild=args.force_rebuild)
-        print(json.dumps(manifest, indent=2), flush=True)
+        print(dump_rounded_json(manifest, indent=2), flush=True)
+        return 0
+
+    if args.command == "audit-data":
+        from data.dataset import DatasetBuilder
+
+        config = load_config(args.config, DataConfig)
+        builder = DatasetBuilder(config)
+        if args.stage == "continue":
+            payload = builder.assess_continue_readiness()
+        else:
+            payload = builder.audit_lm_stage(args.stage)
+        print(dump_rounded_json(payload, indent=2), flush=True)
         return 0
 
     if args.command == "train-pretrain":
         from train.entrypoints import run_pretraining
 
         print("WebbGPT: starting pretraining.", file=sys.stderr, flush=True)
+        model_config = load_config(args.model_config, ModelConfig)
+        data_config = load_config(args.data_config, DataConfig)
+        base_train_config = load_config(args.train_config, TrainConfig)
+        data_config = _prepare_manual_stage_data_config(
+            args.model_config,
+            args.data_config,
+            args.train_config,
+            data_config,
+            base_train_config,
+            stage_name="pretrain",
+            force_rebuild=args.force_rebuild,
+        )
+        train_config = _prepare_manual_pretrain_train_config(
+            args.model_config,
+            args.data_config,
+            args.train_config,
+            base_train_config,
+        )
         run_pretraining(
-            load_config(args.model_config, ModelConfig),
-            load_config(args.data_config, DataConfig),
-            load_config(args.train_config, TrainConfig),
+            model_config,
+            data_config,
+            train_config,
         )
         return 0
 
@@ -3160,11 +3548,21 @@ def main() -> int:
         print("WebbGPT: starting continued pretraining.", file=sys.stderr, flush=True)
         model_config = load_config(args.model_config, ModelConfig)
         data_config = load_config(args.data_config, DataConfig)
+        base_train_config = load_config(args.train_config, TrainConfig)
+        data_config = _prepare_manual_stage_data_config(
+            args.model_config,
+            args.data_config,
+            args.train_config,
+            data_config,
+            base_train_config,
+            stage_name="continue",
+            force_rebuild=args.force_rebuild,
+        )
         train_config = _prepare_manual_continue_train_config(
             args.model_config,
             args.data_config,
             args.train_config,
-            load_config(args.train_config, TrainConfig),
+            base_train_config,
         )
         run_continued_pretraining(
             model_config,
@@ -3179,11 +3577,21 @@ def main() -> int:
         print("WebbGPT: starting supervised fine-tuning.", file=sys.stderr, flush=True)
         model_config = load_config(args.model_config, ModelConfig)
         data_config = load_config(args.data_config, DataConfig)
+        base_train_config = load_config(args.train_config, TrainConfig)
+        data_config = _prepare_manual_stage_data_config(
+            args.model_config,
+            args.data_config,
+            args.train_config,
+            data_config,
+            base_train_config,
+            stage_name="sft",
+            force_rebuild=args.force_rebuild,
+        )
         train_config = _prepare_manual_sft_train_config(
             args.model_config,
             args.data_config,
             args.train_config,
-            load_config(args.train_config, TrainConfig),
+            base_train_config,
         )
         run_sft_job(
             model_config,
@@ -3198,11 +3606,21 @@ def main() -> int:
         print("WebbGPT: starting DPO alignment.", file=sys.stderr, flush=True)
         model_config = load_config(args.model_config, ModelConfig)
         data_config = load_config(args.data_config, DataConfig)
+        base_train_config = load_config(args.train_config, TrainConfig)
+        data_config = _prepare_manual_stage_data_config(
+            args.model_config,
+            args.data_config,
+            args.train_config,
+            data_config,
+            base_train_config,
+            stage_name="dpo",
+            force_rebuild=args.force_rebuild,
+        )
         train_config = _prepare_manual_dpo_train_config(
             args.model_config,
             args.data_config,
             args.train_config,
-            load_config(args.train_config, TrainConfig),
+            base_train_config,
             reference_checkpoint=args.reference_checkpoint,
         )
         run_dpo_job(
@@ -3217,13 +3635,18 @@ def main() -> int:
         from eval.runner import run_evaluation
 
         print("WebbGPT: starting evaluation.", file=sys.stderr, flush=True)
+        _require_trusted_artifact(
+            args.checkpoint,
+            action="run evaluation",
+            force_untrusted=args.force_untrusted,
+        )
         result = run_evaluation(
             load_config(args.model_config, ModelConfig),
             load_config(args.data_config, DataConfig),
             load_config(args.eval_config, EvalConfig),
             checkpoint_path=args.checkpoint,
         )
-        print(json.dumps(result, indent=2), flush=True)
+        print(dump_rounded_json(result, indent=2), flush=True)
         return 0
 
     if args.command == "ingest-webb-site":
@@ -3238,7 +3661,7 @@ def main() -> int:
             label=args.label,
             families=args.families,
         )
-        print(json.dumps(result, indent=2), flush=True)
+        print(dump_rounded_json(result, indent=2), flush=True)
         return 0
 
     if args.command == "ingest-webb-handbook":
@@ -3251,7 +3674,7 @@ def main() -> int:
             label=args.label,
             allow_ocr_fallback=args.allow_ocr_fallback,
         )
-        print(json.dumps(result, indent=2), flush=True)
+        print(dump_rounded_json(result, indent=2), flush=True)
         return 0
 
     if args.command == "webb-sync":
@@ -3267,20 +3690,25 @@ def main() -> int:
             label=args.label,
             families=args.families,
         )
-        print(json.dumps(result, indent=2), flush=True)
+        print(dump_rounded_json(result, indent=2), flush=True)
         return 0
 
     if args.command == "diff-webb-snapshot":
         from grounding.ingest import diff_webb_snapshot
 
         result = diff_webb_snapshot(args.dsn, args.from_snapshot, args.to_snapshot)
-        print(json.dumps(result, indent=2), flush=True)
+        print(dump_rounded_json(result, indent=2), flush=True)
         return 0
 
     if args.command == "serve":
         from serve.app import run_server
 
         serve_config = load_config(args.serve_config, ServeConfig)
+        _require_trusted_artifact(
+            serve_config.checkpoint_path,
+            action="serve",
+            force_untrusted=args.force_untrusted,
+        )
         if args.sync_on_start:
             serve_config = ServeConfig.from_dict(serve_config.to_dict())
             grounding = serve_config.grounding or GroundingConfig()
@@ -3292,6 +3720,11 @@ def main() -> int:
     if args.command == "export-hf":
         from export.hf import export_hf_checkpoint
 
+        _require_trusted_artifact(
+            args.checkpoint,
+            action="export",
+            force_untrusted=args.force_untrusted,
+        )
         export_hf_checkpoint(
             load_config(args.model_config, ModelConfig),
             checkpoint_path=args.checkpoint,
@@ -3333,3 +3766,7 @@ def main() -> int:
         )
 
     raise ValueError(f"Unhandled command {args.command!r}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

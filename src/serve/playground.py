@@ -594,7 +594,7 @@ def render_playground_html(config: ServeConfig) -> str:
 
         <div id="chatLog" class="chat-log">
           <div class="empty">
-            Start with a general question, or ask a catalog-style question like “What does CS 101 cover?” to test grounding.
+            Start with a general question, or ask a catalog-style question like “What does AdvSt Chemistry require?” to test grounding.
           </div>
         </div>
 
@@ -1151,7 +1151,7 @@ def render_playground_html(config: ServeConfig) -> str:
       function render() {{
         chatLog.innerHTML = "";
         if (!messages.length) {{
-          chatLog.innerHTML = '<div class="empty">Start with a general question, or ask a catalog-style question like “What does CS 101 cover?” to test grounding.</div>';
+          chatLog.innerHTML = '<div class="empty">Start with a general question, or ask a catalog-style question like “What does AdvSt Chemistry require?” to test grounding.</div>';
           return;
         }}
 
