@@ -5,6 +5,7 @@ from train.console import (
     format_scalar,
     print_dpo_eval_event,
     print_dpo_train_event,
+    print_lm_eval_event,
     round_output_numbers,
 )
 
@@ -63,6 +64,37 @@ def test_dump_rounded_json_applies_the_same_rounding_rules():
         "examples": 12,
         "perplexity": 4.57,
     }
+
+
+def test_lm_eval_sample_logging_preserves_unicode_punctuation(capsys):
+    print_lm_eval_event(
+        {
+            "eval": {"loss": 5.3463, "perplexity": 209.83},
+            "progress_percent": 100.0,
+            "stage_elapsed_sec": 16486.38,
+            "stage_eta_sec": 0.0,
+            "sample_mode": "raw_lm",
+            "samples": [
+                {
+                    "id": "unicode_probe",
+                    "bucket": "neutral_expository_prose",
+                    "probe_type": "general_legibility",
+                    "prompt": "Explain the punctuation.",
+                    "clean_response": "don’t print “quote” or — as JSON escapes.",
+                }
+            ],
+        }
+    )
+
+    captured = capsys.readouterr()
+
+    assert "don’t" in captured.out
+    assert "“quote”" in captured.out
+    assert "—" in captured.out
+    assert "\\u2019" not in captured.out
+    assert "\\u201c" not in captured.out
+    assert "\\u201d" not in captured.out
+    assert "\\u2014" not in captured.out
 
 
 def test_print_dpo_train_event_uses_semicolon_console_format(capsys):

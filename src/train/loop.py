@@ -253,7 +253,7 @@ def save_run_metadata(train_config: TrainConfig, output_dir: str, extra: dict[st
     payload = train_config.to_dict()
     if extra:
         payload.update(extra)
-    path.write_text(json.dumps(payload, indent=2))
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def save_stage_summary(output_dir: str, payload: dict[str, Any]) -> None:
@@ -261,7 +261,7 @@ def save_stage_summary(output_dir: str, payload: dict[str, Any]) -> None:
         return
     path = Path(output_dir) / "stage_summary.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2))
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def run_training(
@@ -392,7 +392,7 @@ def run_training(
         history_path = Path(eval_control.eval_history_path)
         history_path.parent.mkdir(parents=True, exist_ok=True)
         with history_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload) + "\n")
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _save_best_checkpoint(step: int) -> Path | None:
         if best_checkpoint_name is None:
@@ -422,7 +422,7 @@ def run_training(
 
     def _write_selection_metadata(best_path: Path, payload: dict[str, Any]) -> None:
         selection_path = best_path / "selection.json"
-        selection_path.write_text(json.dumps(payload, indent=2))
+        selection_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
     def _percent(completed: int | float | None, total: int | float | None) -> float | None:
         if completed is None or total is None:

@@ -55,7 +55,7 @@ def round_output_numbers(value: Any, *, key_path: tuple[str, ...] = ()) -> Any:
 
 
 def dump_rounded_json(value: Any, *, indent: int | None = None) -> str:
-    return json.dumps(round_output_numbers(value), indent=indent)
+    return json.dumps(round_output_numbers(value), indent=indent, ensure_ascii=False)
 
 
 def single_line_text(value: object) -> str:
@@ -99,14 +99,14 @@ def _print_samples_block(
         return
     print(f"{prefix}; samples: [", flush=True)
     for index, sample in enumerate(samples, start=1):
-        prompt = json.dumps(single_line_text(sample.get("prompt", "")), ensure_ascii=True)
-        response = json.dumps(single_line_text(sample.get("response", "")), ensure_ascii=True)
+        prompt = json.dumps(single_line_text(sample.get("prompt", "")), ensure_ascii=False)
+        response = json.dumps(single_line_text(sample.get("response", "")), ensure_ascii=False)
         metadata = ""
         if sample.get("id") or sample.get("bucket") or sample.get("probe_type"):
             metadata = (
-                f"id: {json.dumps(single_line_text(sample.get('id', '')), ensure_ascii=True)}; "
-                f"bucket: {json.dumps(single_line_text(sample.get('bucket', '')), ensure_ascii=True)}; "
-                f"probe_type: {json.dumps(single_line_text(sample.get('probe_type', '')), ensure_ascii=True)}; "
+                f"id: {json.dumps(single_line_text(sample.get('id', '')), ensure_ascii=False)}; "
+                f"bucket: {json.dumps(single_line_text(sample.get('bucket', '')), ensure_ascii=False)}; "
+                f"probe_type: {json.dumps(single_line_text(sample.get('probe_type', '')), ensure_ascii=False)}; "
             )
         suffix = ";" if index < len(samples) else ""
         print(f"  sample{index}: {{{metadata}prompt: {prompt}; response: {response}}}{suffix}", flush=True)

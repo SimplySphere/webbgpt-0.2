@@ -139,7 +139,9 @@ class CheckpointManager:
         torch.save(payload, tmp_target / "checkpoint.pt")
         checkpoint_metadata = payload["extra_state"].get("checkpoint_metadata")
         if checkpoint_metadata is not None:
-            (tmp_target / "checkpoint_metadata.json").write_text(json.dumps(checkpoint_metadata, indent=2))
+            (tmp_target / "checkpoint_metadata.json").write_text(
+                json.dumps(checkpoint_metadata, indent=2, ensure_ascii=False)
+            )
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
         tmp_target.replace(target)

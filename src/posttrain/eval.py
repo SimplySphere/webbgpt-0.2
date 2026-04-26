@@ -379,13 +379,13 @@ def append_eval_history(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def write_selection_metadata(best_dir: str | Path, payload: dict[str, Any]) -> None:
     target_dir = Path(best_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / "selection.json").write_text(json.dumps(payload, indent=2))
+    (target_dir / "selection.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def update_topk_candidates(
@@ -426,7 +426,7 @@ def update_topk_candidates(
         stale = Path(entry["path"])
         if stale.exists() and stale.is_dir() and str(stale) not in kept_paths:
             shutil.rmtree(stale, ignore_errors=True)
-    metadata_path.write_text(json.dumps(kept, indent=2))
+    metadata_path.write_text(json.dumps(kept, indent=2, ensure_ascii=False))
     return kept
 
 
