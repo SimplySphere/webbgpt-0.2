@@ -128,6 +128,9 @@ def test_data_source_config_roundtrip_with_extended_fields():
     assert restored.family == "public_prose"
     assert restored.quality_filter_mode == "broad_lm"
 
+    domain_source = DataSourceConfig(name="domain", quality_filter_mode="domain_lm")
+    assert DataSourceConfig.from_dict(domain_source.to_dict()).quality_filter_mode == "domain_lm"
+
 
 def test_eval_config_roundtrip_with_release_gates():
     config = EvalConfig(

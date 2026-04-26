@@ -13,7 +13,7 @@ from posttrain.eval import (
     generate_qualitative_samples,
 )
 from repro import seed_everything
-from train.checkpoint import CheckpointManager, resolve_parent_lineage
+from train.checkpoint import CheckpointManager, load_artifact_trust, resolve_parent_lineage
 from train.console import print_lm_train_event, print_sft_eval_event, simplify_samples
 from train.distributed import cleanup_distributed, init_distributed, is_main_process, maybe_wrap_fsdp
 from train.entrypoints import build_stage_data_fingerprint, snapshot_configs
@@ -208,6 +208,18 @@ def run_sft_job(model_config: ModelConfig, data_config: DataConfig, train_config
             stage_config.checkpoint.resume_from or stage_config.checkpoint.initialize_from,
             nominal_parent_stage="continue",
         )
+        parent_checkpoint = stage_config.checkpoint.resume_from or stage_config.checkpoint.initialize_from
+        parent_trust = load_artifact_trust(parent_checkpoint) if parent_checkpoint else {}
+        if parent_trust and not bool(parent_trust.get("promotion_eligible_for_sft", parent_trust.get("promotion_eligible", False))):
+            trust_blockers.append("parent_raw_lm_not_sft_ready")
+            if is_main_process():
+                print(
+                    "WebbGPT: SFT parent checkpoint is archiveable but not quality-gated for serious SFT "
+                    f"(model_quality_status={parent_trust.get('model_quality_status')}, "
+                    f"sft_blockers={', '.join(parent_trust.get('sft_promotion_blockers', [])) or 'none'}).",
+                    file=sys.stderr,
+                    flush=True,
+                )
         checkpoint_metadata = {
             "stage": "sft",
             **parent_lineage,

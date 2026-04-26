@@ -30,6 +30,13 @@ class _FakeTorch:
     def device(name):
         return name
 
+    class no_grad:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
 
 class _FakeValue:
     def __init__(self, value):
@@ -107,7 +114,11 @@ class _FakeOptimizer:
 
 
 class _FakeScheduler:
+    def __init__(self):
+        self.steps = 0
+
     def step(self):
+        self.steps += 1
         return None
 
     def get_last_lr(self):
@@ -245,7 +256,7 @@ def test_run_training_emits_terminal_eval_for_short_token_budget_stage(monkeypat
     assert state.step == 2
     assert len(eval_calls) == 1
     assert payloads[-1]["step"] == 2
-    assert "final_eval" not in payloads[-1]
+    assert payloads[-1]["final_eval"] is True
     assert "progress_summary" in payloads[-1]
     assert "elapsed" in payloads[-1]["progress_summary"]
     assert "left" in payloads[-1]["progress_summary"]
@@ -323,37 +334,22 @@ def test_run_training_merges_eval_payload_and_saves_best_checkpoint(monkeypatch,
     stdout_lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     payloads = [json.loads(line) for line in stdout_lines if '"eval"' in line]
 
-    assert checkpoint_manager.named_saves == [
-        (
-            "best",
-            2,
-            {
-                "train_state": {
-                    "tokens_seen": 6,
-                    "examples_seen": 3,
-                    "best_eval_loss": 2.0,
-                    "best_eval_step": 2,
-                    "nonfinite_loss_steps": 0,
-                    "nonfinite_event_samples": [],
-                }
-            },
-        ),
-        (
-            "best",
-            4,
-            {
-                "train_state": {
-                    "tokens_seen": 10,
-                    "examples_seen": 5,
-                    "best_eval_loss": 1.0,
-                    "best_eval_step": 4,
-                    "nonfinite_loss_steps": 0,
-                    "nonfinite_event_samples": [],
-                }
-            },
-        ),
+    assert [(name, step) for name, step, _extra in checkpoint_manager.named_saves] == [
+        ("best", 2),
+        ("best", 4),
     ]
-    assert "final_eval" not in payloads[-1]
+    first_train_state = checkpoint_manager.named_saves[0][2]["train_state"]
+    second_train_state = checkpoint_manager.named_saves[1][2]["train_state"]
+    assert first_train_state["tokens_seen"] == 6
+    assert first_train_state["examples_seen"] == 3
+    assert first_train_state["best_eval_loss"] == 2.0
+    assert first_train_state["best_eval_step"] == 2
+    assert first_train_state["run_mode"] == "max_steps_limited"
+    assert second_train_state["tokens_seen"] == 10
+    assert second_train_state["examples_seen"] == 5
+    assert second_train_state["best_eval_loss"] == 1.0
+    assert second_train_state["best_eval_step"] == 4
+    assert payloads[-1]["final_eval"] is True
     assert payloads[-1]["qualitative_samples"] == [{"prompt": "p6", "raw_response": "r", "clean_response": "r"}]
     assert payloads[-1]["final_eval_seen"] is True
     train_payloads = [json.loads(line) for line in stdout_lines if '"loss"' in line and '"eval"' not in line]
@@ -524,3 +520,75 @@ def test_run_training_honors_qualitative_stop_request(monkeypatch, capsys):
 
     assert state.step == 0
     assert "qualitative gate requested termination" in capsys.readouterr().err
+
+
+def test_run_training_one_prepared_pass_does_not_repeat_and_flushes_partial(monkeypatch, capsys):
+    fake_checkpoint = types.ModuleType("train.checkpoint")
+    fake_checkpoint.CheckpointManager = object
+    fake_distributed = types.ModuleType("train.distributed")
+    fake_distributed.barrier = lambda: None
+    fake_distributed.is_main_process = lambda: True
+
+    monkeypatch.setitem(sys.modules, "train.checkpoint", fake_checkpoint)
+    monkeypatch.setitem(sys.modules, "train.distributed", fake_distributed)
+    sys.modules.pop("train.loop", None)
+
+    train_loop = importlib.import_module("train.loop")
+
+    def fake_require_torch():
+        return _FakeTorch(), None, None
+
+    monkeypatch.setattr(train_loop, "_require_torch", fake_require_torch)
+    monkeypatch.setattr(train_loop, "_to_device", lambda batch, _device: batch)
+    monkeypatch.setattr(train_loop, "barrier", lambda: None)
+    monkeypatch.setattr(train_loop, "is_main_process", lambda: True)
+
+    scheduler = _FakeScheduler()
+    state = train_loop.run_training(
+        model=_FakeModel(),
+        train_loader=[
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+        ],
+        train_config=TrainConfig(
+            run_name="test-one-pass",
+            global_batch_size=2,
+            max_steps=100,
+            micro_batch_size=1,
+            gradient_accumulation_steps=2,
+            learning_rate=1e-4,
+            min_learning_rate=1e-5,
+            warmup_steps=1,
+            log_every_steps=1,
+            checkpoint=CheckpointConfig(output_dir="/tmp/webbgpt-test-one-pass", save_every_steps=1000),
+        ),
+        checkpoint_manager=_FakeCheckpointManager(),
+        optimizer=_FakeOptimizer(),
+        scheduler=scheduler,
+        run_control=train_loop.TrainingRunControl(
+            run_mode="one_prepared_pass",
+            progress_mode="prepared_tokens",
+            prepared_token_target=10,
+            prepared_sequence_target=5,
+            stop_after_one_pass=True,
+            flush_final_partial_accumulation=True,
+            scheduler_max_steps=3,
+            effective_optimizer_steps=3,
+        ),
+    )
+
+    payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    assert state.step == 3
+    assert scheduler.steps == 3
+    assert state.tokens_seen == 10
+    assert state.examples_seen == 5
+    assert state.dataloader_passes_completed == 1
+    assert state.final_partial_accumulation_flushed is True
+    assert state.final_partial_microbatches == 1
+    assert state.prepared_token_progress_percent == 100.0
+    assert state.prepared_sequence_progress_percent == 100.0
+    assert payloads[-1]["run_mode"] == "one_prepared_pass"
+    assert payloads[-1]["prepared_token_progress_percent"] == 100.0

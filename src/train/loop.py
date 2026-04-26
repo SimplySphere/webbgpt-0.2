@@ -38,6 +38,17 @@ class TrainState:
     best_eval_step: int = -1
     nonfinite_loss_steps: int = 0
     nonfinite_event_samples: list[dict[str, Any]] = field(default_factory=list)
+    run_mode: str = "max_steps_limited"
+    progress_mode: str = "steps"
+    scheduler_max_steps: int | None = None
+    effective_optimizer_steps: int | None = None
+    prepared_token_target: int | None = None
+    prepared_sequence_target: int | None = None
+    prepared_token_progress_percent: float | None = None
+    prepared_sequence_progress_percent: float | None = None
+    final_partial_accumulation_flushed: bool = False
+    final_partial_microbatches: int = 0
+    dataloader_passes_completed: int = 0
 
 
 @dataclass(slots=True)
@@ -54,8 +65,22 @@ class EvalControl:
     overfit_worsening_patience: int | None = None
     train_dataset_size: int | None = None
     validation_dataset_size: int | None = None
+    final_validation_max_batches: int | None = None
+    final_eval_full_validation: bool = False
     steps_per_epoch: int | None = None
     eval_history_path: str | None = None
+
+
+@dataclass(slots=True)
+class TrainingRunControl:
+    run_mode: str = "max_steps_limited"
+    progress_mode: str = "steps"
+    prepared_token_target: int | None = None
+    prepared_sequence_target: int | None = None
+    stop_after_one_pass: bool = False
+    flush_final_partial_accumulation: bool = False
+    scheduler_max_steps: int | None = None
+    effective_optimizer_steps: int | None = None
 
 
 def _to_device(batch: dict[str, Any], device):
@@ -145,20 +170,21 @@ def _summarize_nonfinite_batch(batch: dict[str, Any], *, step: int, loss_value: 
     }
 
 
-def build_dataloader(dataset, batch_size: int, shuffle: bool = True):
+def build_dataloader(dataset, batch_size: int, shuffle: bool = True, drop_last: bool | None = None):
     _, dist, DataLoader = _require_torch()
     sampler = None
+    actual_drop_last = shuffle if drop_last is None else bool(drop_last)
     if dist.is_initialized():
         from torch.utils.data.distributed import DistributedSampler
 
-        sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=shuffle)
+        sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=actual_drop_last)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle if sampler is None else False,
         sampler=sampler,
         pin_memory=True,
-        drop_last=shuffle,
+        drop_last=actual_drop_last,
     )
 
 
@@ -255,6 +281,7 @@ def run_training(
     train_event_printer: Callable[[dict[str, Any]], None] | None = None,
     eval_event_printer: Callable[[dict[str, Any]], None] | None = None,
     checkpoint_metadata: dict[str, Any] | None = None,
+    run_control: TrainingRunControl | None = None,
 ) -> TrainState:
     torch, _, _ = _require_torch()
     batch_config = validate_effective_batch_size(train_config)
@@ -265,6 +292,14 @@ def run_training(
         )
     stage_start_time = time.perf_counter()
     state = TrainState()
+    if run_control is None:
+        run_control = TrainingRunControl()
+    state.run_mode = run_control.run_mode
+    state.progress_mode = run_control.progress_mode
+    state.scheduler_max_steps = run_control.scheduler_max_steps
+    state.effective_optimizer_steps = run_control.effective_optimizer_steps
+    state.prepared_token_target = run_control.prepared_token_target
+    state.prepared_sequence_target = run_control.prepared_sequence_target
     last_saved_step = -1
     last_eval_step = -1
     last_eval_value = math.nan
@@ -306,11 +341,20 @@ def run_training(
         if state.nonfinite_loss_steps > 0 and "nonfinite_loss_seen" not in blockers:
             blockers.append("nonfinite_loss_seen")
         payload["promotion_blockers"] = blockers
-        payload["artifact_status"] = derive_artifact_status(
-            blockers,
-            base_status=str(payload.get("artifact_status", "promotable")),
-        )
+        base_artifact_status = str(payload.get("artifact_status", "promotable"))
+        if base_artifact_status in {"archiveable", "incomplete", "corrupted"}:
+            payload["artifact_status"] = "incomplete" if blockers else base_artifact_status
+            if blockers:
+                payload["run_health_status"] = "unstable"
+        else:
+            payload["artifact_status"] = derive_artifact_status(
+                blockers,
+                base_status=base_artifact_status,
+            )
         payload["promotion_eligible"] = payload["artifact_status"] == "promotable"
+        payload["promotion_eligible_for_sft"] = bool(
+            payload.get("promotion_eligible_for_sft", payload["promotion_eligible"])
+        ) and not blockers
         payload["nonfinite_loss_steps"] = state.nonfinite_loss_steps
         payload["nonfinite_event_samples"] = list(state.nonfinite_event_samples)
         return payload
@@ -324,6 +368,17 @@ def run_training(
                 "best_eval_step": state.best_eval_step,
                 "nonfinite_loss_steps": state.nonfinite_loss_steps,
                 "nonfinite_event_samples": list(state.nonfinite_event_samples),
+                "run_mode": state.run_mode,
+                "progress_mode": state.progress_mode,
+                "scheduler_max_steps": state.scheduler_max_steps,
+                "effective_optimizer_steps": state.effective_optimizer_steps,
+                "prepared_token_target": state.prepared_token_target,
+                "prepared_sequence_target": state.prepared_sequence_target,
+                "prepared_token_progress_percent": state.prepared_token_progress_percent,
+                "prepared_sequence_progress_percent": state.prepared_sequence_progress_percent,
+                "final_partial_accumulation_flushed": state.final_partial_accumulation_flushed,
+                "final_partial_microbatches": state.final_partial_microbatches,
+                "dataloader_passes_completed": state.dataloader_passes_completed,
             }
         }
         current_metadata = _current_checkpoint_metadata()
@@ -369,14 +424,52 @@ def run_training(
         selection_path = best_path / "selection.json"
         selection_path.write_text(json.dumps(payload, indent=2))
 
+    def _percent(completed: int | float | None, total: int | float | None) -> float | None:
+        if completed is None or total is None:
+            return None
+        total_value = float(total)
+        if total_value <= 0 or not math.isfinite(total_value):
+            return None
+        completed_value = float(completed)
+        if not math.isfinite(completed_value):
+            return None
+        return round(max(0.0, min(completed_value / total_value, 1.0)) * 100.0, 2)
+
+    def _refresh_prepared_progress() -> None:
+        state.prepared_token_progress_percent = _percent(
+            state.tokens_seen,
+            run_control.prepared_token_target,
+        )
+        state.prepared_sequence_progress_percent = _percent(
+            state.examples_seen,
+            run_control.prepared_sequence_target,
+        )
+
+    def _progress_counts(completed_steps: int | None = None) -> list[tuple[int | float | None, int | float | None]]:
+        if run_control.progress_mode == "prepared_tokens":
+            return [(state.tokens_seen, run_control.prepared_token_target)]
+        if run_control.progress_mode == "token_budget":
+            return [(state.tokens_seen, train_config.token_budget)]
+        step_total = run_control.scheduler_max_steps or train_config.max_steps
+        return [(state.step if completed_steps is None else completed_steps, step_total)]
+
+    def _progress_metadata() -> dict[str, Any]:
+        _refresh_prepared_progress()
+        return {
+            "run_mode": run_control.run_mode,
+            "progress_mode": run_control.progress_mode,
+            "prepared_token_target": run_control.prepared_token_target,
+            "prepared_sequence_target": run_control.prepared_sequence_target,
+            "prepared_token_progress_percent": state.prepared_token_progress_percent,
+            "prepared_sequence_progress_percent": state.prepared_sequence_progress_percent,
+            "scheduler_max_steps": run_control.scheduler_max_steps,
+            "effective_optimizer_steps": run_control.effective_optimizer_steps,
+        }
+
     def _stage_progress(completed_steps: int | None = None):
         return build_progress_snapshot(
             time.perf_counter() - stage_start_time,
-            (
-                state.step if completed_steps is None else completed_steps,
-                train_config.max_steps,
-            ),
-            (state.tokens_seen, train_config.token_budget),
+            *_progress_counts(completed_steps),
         )
 
     def _run_eval(step: int, *, final_eval: bool, initial_eval: bool = False) -> None:
@@ -384,11 +477,17 @@ def run_training(
         evaluator = eval_fn or evaluate_language_model
         max_eval_batches = train_config.num_eval_batches
         if eval_control is not None:
-            max_eval_batches = eval_control.validation_max_batches
+            max_eval_batches = (
+                eval_control.final_validation_max_batches
+                if final_eval
+                else eval_control.validation_max_batches
+            )
         metrics = evaluator(model, val_loader, max_eval_batches)
         payload: dict[str, Any] = {"step": step, "eval": metrics}
         if initial_eval:
             payload["initial_eval"] = True
+        if final_eval:
+            payload["final_eval"] = True
         if eval_control is not None:
             approx_epoch = _approx_epoch(step, initial_eval=initial_eval, final_eval=final_eval)
             if approx_epoch is not None:
@@ -398,13 +497,36 @@ def run_training(
             payload["train_examples_seen"] = state.examples_seen
             payload["validation_batches_evaluated"] = metrics.get("batches_evaluated")
             payload["validation_examples_evaluated"] = metrics.get("examples_evaluated")
-        progress = _stage_progress(completed_steps=min(max(step, 0), train_config.max_steps))
+            eval_batches_used = metrics.get("batches_evaluated")
+            eval_sequences_estimated = metrics.get("examples_evaluated")
+            validation_sequences_total = eval_control.validation_dataset_size
+            coverage_percent = _percent(eval_sequences_estimated, validation_sequences_total)
+            eval_mode = "interim_subset"
+            if final_eval:
+                eval_mode = "full_validation" if max_eval_batches is None else "final_subset"
+            payload.update(
+                {
+                    "eval_batches_used": eval_batches_used,
+                    "eval_sequences_estimated": eval_sequences_estimated,
+                    "validation_sequences_total": validation_sequences_total,
+                    "eval_coverage_percent": coverage_percent,
+                    "eval_mode": eval_mode,
+                    "final_eval_full_validation": bool(eval_control.final_eval_full_validation)
+                    if final_eval
+                    else False,
+                    "final_num_eval_batches": eval_control.final_validation_max_batches
+                    if final_eval
+                    else None,
+                }
+            )
+        progress = _stage_progress(completed_steps=max(step, 0))
         payload["progress_percent"] = (
             None if progress.fraction_complete is None else round(progress.fraction_complete * 100.0, 2)
         )
         payload["stage_elapsed_sec"] = round(progress.elapsed_seconds, 2)
         payload["stage_eta_sec"] = None if progress.remaining_seconds is None else round(progress.remaining_seconds, 2)
         payload["progress_summary"] = progress.summary
+        payload.update(_progress_metadata())
         improved = (
             not math.isnan(float(metrics.get((eval_control.eval_metric_key if eval_control else "loss"), math.nan)))
             and float(metrics.get((eval_control.eval_metric_key if eval_control else "loss"), math.nan))
@@ -462,6 +584,20 @@ def run_training(
                     "train_examples_seen": state.examples_seen,
                     "validation_batches_evaluated": metrics.get("batches_evaluated"),
                     "validation_examples_evaluated": metrics.get("examples_evaluated"),
+                    "eval_batches_used": payload.get("eval_batches_used"),
+                    "eval_sequences_estimated": payload.get("eval_sequences_estimated"),
+                    "validation_sequences_total": payload.get("validation_sequences_total"),
+                    "eval_coverage_percent": payload.get("eval_coverage_percent"),
+                    "eval_mode": payload.get("eval_mode"),
+                    "final_eval_full_validation": payload.get("final_eval_full_validation"),
+                    "final_num_eval_batches": payload.get("final_num_eval_batches"),
+                    "run_mode": run_control.run_mode,
+                    "progress_mode": run_control.progress_mode,
+                    "prepared_token_target": run_control.prepared_token_target,
+                    "prepared_sequence_target": run_control.prepared_sequence_target,
+                    "prepared_token_progress_percent": state.prepared_token_progress_percent,
+                    "prepared_sequence_progress_percent": state.prepared_sequence_progress_percent,
+                    "scheduler_max_steps": run_control.scheduler_max_steps,
                     "metrics": metrics,
                     "selection_metric": metric_key,
                     "selection_value": selection_value,
@@ -483,6 +619,17 @@ def run_training(
                     selection_payload["samples"] = payload.get("samples")
                 elif payload.get("qualitative_samples") is not None:
                     selection_payload["qualitative_samples"] = payload.get("qualitative_samples")
+                for key in (
+                    "short_stable_samples",
+                    "long_stress_samples",
+                    "short_stable_quality",
+                    "long_stress_quality",
+                    "raw_lm_quality_gate_passed",
+                    "raw_lm_quality_gate_reasons",
+                    "model_quality_status",
+                ):
+                    if key in payload:
+                        selection_payload[key] = payload[key]
                 _write_selection_metadata(best_path, selection_payload)
                 candidate_name = f"candidate-step-{step:08d}"
                 candidate_path = checkpoint_manager.save_named(
@@ -551,13 +698,110 @@ def run_training(
         )
         return early_eval_due or interval_due
 
+    def _step_limit_reached() -> bool:
+        if run_control.stop_after_one_pass:
+            return False
+        return state.step >= train_config.max_steps
+
+    def _token_budget_reached() -> bool:
+        return (
+            not run_control.stop_after_one_pass
+            and train_config.token_budget is not None
+            and state.tokens_seen >= train_config.token_budget
+        )
+
+    def _scale_partial_gradients(partial_microbatches: int) -> None:
+        if partial_microbatches <= 0 or partial_microbatches >= train_config.gradient_accumulation_steps:
+            return
+        scale = train_config.gradient_accumulation_steps / float(partial_microbatches)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                gradient = getattr(parameter, "grad", None)
+                if gradient is not None:
+                    gradient.mul_(scale)
+
+    def _complete_optimizer_step(
+        *,
+        train_loss_value: float,
+        start_time: float,
+        final_partial_microbatches: int = 0,
+    ) -> None:
+        nonlocal last_saved_step, last_train_loss, token_budget_reached
+        if final_partial_microbatches:
+            _scale_partial_gradients(final_partial_microbatches)
+            state.final_partial_accumulation_flushed = True
+            state.final_partial_microbatches = final_partial_microbatches
+        torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        last_train_loss = train_loss_value
+
+        if state.step % train_config.log_every_steps == 0 and is_main_process():
+            elapsed = time.perf_counter() - start_time
+            progress = _stage_progress(completed_steps=state.step + 1)
+            payload = {
+                "step": state.step,
+                "loss": last_train_loss,
+                "lr": float(scheduler.get_last_lr()[0]),
+                "tokens_seen": state.tokens_seen,
+                "examples_seen": state.examples_seen,
+                "step_time_sec": round(elapsed, 2),
+                "progress_percent": (
+                    None
+                    if progress.fraction_complete is None
+                    else round(progress.fraction_complete * 100.0, 2)
+                ),
+                "stage_elapsed_sec": round(progress.elapsed_seconds, 2),
+                "stage_eta_sec": (
+                    None if progress.remaining_seconds is None else round(progress.remaining_seconds, 2)
+                ),
+                "progress_summary": progress.summary,
+            }
+            if final_partial_microbatches:
+                payload["final_partial_accumulation_flushed"] = True
+                payload["final_partial_microbatches"] = final_partial_microbatches
+            payload.update(_progress_metadata())
+            if train_event_printer is not None:
+                train_event_printer(payload)
+            else:
+                print(dump_rounded_json(payload))
+
+        if _should_run_scheduled_eval(state.step):
+            _run_eval(state.step, final_eval=False)
+
+        if (
+            train_config.checkpoint.save_every_steps > 0
+            and state.step > 0
+            and state.step % train_config.checkpoint.save_every_steps == 0
+        ):
+            barrier()
+            if is_main_process():
+                checkpoint_manager.save(
+                    step=state.step,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    extra_state=_checkpoint_extra_state(),
+                )
+                last_saved_step = state.step
+            barrier()
+
+        state.step += 1
+        if _token_budget_reached():
+            token_budget_reached = True
+
     if val_loader is not None and eval_control is not None and eval_control.evaluate_at_start:
         _run_eval(0, final_eval=False, initial_eval=True)
 
-    while state.step < train_config.max_steps and not token_budget_reached and not should_stop_training:
+    partial_loss_value = math.nan
+    partial_start_time = stage_start_time
+    while not _step_limit_reached() and not token_budget_reached and not should_stop_training:
+        consumed_any_batch = False
         for batch in train_loader:
-            if state.step >= train_config.max_steps or token_budget_reached or should_stop_training:
+            if _step_limit_reached() or token_budget_reached or should_stop_training:
                 break
+            consumed_any_batch = True
             start_time = time.perf_counter()
             batch = _to_device(batch, device)
             with scaler_context:
@@ -585,66 +829,32 @@ def run_training(
             state.tokens_seen += tokens_this_batch
             state.examples_seen += _infer_batch_size(batch)
             micro_step += 1
+            partial_loss_value = raw_loss_value
+            partial_start_time = start_time
 
             if micro_step % train_config.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                last_train_loss = float(loss.item() * train_config.gradient_accumulation_steps)
-
-                if state.step % train_config.log_every_steps == 0 and is_main_process():
-                    elapsed = time.perf_counter() - start_time
-                    progress = _stage_progress(completed_steps=min(state.step + 1, train_config.max_steps))
-                    payload = {
-                        "step": state.step,
-                        "loss": last_train_loss,
-                        "lr": float(scheduler.get_last_lr()[0]),
-                        "tokens_seen": state.tokens_seen,
-                        "step_time_sec": round(elapsed, 2),
-                        "progress_percent": (
-                            None
-                            if progress.fraction_complete is None
-                            else round(progress.fraction_complete * 100.0, 2)
-                        ),
-                        "stage_elapsed_sec": round(progress.elapsed_seconds, 2),
-                        "stage_eta_sec": (
-                            None if progress.remaining_seconds is None else round(progress.remaining_seconds, 2)
-                        ),
-                        "progress_summary": progress.summary,
-                    }
-                    if train_event_printer is not None:
-                        train_event_printer(payload)
-                    else:
-                        print(dump_rounded_json(payload))
-
-                if _should_run_scheduled_eval(state.step):
-                    _run_eval(state.step, final_eval=False)
-
-                if (
-                    train_config.checkpoint.save_every_steps > 0
-                    and state.step > 0
-                    and state.step % train_config.checkpoint.save_every_steps == 0
-                ):
-                    barrier()
-                    if is_main_process():
-                        checkpoint_manager.save(
-                            step=state.step,
-                            model=model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            extra_state=_checkpoint_extra_state(),
-                        )
-                        last_saved_step = state.step
-                    barrier()
-
-                state.step += 1
-                if (
-                    train_config.token_budget is not None
-                    and state.tokens_seen >= train_config.token_budget
-                ):
-                    token_budget_reached = True
+                _complete_optimizer_step(
+                    train_loss_value=float(loss.item() * train_config.gradient_accumulation_steps),
+                    start_time=start_time,
+                )
+                if token_budget_reached:
                     break
+        state.dataloader_passes_completed += 1 if consumed_any_batch else 0
+        if run_control.stop_after_one_pass or not consumed_any_batch:
+            break
+
+    remaining_microbatches = micro_step % train_config.gradient_accumulation_steps
+    if (
+        run_control.stop_after_one_pass
+        and run_control.flush_final_partial_accumulation
+        and remaining_microbatches
+        and not should_stop_training
+    ):
+        _complete_optimizer_step(
+            train_loss_value=partial_loss_value,
+            start_time=partial_start_time,
+            final_partial_microbatches=remaining_microbatches,
+        )
 
     if eval_control is not None:
         should_run_final_eval = (
@@ -672,4 +882,5 @@ def run_training(
                 extra_state=_checkpoint_extra_state(),
             )
         barrier()
+    _refresh_prepared_progress()
     return state

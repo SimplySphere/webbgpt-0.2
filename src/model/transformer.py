@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from config import ModelConfig
@@ -15,6 +16,9 @@ def _require_torch():
     import torch.nn.functional as F
 
     return torch, nn, F
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -198,6 +202,50 @@ class CausalTransformer(_require_torch()[1].Module):
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1)
 
+    def _generation_context_window(self) -> int:
+        context_window = int(getattr(self.config, "max_position_embeddings", 0) or 0)
+        if context_window <= 0:
+            raise ValueError("model.config.max_position_embeddings must be a positive integer for generation")
+        return context_window
+
+    @staticmethod
+    def _cache_length(cache: KVCache | None) -> int:
+        if not cache:
+            return 0
+        first_layer = cache[0]
+        key = getattr(first_layer, "key", None)
+        if key is None:
+            return 0
+        return int(key.size(-2))
+
+    @staticmethod
+    def _crop_cache(cache: KVCache | None, max_tokens: int) -> KVCache | None:
+        if cache is None:
+            return None
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative when cropping KV cache")
+        cropped: KVCache = []
+        changed = False
+        for layer_cache in cache:
+            key = getattr(layer_cache, "key", None)
+            value = getattr(layer_cache, "value", None)
+            if key is None or value is None:
+                cropped.append(layer_cache)
+                continue
+            current_tokens = int(key.size(-2))
+            if current_tokens <= max_tokens:
+                cropped.append(layer_cache)
+                continue
+            if max_tokens == 0:
+                key = key[:, :, :0, :]
+                value = value[:, :, :0, :]
+            else:
+                key = key[:, :, -max_tokens:, :]
+                value = value[:, :, -max_tokens:, :]
+            cropped.append(LayerKVCache(key=key, value=value))
+            changed = True
+        return cropped if changed else cache
+
     def generate(
         self,
         input_ids,
@@ -212,33 +260,86 @@ class CausalTransformer(_require_torch()[1].Module):
         use_cache: bool = True,
     ):
         torch, _, _ = _require_torch()
-        generated = input_ids
+        context_window = self._generation_context_window()
+        prompt_tokens = int(input_ids.size(-1))
+        if prompt_tokens <= 0:
+            raise ValueError("input_ids must contain at least one prompt token for generation")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+        prompt_truncated = prompt_tokens > context_window
+        if prompt_truncated:
+            logger.warning(
+                "generation prompt exceeds context window; left-truncating prompt_tokens=%s "
+                "effective_context_window=%s max_new_tokens=%s",
+                prompt_tokens,
+                context_window,
+                max_new_tokens,
+            )
+            active_generated = input_ids[:, -context_window:]
+            active_attention_mask = attention_mask[:, -context_window:]
+        else:
+            active_generated = input_ids
+            active_attention_mask = attention_mask
+        active_position_ids = (
+            torch.arange(active_generated.size(-1), device=input_ids.device)
+            .unsqueeze(0)
+            .expand(input_ids.size(0), -1)
+        )
+
+        logger.info(
+            "generation_context prompt_tokens=%s max_new_tokens=%s effective_context_window=%s "
+            "prompt_truncated=%s",
+            prompt_tokens,
+            max_new_tokens,
+            context_window,
+            prompt_truncated,
+        )
+
+        returned_generated = input_ids
         cache: KVCache | None = None
         effective_stop_ids = set(stop_token_ids or [self.config.eos_token_id])
+        history_truncated = prompt_truncated
+        generated_tokens = 0
         for _ in range(max_new_tokens):
             if cache is None:
-                model_input = generated
+                model_input = active_generated
+                model_position_ids = active_position_ids
             else:
-                model_input = generated[:, -1:]
+                model_input = active_generated[:, -1:]
+                model_position_ids = active_position_ids[:, -1:]
+                cache = self._crop_cache(cache, max(context_window - int(model_input.size(-1)), 0))
+            cache_length = self._cache_length(cache)
+            attention_tokens = cache_length + int(model_input.size(-1))
+            effective_attention_mask = active_attention_mask[:, -attention_tokens:]
             output = self.forward(
                 model_input,
-                attention_mask=attention_mask,
+                attention_mask=effective_attention_mask,
+                position_ids=model_position_ids,
                 past_key_values=cache,
                 use_cache=use_cache,
             )
-            cache = output.past_key_values
+            cache = self._crop_cache(output.past_key_values, context_window)
             next_logits = output.logits[:, -1, :]
-            next_logits = apply_repetition_penalty(next_logits, generated, repetition_penalty)
-            next_logits = apply_no_repeat_ngram(next_logits, generated, no_repeat_ngram_size)
+            penalty_context = active_generated[:, -context_window:]
+            next_logits = apply_repetition_penalty(next_logits, penalty_context, repetition_penalty)
+            next_logits = apply_no_repeat_ngram(next_logits, penalty_context, no_repeat_ngram_size)
             next_token = self._sample_next_token(
                 next_logits, temperature=temperature, top_k=top_k, top_p=top_p
             )
-            generated = torch.cat([generated, next_token], dim=-1)
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones_like(next_token, dtype=attention_mask.dtype)], dim=-1
+            returned_generated = torch.cat([returned_generated, next_token], dim=-1)
+            next_position_id = active_position_ids[:, [-1]] + 1
+            active_generated = torch.cat([active_generated, next_token], dim=-1)
+            active_attention_mask = torch.cat(
+                [active_attention_mask, torch.ones_like(next_token, dtype=active_attention_mask.dtype)], dim=-1
             )
+            active_position_ids = torch.cat([active_position_ids, next_position_id], dim=-1)
+            if active_generated.size(-1) > context_window:
+                history_truncated = True
+                active_generated = active_generated[:, -context_window:]
+                active_attention_mask = active_attention_mask[:, -context_window:]
+                active_position_ids = active_position_ids[:, -context_window:]
+            generated_tokens += 1
             if torch.all(
                 torch.tensor(
                     [int(token_id) in effective_stop_ids for token_id in next_token.view(-1).tolist()],
@@ -247,4 +348,13 @@ class CausalTransformer(_require_torch()[1].Module):
                 )
             ):
                 break
-        return generated
+        logger.info(
+            "generation_context_complete prompt_tokens=%s max_new_tokens=%s generated_tokens=%s "
+            "effective_context_window=%s truncation_occurred=%s",
+            prompt_tokens,
+            max_new_tokens,
+            generated_tokens,
+            context_window,
+            history_truncated,
+        )
+        return returned_generated

@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import sys
 import time
 from collections import Counter
@@ -62,8 +63,10 @@ LOCAL_MVP_PRETRAIN_DOMAIN_SOURCE_NAMES = {
     "webb_domain_seed_mix",
     "webb_public_seed",
 }
-LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE = 0.01
-LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS = 500_000
+LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE = 0.05
+LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS = 5_000_000
+LOCAL_MVP_PRETRAIN_MAX_GENERIC_SOURCE_SHARE = 0.50
+LOCAL_MVP_PRETRAIN_REPEATED_PHRASE_WARN_COUNT = 100
 # The SFT planner trims overrepresented buckets globally after candidate collection.
 # Targets are row-share goals first; label-token shares are diagnostics unless a bucket's
 # token share drifts badly enough to surface in review.
@@ -104,6 +107,22 @@ PROMOTABLE_DPO_NEGATIVE_TYPES = {
     "overconfident_ungrounded",
     "generic_greeting",
     "missing_verification",
+}
+LM_JUNK_PATTERNS: dict[str, re.Pattern[str]] = {
+    "excessive_hyphen_fragments": re.compile(
+        r"(?:\b[A-Za-z]{1,6}-){2,}[A-Za-z]{1,10}\b|-[A-Za-z]{1,4}-|"
+        r"\b(?:Newth|F-the-s|based-in|in-in|to-in)\b"
+    ),
+    "broken_quote_fragments": re.compile(r"(?:[\"'“”‘’]\s*){3,}|(?:\b[a-zA-Z]\s+[\"'“”‘’]\s*){2,}"),
+    "navigation_like_text": re.compile(r"\b(?:home|menu|search|subscribe|cookie|privacy policy)\b", re.IGNORECASE),
+    "generic_article_formula": re.compile(
+        r"\b(?:the most important|in the same time|the first step|the process)\b",
+        re.IGNORECASE,
+    ),
+    "medical_body_health": re.compile(
+        r"\b(?:blood|body|child|children|diabetes|diet|doctor|food|health|medical|pain|symptoms)\b",
+        re.IGNORECASE,
+    ),
 }
 
 
@@ -1065,6 +1084,12 @@ class DatasetBuilder:
             stage=stage,
         )
         diagnostics["too_short_packed_sequences"] = int(packer.dropped_short_windows)
+        prepare_warnings: list[str] = []
+        domain_realization_gate = diagnostics.get("domain_realization_gate") if stage == "pretrain" else None
+        if isinstance(domain_realization_gate, dict) and not bool(domain_realization_gate.get("passed", True)):
+            message = str(domain_realization_gate.get("message", "pretrain domain realization failed"))
+            prepare_warnings.append(message)
+            _stage_progress(f"WebbGPT: {message}")
         manifest = {
             "version": "2.0",
             "stage": stage,
@@ -1078,14 +1103,23 @@ class DatasetBuilder:
             "num_tokens": num_tokens,
             "source_snapshots": source_snapshots,
             "diagnostics": diagnostics,
+            "prepare_warnings": prepare_warnings,
             "shards": shards,
         }
+        if isinstance(domain_realization_gate, dict):
+            manifest["domain_realization_gate"] = domain_realization_gate
         save_prepared_manifest(manifest_path, manifest)
         remove_resume_artifacts(manifest_path)
         _stage_progress(
             f"WebbGPT: finished preparing {stage} "
             f"({num_sequences:,} sequences across {len(shards):,} shards, {num_tokens:,} packed tokens)."
         )
+        if (
+            isinstance(domain_realization_gate, dict)
+            and not bool(domain_realization_gate.get("passed", True))
+            and domain_realization_gate.get("mode") == "fail"
+        ):
+            raise RuntimeError(str(domain_realization_gate.get("message")))
         return manifest
 
     def _should_keep_sft_example(
@@ -2025,6 +2059,9 @@ class DatasetBuilder:
             "restart_count": 0,
             "unique_document_ids": set(),
             "phrase_counter": Counter(),
+            "phrase_counter_8": Counter(),
+            "phrase_counter_12": Counter(),
+            "quality_artifact_counter": Counter(),
         }
 
     def _serialize_lm_audit_state(self, audit_state: dict[str, Any]) -> dict[str, Any]:
@@ -2040,6 +2077,9 @@ class DatasetBuilder:
             "repeated_documents": int(audit_state["repeated_documents"]),
             "restart_count": int(audit_state.get("restart_count", 0)),
             "phrase_counter": dict(audit_state["phrase_counter"]),
+            "phrase_counter_8": dict(audit_state.get("phrase_counter_8", {})),
+            "phrase_counter_12": dict(audit_state.get("phrase_counter_12", {})),
+            "quality_artifact_counter": dict(audit_state.get("quality_artifact_counter", {})),
         }
 
     def _restore_lm_audit_state(
@@ -2058,6 +2098,9 @@ class DatasetBuilder:
         audit_state["repeated_documents"] = int(snapshot.get("repeated_documents", 0))
         audit_state["restart_count"] = int(snapshot.get("restart_count", 0))
         audit_state["phrase_counter"] = Counter(snapshot.get("phrase_counter", {}))
+        audit_state["phrase_counter_8"] = Counter(snapshot.get("phrase_counter_8", {}))
+        audit_state["phrase_counter_12"] = Counter(snapshot.get("phrase_counter_12", {}))
+        audit_state["quality_artifact_counter"] = Counter(snapshot.get("quality_artifact_counter", {}))
         return audit_state
 
     def _realizable_lm_token_capacity(
@@ -2188,16 +2231,21 @@ class DatasetBuilder:
             failures.append("domain_tokens_too_low")
         if token_share < LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE:
             failures.append("domain_share_too_low")
+        realization_ratio = token_share / max(configured_target_share, 1e-8)
         return {
             "passed": not failures,
             "severity": "pass" if not failures else "warning",
             "failures": failures,
             "minimum_token_share": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE,
             "minimum_tokens": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS,
+            "minimum_recommended_domain_tokens_for_profile": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS,
             "domain_tokens": domain_tokens,
             "domain_documents": domain_documents,
             "token_share": round(token_share, 6),
             "document_share": round(document_share, 6),
+            "configured_domain_share": round(configured_target_share, 6),
+            "realized_domain_share": round(token_share, 6),
+            "domain_realization_ratio": round(realization_ratio, 6),
             "configured_target_share": round(configured_target_share, 6),
             "configured_share_gap": round(configured_target_share - token_share, 6),
             "effective_target_share": round(effective_target_share, 6),
@@ -2215,6 +2263,37 @@ class DatasetBuilder:
             ],
             "all_domain_sources_realizability_limited": bool(domain_reports)
             and all(bool(report.get("realizability_limited", False)) for report in domain_reports),
+            "domain_sources_realizability_limited": [
+                str(report.get("source", ""))
+                for report in domain_reports
+                if bool(report.get("realizability_limited", False))
+            ],
+        }
+
+    def _pretrain_domain_realization_gate(self, contribution: dict[str, Any]) -> dict[str, Any]:
+        failures = list(contribution.get("failures", []))
+        passed = not failures
+        mode = str(self.config.pretrain_domain_realization_gate_mode)
+        message = "pretrain domain realization passed"
+        if not passed:
+            message = (
+                "pretrain domain realization failed: "
+                f"{', '.join(failures)} "
+                f"(domain_tokens={contribution.get('domain_tokens')}, "
+                f"token_share={contribution.get('token_share')}, "
+                f"minimum_tokens={contribution.get('minimum_tokens')}, "
+                f"minimum_token_share={contribution.get('minimum_token_share')})"
+            )
+        return {
+            "passed": passed,
+            "mode": mode,
+            "severity": "pass" if passed else ("error" if mode == "fail" else "warning"),
+            "failures": failures,
+            "message": message,
+            "domain_tokens": contribution.get("domain_tokens"),
+            "token_share": contribution.get("token_share"),
+            "minimum_tokens": contribution.get("minimum_tokens"),
+            "minimum_token_share": contribution.get("minimum_token_share"),
         }
 
     def _lm_source_diagnostics(
@@ -2228,12 +2307,18 @@ class DatasetBuilder:
         source_reports: list[dict[str, Any]] = []
         family_counts: Counter[str] = Counter()
         phrase_counter: Counter[str] = Counter()
+        phrase_counter_8: Counter[str] = Counter()
+        phrase_counter_12: Counter[str] = Counter()
+        quality_artifact_counter: Counter[str] = Counter()
         for audit_state in source_audit_states:
             kept_documents = int(audit_state["kept_documents"])
             kept_tokens = int(audit_state["kept_tokens"])
             if kept_documents > 0:
                 family_counts[str(audit_state["family"])] += 1
             phrase_counter.update(audit_state["phrase_counter"])
+            phrase_counter_8.update(audit_state.get("phrase_counter_8", Counter()))
+            phrase_counter_12.update(audit_state.get("phrase_counter_12", Counter()))
+            quality_artifact_counter.update(audit_state.get("quality_artifact_counter", Counter()))
             source_reports.append(
                 {
                     "source": str(audit_state["source"]),
@@ -2250,6 +2335,13 @@ class DatasetBuilder:
                         6,
                     ),
                     "dropped_reasons": _counter_to_sorted_dict(audit_state["dropped_reasons"]),
+                    "quality_artifact_counts": _counter_to_sorted_dict(
+                        Counter(audit_state.get("quality_artifact_counter", {}))
+                    ),
+                    "top_repeated_phrases": [
+                        {"phrase": phrase, "count": count}
+                        for phrase, count in Counter(audit_state["phrase_counter"]).most_common(5)
+                    ],
                 }
             )
         self._finalize_lm_source_reports(
@@ -2272,13 +2364,43 @@ class DatasetBuilder:
                 {"phrase": phrase, "count": count}
                 for phrase, count in phrase_counter.most_common(10)
             ],
+            "top_repeated_8grams": [
+                {"phrase": phrase, "count": count}
+                for phrase, count in phrase_counter_8.most_common(10)
+            ],
+            "top_repeated_12grams": [
+                {"phrase": phrase, "count": count}
+                for phrase, count in phrase_counter_12.most_common(10)
+            ],
+            "quality_artifact_counts": _counter_to_sorted_dict(quality_artifact_counter),
+            "repeated_paragraph_hash_count": int(
+                sum(int(report["repeated_documents"]) for report in source_reports)
+            ),
         }
+        warnings: list[str] = []
+        if diagnostics["max_single_source_token_share"] > LOCAL_MVP_PRETRAIN_MAX_GENERIC_SOURCE_SHARE:
+            warnings.append("single_source_token_share_above_local_mvp_limit")
+        if any(
+            int(row["count"]) > LOCAL_MVP_PRETRAIN_REPEATED_PHRASE_WARN_COUNT
+            for row in diagnostics["top_repeated_phrases"]
+        ):
+            warnings.append("repeated_phrase_count_above_local_mvp_limit")
+        if any(int(count) > 0 for count in quality_artifact_counter.values()):
+            warnings.append("quality_artifacts_detected")
+        diagnostics["quality_warnings"] = warnings
         if stage == "pretrain":
-            diagnostics["domain_contribution"] = self._pretrain_domain_contribution_summary(
+            domain_contribution = self._pretrain_domain_contribution_summary(
                 source_reports,
                 total_tokens=total_tokens,
                 total_documents=total_documents,
             )
+            diagnostics["domain_contribution"] = domain_contribution
+            diagnostics["domain_realization_gate"] = self._pretrain_domain_realization_gate(domain_contribution)
+            if not domain_contribution.get("passed", True):
+                diagnostics["quality_warnings"] = [
+                    *diagnostics["quality_warnings"],
+                    "domain_readiness_not_expected",
+                ]
         return diagnostics
 
     def _audit_prepared_lm_stage(
@@ -2357,13 +2479,26 @@ class DatasetBuilder:
                 {"phrase": phrase, "count": count}
                 for phrase, count in phrase_counter.most_common(10)
             ],
+            "repeated_paragraph_hash_count": int(
+                sum(int(report["repeated_documents"]) for report in source_reports)
+            ),
         }
+        warnings: list[str] = []
+        if max_source_share > LOCAL_MVP_PRETRAIN_MAX_GENERIC_SOURCE_SHARE:
+            warnings.append("single_source_token_share_above_local_mvp_limit")
+        if any(count > LOCAL_MVP_PRETRAIN_REPEATED_PHRASE_WARN_COUNT for _phrase, count in phrase_counter.items()):
+            warnings.append("repeated_phrase_count_above_local_mvp_limit")
+        audit["quality_warnings"] = warnings
         if stage == "pretrain":
-            audit["domain_contribution"] = self._pretrain_domain_contribution_summary(
+            domain_contribution = self._pretrain_domain_contribution_summary(
                 source_reports,
                 total_tokens=total_tokens,
                 total_documents=total_documents,
             )
+            audit["domain_contribution"] = domain_contribution
+            audit["domain_realization_gate"] = self._pretrain_domain_realization_gate(domain_contribution)
+            if not domain_contribution.get("passed", True):
+                audit["quality_warnings"] = [*audit["quality_warnings"], "domain_readiness_not_expected"]
         return audit
 
     def _iter_tokenized_documents_for_source(
@@ -2430,6 +2565,13 @@ class DatasetBuilder:
                 audit_state["kept_tokens"] += len(token_ids)
                 for phrase in _top_ngram_families(cleaned.record.text):
                     audit_state["phrase_counter"][phrase] += 1
+                for phrase in _top_ngram_families(cleaned.record.text, n=8, limit=4):
+                    audit_state["phrase_counter_8"][phrase] += 1
+                for phrase in _top_ngram_families(cleaned.record.text, n=12, limit=3):
+                    audit_state["phrase_counter_12"][phrase] += 1
+                for artifact_name, pattern in LM_JUNK_PATTERNS.items():
+                    if pattern.search(cleaned.record.text):
+                        audit_state["quality_artifact_counter"][artifact_name] += 1
             if progress_state is not None:
                 progress_state["accepted_records"] = int(progress_state.get("accepted_records", 0)) + 1
             kept_in_iterator += 1
@@ -2743,11 +2885,13 @@ class DatasetBuilder:
             ],
         }
         if stage == "pretrain":
-            audit["domain_contribution"] = self._pretrain_domain_contribution_summary(
+            domain_contribution = self._pretrain_domain_contribution_summary(
                 source_reports,
                 total_tokens=total_tokens,
                 total_documents=total_documents,
             )
+            audit["domain_contribution"] = domain_contribution
+            audit["domain_realization_gate"] = self._pretrain_domain_realization_gate(domain_contribution)
         return audit
 
     def assess_continue_readiness(self) -> dict[str, Any]:

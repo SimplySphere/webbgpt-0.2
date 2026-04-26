@@ -202,15 +202,25 @@ def load_artifact_trust(path: str | Path) -> dict[str, Any]:
         if candidate.exists():
             payload = json.loads(candidate.read_text())
             return {
+                "run_health_status": payload.get("run_health_status", "valid"),
                 "artifact_status": payload.get("artifact_status", "promotable"),
+                "model_quality_status": payload.get("model_quality_status"),
                 "promotion_blockers": list(payload.get("promotion_blockers", [])),
                 "promotion_eligible": bool(payload.get("promotion_eligible", False)),
+                "promotion_eligible_for_sft": bool(
+                    payload.get("promotion_eligible_for_sft", payload.get("promotion_eligible", False))
+                ),
+                "sft_promotion_blockers": list(payload.get("sft_promotion_blockers", [])),
                 "source_path": str(candidate),
             }
     return {
+        "run_health_status": "valid",
         "artifact_status": "promotable",
+        "model_quality_status": None,
         "promotion_blockers": [],
         "promotion_eligible": True,
+        "promotion_eligible_for_sft": True,
+        "sft_promotion_blockers": [],
         "source_path": "",
     }
 

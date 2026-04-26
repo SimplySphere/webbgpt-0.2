@@ -196,7 +196,7 @@ class DataSourceConfig:
     metadata_fields: list[str] = field(default_factory=list)
     language: str | None = None
     quality_filter: bool = True
-    quality_filter_mode: Literal["basic", "broad_lm"] = "basic"
+    quality_filter_mode: Literal["basic", "broad_lm", "domain_lm"] = "basic"
     deduplicate: bool = True
     pii_scrub: bool = True
     max_records: int | None = None
@@ -231,6 +231,7 @@ class DataConfig:
     lm_weighted_source_token_budget: int = 32_768
     lm_max_source_token_share: float = 0.65
     lm_max_source_repeat_rate: float = 0.1
+    pretrain_domain_realization_gate_mode: Literal["warn", "fail"] = "warn"
     continue_readiness_min_clean_token_fraction: float = 0.8
     continue_readiness_min_documents: int = 1_500
     continue_readiness_min_source_families: int = 3
@@ -312,6 +313,21 @@ class TrainConfig:
     allow_weak_posttrain_validation: bool = False
     posttrain_top_k_checkpoints: int = 3
     token_budget: int | None = None
+    pretrain_progress_mode: Literal["prepared_tokens", "steps", "token_budget"] = "prepared_tokens"
+    pretrain_stop_mode: Literal[
+        "one_prepared_pass",
+        "token_budget_repeat_allowed",
+        "max_steps_limited",
+    ] = "one_prepared_pass"
+    pretrain_flush_final_partial_accumulation: bool = True
+    final_eval_full_validation: bool = False
+    final_num_eval_batches: int | None = None
+    raw_lm_short_probe_max_new_tokens: int = 48
+    raw_lm_long_probe_max_new_tokens: int = 128
+    raw_lm_stable_temperature: float = 0.4
+    raw_lm_stable_top_p: float = 0.9
+    raw_lm_stress_temperature: float = 0.7
+    raw_lm_stress_top_p: float = 0.95
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95

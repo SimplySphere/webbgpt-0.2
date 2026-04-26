@@ -109,6 +109,17 @@ def test_run_pretraining_wires_eval_history_control(monkeypatch, tmp_path: Path)
             best_eval_step=200,
             nonfinite_loss_steps=0,
             nonfinite_event_samples=[],
+            run_mode="max_steps_limited",
+            progress_mode="steps",
+            scheduler_max_steps=400_000,
+            effective_optimizer_steps=400_000,
+            prepared_token_target=None,
+            prepared_sequence_target=None,
+            prepared_token_progress_percent=None,
+            prepared_sequence_progress_percent=None,
+            final_partial_accumulation_flushed=False,
+            final_partial_microbatches=0,
+            dataloader_passes_completed=0,
         )
 
     monkeypatch.setattr(entrypoints, "DatasetBuilder", _FakeBuilder)
@@ -116,10 +127,10 @@ def test_run_pretraining_wires_eval_history_control(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(entrypoints, "maybe_wrap_fsdp", lambda model, _config: model)
     monkeypatch.setattr(entrypoints, "CheckpointManager", lambda **_kwargs: object())
     monkeypatch.setattr(entrypoints, "build_optimizer", lambda _model, _config: object())
-    monkeypatch.setattr(entrypoints, "build_scheduler", lambda _optimizer, _config: object())
+    monkeypatch.setattr(entrypoints, "build_scheduler", lambda _optimizer, _config, **_kwargs: object())
     monkeypatch.setattr(entrypoints, "build_dataloader", lambda dataset, **_kwargs: [dataset])
     monkeypatch.setattr(entrypoints, "run_training", fake_run_training)
-    monkeypatch.setattr(entrypoints, "init_distributed", lambda: None)
+    monkeypatch.setattr(entrypoints, "init_distributed", lambda: (0, 1, 0))
     monkeypatch.setattr(entrypoints, "cleanup_distributed", lambda: None)
     monkeypatch.setattr(entrypoints, "is_main_process", lambda: True)
     monkeypatch.setattr(entrypoints, "seed_everything", lambda _seed: {"seed": 52})
@@ -150,25 +161,36 @@ def test_run_pretraining_wires_eval_history_control(monkeypatch, tmp_path: Path)
     assert eval_control.evaluate_at_start is False
     assert eval_control.eval_interval_steps == 200
     assert eval_control.validation_max_batches == 8
+    assert eval_control.final_validation_max_batches == 8
+    assert eval_control.final_eval_full_validation is False
     assert eval_control.train_dataset_size == 7
     assert eval_control.validation_dataset_size == 3
     assert eval_control.eval_history_path == str(output_dir / "eval_history.jsonl")
     assert captured["best_checkpoint_name"] == "best-pretrain"
     assert captured["eval_event_printer"] == entrypoints.print_lm_eval_event
     assert captured["eval_payload_callback"] is not None
+    assert captured["run_control"].run_mode == "max_steps_limited"
     assert summary["validation_enabled"] is True
     assert summary["validation_dataset_size"] == 3
     assert summary["best_checkpoint_path"] == str(output_dir / "best-pretrain")
 
 
 def test_pretrain_eval_payload_uses_raw_lm_sampler(monkeypatch):
-    captured: dict[str, object] = {}
+    captured: dict[str, object] = {"raw_calls": []}
 
     def fake_raw_sampler(model, tokenizer_path, **kwargs):
         captured["raw_model"] = model
         captured["raw_tokenizer_path"] = tokenizer_path
-        captured["raw_kwargs"] = kwargs
-        return [{"prompt": "A raw prefix", "clean_response": "continued text"}]
+        captured["raw_calls"].append(kwargs)
+        return [
+            {
+                "id": "neutral_expository_01",
+                "bucket": "neutral_expository_prose",
+                "probe_type": "general_legibility",
+                "prompt": "A raw prefix",
+                "clean_response": "continued text",
+            }
+        ]
 
     def fake_chat_sampler(*_args, **_kwargs):
         raise AssertionError("pretrain eval must not use chat-formatted qualitative sampling")
@@ -203,12 +225,31 @@ def test_pretrain_eval_payload_uses_raw_lm_sampler(monkeypatch):
     )
 
     assert captured["raw_tokenizer_path"] == "tokenizer.model"
-    assert captured["raw_kwargs"]["regression_path"] == "data/eval/pretrain_regression.jsonl"
-    assert captured["raw_kwargs"]["temperature"] == 0.7
-    assert captured["raw_kwargs"]["top_p"] == 0.95
+    assert captured["raw_calls"][0]["regression_path"] == "data/eval/pretrain_regression.jsonl"
+    assert captured["raw_calls"][0]["limit"] is None
+    assert captured["raw_calls"][0]["temperature"] == 0.4
+    assert captured["raw_calls"][0]["top_p"] == 0.9
+    assert captured["raw_calls"][0]["max_new_tokens"] == 48
+    assert captured["raw_calls"][1]["temperature"] == 0.7
+    assert captured["raw_calls"][1]["top_p"] == 0.95
+    assert captured["raw_calls"][1]["max_new_tokens"] == 128
     assert payload["sample_mode"] == "raw_lm"
-    assert payload["sample_decode"] == {"temperature": 0.7, "top_p": 0.95, "max_new_tokens": 128}
-    assert payload["samples"] == [{"prompt": "A raw prefix", "response": "continued text"}]
+    assert payload["sample_decode"]["stable_profile"] == {"temperature": 0.4, "top_p": 0.9, "max_new_tokens": 48}
+    assert payload["sample_decode"]["stress_profile"] == {"temperature": 0.7, "top_p": 0.95, "max_new_tokens": 128}
+    assert payload["samples"] == [
+        {
+            "id": "neutral_expository_01",
+            "bucket": "neutral_expository_prose",
+            "probe_type": "general_legibility",
+            "prompt": "A raw prefix",
+            "response": "continued text",
+        }
+    ]
+    assert payload["short_stable_samples"] == payload["samples"]
+    assert payload["long_stress_samples"] == payload["samples"]
+    assert payload["raw_lm_quality_gate_passed"] is False
+    assert payload["model_quality_status"] == "weak_raw_lm"
+    assert payload["qualitative_rubric"] == entrypoints.PRETRAIN_QUALITATIVE_RUBRIC
     assert payload["best_family"] == "general_clean_prose"
     assert best_family_eval["best_family"] == "general_clean_prose"
 

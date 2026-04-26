@@ -23,6 +23,8 @@ LABEL_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 TOC_LINE_RE = re.compile(r"\.{3,}\s*\d+\s*$")
+DOT_LEADER_RE = re.compile(r"\.{5,}")
+DOMAIN_SOURCE_SECTION_RE = re.compile(r"^\s*Source:\s*.+?\.\s*Section:\s*", re.IGNORECASE)
 
 BROAD_LM_BOILERPLATE_PHRASES = (
     "available here",
@@ -109,6 +111,42 @@ def broad_lm_quality_filter_reason(text: str, raw_text: str | None = None) -> st
     return None
 
 
+def normalize_domain_lm_text(text: str) -> str:
+    """Remove scrape provenance while keeping the domain text itself available for LM training."""
+    text = DOMAIN_SOURCE_SECTION_RE.sub("", text).strip()
+    text = re.sub(r"\s*\|\s*", ", ", text)
+    text = re.sub(r"\s+-\s+", "; ", text)
+    text = DOT_LEADER_RE.sub(" ", text)
+    return normalize_whitespace(text)
+
+
+def domain_lm_quality_filter_reason(text: str, raw_text: str | None = None) -> str | None:
+    """Heuristics for Webb/catalog prose that should read like continuable text, not scraped chrome."""
+    raw = raw_text if raw_text is not None else text
+    raw_lower = raw.lower()
+    words = text.split()
+    if (
+        "american heritage dictionary of the english language" in raw_lower
+        or "curriculum detail" in raw_lower
+        or "photo of " in raw_lower
+    ):
+        return "domain_lm_structured_source_junk"
+    if "section: contents" in raw_lower or TOC_LINE_RE.search(raw) or DOT_LEADER_RE.search(raw):
+        return "domain_lm_table_of_contents"
+    if "top 40 colleges webb students matriculate to most" in raw_lower and len(words) < 20:
+        return "domain_lm_list_fragment"
+    if len(words) < 8:
+        return "domain_lm_fragment"
+    pipe_count = raw.count("|")
+    if pipe_count >= 12 and len(words) < 80:
+        return "domain_lm_dense_table_row"
+    source_prefix_hits = len(re.findall(r"\bsource:\s*", raw_lower))
+    section_prefix_hits = len(re.findall(r"\bsection:\s*", raw_lower))
+    if source_prefix_hits + section_prefix_hits >= 3:
+        return "domain_lm_metadata_heavy"
+    return None
+
+
 def quality_filter_reason(
     text: str,
     config: DataConfig,
@@ -125,6 +163,8 @@ def quality_filter_reason(
         return "low_alpha_ratio"
     if text.count("http") > 100:
         return "too_many_urls"
+    if source_config is not None and source_config.quality_filter_mode == "domain_lm":
+        return domain_lm_quality_filter_reason(text, raw_text=raw_text)
     if source_config is not None and source_config.quality_filter_mode == "broad_lm":
         return broad_lm_quality_filter_reason(text, raw_text=raw_text)
     return None
@@ -148,6 +188,8 @@ def clean_document(
     text = normalize_whitespace(record.text)
     if source_config.pii_scrub:
         text = scrub_pii(text)
+    if source_config.quality_filter_mode == "domain_lm":
+        text = normalize_domain_lm_text(text)
     if source_config.quality_filter:
         drop_reason = quality_filter_reason(
             text,

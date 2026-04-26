@@ -511,9 +511,21 @@ def test_lm_source_diagnostics_warn_when_pretrain_domain_contribution_is_too_low
     assert contribution["severity"] == "warning"
     assert contribution["domain_tokens"] == 1_000
     assert contribution["token_share"] == 0.001
-    assert contribution["minimum_token_share"] == 0.01
-    assert contribution["minimum_tokens"] == 500_000
+    assert contribution["minimum_token_share"] == 0.05
+    assert contribution["minimum_tokens"] == 5_000_000
+    assert contribution["configured_domain_share"] == 0.5
+    assert contribution["realized_domain_share"] == 0.001
+    assert contribution["minimum_recommended_domain_tokens_for_profile"] == 5_000_000
     assert contribution["failures"] == ["domain_tokens_too_low", "domain_share_too_low"]
+    gate = diagnostics["domain_realization_gate"]
+    assert gate["passed"] is False
+    assert gate["severity"] == "warning"
+    assert gate["failures"] == ["domain_tokens_too_low", "domain_share_too_low"]
+
+    fail_builder = DatasetBuilder(DataConfig(pretrain_domain_realization_gate_mode="fail"))
+    fail_gate = fail_builder._pretrain_domain_realization_gate(contribution)
+    assert fail_gate["passed"] is False
+    assert fail_gate["severity"] == "error"
 
 
 def test_lm_source_diagnostics_pass_when_pretrain_domain_contribution_is_material():
@@ -538,26 +550,27 @@ def test_lm_source_diagnostics_pass_when_pretrain_domain_contribution_is_materia
                 "family": "catalog_grounding_prose",
                 "weight": 1.0,
                 "target_share": 0.5,
-                "raw_records": 1_000,
-                "kept_documents": 1_000,
-                "kept_tokens": 600_000,
+                "raw_records": 10_000,
+                "kept_documents": 10_000,
+                "kept_tokens": 5_100_000,
                 "dropped_reasons": Counter(),
                 "repeated_documents": 0,
                 "restart_count": 0,
                 "phrase_counter": Counter(),
             },
         ],
-        total_tokens=1_500_000,
-        total_documents=1_100,
+        total_tokens=6_000_000,
+        total_documents=10_100,
         stage="pretrain",
     )
 
     contribution = diagnostics["domain_contribution"]
     assert contribution["passed"] is True
     assert contribution["failures"] == []
-    assert contribution["domain_tokens"] == 600_000
-    assert contribution["token_share"] == 0.4
+    assert contribution["domain_tokens"] == 5_100_000
+    assert contribution["token_share"] == 0.85
     assert contribution["source_names"] == ["catalog_expanded_corpus"]
+    assert diagnostics["domain_realization_gate"]["passed"] is True
 
 
 def test_prepared_pretrain_audit_includes_domain_contribution_guardrail(tmp_path: Path):
@@ -618,6 +631,8 @@ def test_prepared_pretrain_audit_includes_domain_contribution_guardrail(tmp_path
     assert contribution["failures"] == ["domain_tokens_too_low", "domain_share_too_low"]
     assert contribution["domain_tokens"] == 1_000
     assert contribution["token_share"] == 0.001
+    assert audit["domain_realization_gate"]["passed"] is False
+    assert audit["domain_realization_gate"]["severity"] == "warning"
 
 
 def test_iter_tokenized_documents_for_source_drops_too_short_tokenized_rows(monkeypatch):

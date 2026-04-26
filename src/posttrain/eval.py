@@ -14,6 +14,28 @@ from tokenizer import SentencePieceTokenizer, format_chat
 POSTTRAIN_REGRESSION_PATH = "data/eval/posttrain_regression.jsonl"
 PRETRAIN_REGRESSION_PATH = "data/eval/pretrain_regression.jsonl"
 PRETRAIN_FAMILY_HOLDOUTS_PATH = "data/eval/pretrain_family_holdouts.json"
+PRETRAIN_QUALITATIVE_RUBRIC = [
+    {
+        "perplexity_band": "300+",
+        "expected_behavior": "topic drift and broken semantics expected",
+    },
+    {
+        "perplexity_band": "220-260",
+        "expected_behavior": "sentence-shaped text, weak coherence, some drift expected",
+    },
+    {
+        "perplexity_band": "180-220",
+        "expected_behavior": "should often stay on topic for one paragraph, still generic",
+    },
+    {
+        "perplexity_band": "150-180",
+        "expected_behavior": "should usually complete the thought with local coherence",
+    },
+    {
+        "perplexity_band": "below 150",
+        "expected_behavior": "stronger paragraph control expected",
+    },
+]
 SPECIAL_TOKEN_PIECES = {
     "<s>",
     "</s>",
@@ -64,6 +86,126 @@ SOURCE_MENTION_PATTERNS: dict[str, tuple[str, ...]] = {
         "[source: handbook]",
     ),
 }
+RAW_LM_GENERIC_ATTRACTORS = {
+    "student",
+    "students",
+    "course",
+    "courses",
+    "body",
+    "child",
+    "children",
+    "world",
+    "health",
+    "time",
+    "thing",
+    "things",
+    "same",
+    "important",
+    "process",
+    "people",
+}
+RAW_LM_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "but",
+    "by",
+    "can",
+    "for",
+    "from",
+    "has",
+    "have",
+    "help",
+    "how",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "should",
+    "that",
+    "the",
+    "their",
+    "then",
+    "this",
+    "to",
+    "when",
+    "who",
+    "will",
+    "with",
+    "what",
+    "which",
+    "why",
+    "you",
+    "your",
+}
+RAW_LM_DOMAIN_TERMS = {
+    "advisor",
+    "advising",
+    "catalog",
+    "class",
+    "course",
+    "credit",
+    "department",
+    "departmental",
+    "description",
+    "elective",
+    "eligible",
+    "enroll",
+    "honors",
+    "placement",
+    "planning",
+    "prerequisite",
+    "prerequisites",
+    "recommendation",
+    "schedule",
+    "semester",
+    "webb",
+    "workload",
+}
+RAW_LM_DOMAIN_BOILERPLATE = (
+    "catalog entry should be read",
+    "read for any placement or departmental approval notes",
+    "the catalog entry should",
+    "a useful continuation",
+    "grounded in the catalog",
+)
+RAW_LM_NARRATIVE_DRIFT_PATTERNS = (
+    "in the early",
+    "in the late",
+    "united states",
+    "population",
+    "century",
+    "was first known",
+    "was established",
+)
+RAW_LM_EVERYDAY_MEDICAL_DRIFT_TERMS = {
+    "blood",
+    "body",
+    "child",
+    "children",
+    "diabetes",
+    "diet",
+    "doctor",
+    "food",
+    "health",
+    "medical",
+    "pain",
+    "symptoms",
+}
+RAW_WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z']*")
+WEIRD_HYPHEN_RE = re.compile(
+    r"(?:\b[a-zA-Z]{1,6}-){2,}[a-zA-Z]{1,10}\b|-[a-zA-Z]{1,4}-|"
+    r"\b(?:Newth|F-the-s|based-in|in-in|to-in|mvp-[a-z]{1,3})\b"
+)
 
 
 def _require_torch():
@@ -170,7 +312,10 @@ def load_raw_lm_regression_records(
         records.append(
             {
                 "source_path": str(regression_path),
+                "id": str(row.get("id") or f"raw_lm_probe_{len(records) + 1:02d}"),
                 "prompt": prompt,
+                "bucket": str(row.get("bucket") or "unspecified"),
+                "probe_type": str(row.get("probe_type") or "unspecified"),
                 "tags": list(row.get("tags", [])),
                 "sample_mode": "raw_lm",
             }
@@ -382,7 +527,7 @@ def generate_raw_lm_qualitative_samples(
     tokenizer_path: str,
     *,
     regression_path: str | Path = PRETRAIN_REGRESSION_PATH,
-    limit: int = 3,
+    limit: int | None = 3,
     max_new_tokens: int = 128,
     temperature: float = 0.7,
     top_p: float = 0.95,
@@ -436,6 +581,9 @@ def generate_raw_lm_qualitative_samples(
                     "prompt": prompt,
                     "raw_response": raw_response,
                     "clean_response": clean_response,
+                    "id": record["id"],
+                    "bucket": record["bucket"],
+                    "probe_type": record["probe_type"],
                     "tags": record["tags"],
                     "sample_mode": "raw_lm",
                     "source_path": record["source_path"],
@@ -691,3 +839,305 @@ def assess_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "promotion_blockers": blockers,
     }
+
+
+def _raw_words(text: str) -> list[str]:
+    return [match.group(0).lower() for match in RAW_WORD_RE.finditer(text)]
+
+
+def _content_keywords(text: str) -> set[str]:
+    return {
+        word
+        for word in _raw_words(text)
+        if len(word) >= 4 and word not in RAW_LM_STOPWORDS and word not in RAW_LM_GENERIC_ATTRACTORS
+    }
+
+
+def _ngram_counts(words: list[str], n: int) -> dict[tuple[str, ...], int]:
+    counts: dict[tuple[str, ...], int] = {}
+    if len(words) < n:
+        return counts
+    for index in range(len(words) - n + 1):
+        key = tuple(words[index : index + n])
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _legible_raw_lm_span(text: str, *, max_words: int | None = None) -> bool:
+    words = _raw_words(text)
+    if max_words is not None:
+        words = words[:max_words]
+    if len(words) < 8:
+        return False
+    span = " ".join(words)
+    if len(set(words)) / max(len(words), 1) < 0.32:
+        return False
+    if WEIRD_HYPHEN_RE.search(text):
+        weird_count = len(WEIRD_HYPHEN_RE.findall(text))
+        if weird_count / max(len(words), 1) > 0.04:
+            return False
+    max_word_count = max((_count for _word, _count in ((word, words.count(word)) for word in set(words))), default=0)
+    if max_word_count / max(len(words), 1) >= 0.22:
+        return False
+    return any(char in span for char in "abcdefghijklmnopqrstuvwxyz")
+
+
+def _sample_topic_retained(sample: dict[str, Any], response: str) -> bool:
+    prompt = str(sample.get("prompt") or "")
+    prompt_keywords = _content_keywords(prompt)
+    response_keywords = _content_keywords(response)
+    if not prompt_keywords:
+        return bool(response_keywords)
+    overlap = prompt_keywords & response_keywords
+    if overlap:
+        return True
+    bucket = str(sample.get("bucket") or "").lower()
+    probe_type = str(sample.get("probe_type") or "").lower()
+    if "domain" in probe_type or "catalog" in bucket:
+        return bool(response_keywords & RAW_LM_DOMAIN_TERMS)
+    return False
+
+
+def _looks_unfinished(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped[-1] in ".!?\"'”’)]":
+        return False
+    tail_words = _raw_words(stripped[-80:])
+    if not tail_words:
+        return True
+    return tail_words[-1] in {
+        "a",
+        "an",
+        "and",
+        "as",
+        "because",
+        "but",
+        "for",
+        "from",
+        "if",
+        "in",
+        "of",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+
+
+def _domain_phrase_accurate(sample: dict[str, Any], response: str) -> bool | None:
+    bucket = str(sample.get("bucket") or "").lower()
+    probe_type = str(sample.get("probe_type") or "").lower()
+    prompt = str(sample.get("prompt") or "").lower()
+    is_domain = "domain" in probe_type or "catalog" in bucket or "catalog" in prompt or "course" in prompt
+    if not is_domain:
+        return None
+    words = set(_raw_words(response))
+    if not words & RAW_LM_DOMAIN_TERMS:
+        return False
+    lower = response.lower()
+    boilerplate_hits = sum(1 for phrase in RAW_LM_DOMAIN_BOILERPLATE if phrase in lower)
+    if boilerplate_hits >= 2:
+        return False
+    return True
+
+
+def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    per_sample: list[dict[str, Any]] = []
+    blank_count = 0
+    first_40_legible = 0
+    full_128_legible = 0
+    topic_retained = 0
+    repeated_phrase_samples = 0
+    max_repeated_4gram_count = 0
+    weird_hyphen_samples = 0
+    weird_hyphen_total = 0
+    unfinished_count = 0
+    generic_attractor_samples = 0
+    domain_boilerplate_samples = 0
+    domain_phrase_total = 0
+    domain_phrase_accurate = 0
+    narrative_drift_count = 0
+    everyday_medical_drift_count = 0
+    drift_scores: list[float] = []
+    cross_sample_domain_boilerplate_counter: dict[str, int] = {}
+
+    for index, sample in enumerate(samples):
+        response = _normalize_text(str(sample.get("clean_response") or sample.get("response") or ""))
+        lower = response.lower()
+        words = _raw_words(response)
+        word_count = len(words)
+        if not response:
+            blank_count += 1
+        first_legible = _legible_raw_lm_span(response, max_words=40)
+        full_legible = _legible_raw_lm_span(response, max_words=128)
+        first_40_legible += int(first_legible)
+        full_128_legible += int(full_legible)
+
+        retained = _sample_topic_retained(sample, response)
+        topic_retained += int(retained)
+
+        fourgrams = _ngram_counts(words, 4)
+        sample_max_4gram = max(fourgrams.values(), default=0)
+        max_repeated_4gram_count = max(max_repeated_4gram_count, sample_max_4gram)
+        repeated_phrase = sample_max_4gram >= 3
+        repeated_phrase_samples += int(repeated_phrase)
+
+        weird_count = len(WEIRD_HYPHEN_RE.findall(response))
+        weird_hyphen_total += weird_count
+        weird_hyphen_samples += int(weird_count > 0)
+
+        unfinished = _looks_unfinished(response)
+        unfinished_count += int(unfinished)
+
+        generic_count = sum(1 for word in words if word in RAW_LM_GENERIC_ATTRACTORS)
+        generic_rate = generic_count / max(word_count, 1)
+        generic_attractor = generic_rate >= 0.16 or generic_count >= 20
+        generic_attractor_samples += int(generic_attractor)
+
+        boilerplate_hits = [phrase for phrase in RAW_LM_DOMAIN_BOILERPLATE if phrase in lower]
+        for phrase in boilerplate_hits:
+            cross_sample_domain_boilerplate_counter[phrase] = cross_sample_domain_boilerplate_counter.get(phrase, 0) + 1
+        domain_boilerplate = bool(boilerplate_hits)
+        domain_boilerplate_samples += int(domain_boilerplate)
+
+        phrase_accuracy = _domain_phrase_accurate(sample, response)
+        if phrase_accuracy is not None:
+            domain_phrase_total += 1
+            domain_phrase_accurate += int(phrase_accuracy)
+
+        bucket = str(sample.get("bucket") or "").lower()
+        narrative_drift = "narrative" in bucket and any(pattern in lower for pattern in RAW_LM_NARRATIVE_DRIFT_PATTERNS)
+        narrative_drift_count += int(narrative_drift)
+        prompt_words = set(_raw_words(str(sample.get("prompt") or "")))
+        everyday_medical_drift = (
+            "everyday" in bucket
+            and not (prompt_words & RAW_LM_EVERYDAY_MEDICAL_DRIFT_TERMS)
+            and bool(set(words) & RAW_LM_EVERYDAY_MEDICAL_DRIFT_TERMS)
+        )
+        everyday_medical_drift_count += int(everyday_medical_drift)
+
+        drift_score = 0.0
+        drift_score += 0.35 if not retained else 0.0
+        drift_score += 0.20 if generic_attractor else 0.0
+        drift_score += 0.15 if repeated_phrase else 0.0
+        drift_score += 0.15 if weird_count > 0 else 0.0
+        drift_score += 0.10 if narrative_drift or everyday_medical_drift else 0.0
+        drift_score += 0.05 if unfinished else 0.0
+        drift_scores.append(min(drift_score, 1.0))
+
+        per_sample.append(
+            {
+                "index": index,
+                "id": sample.get("id"),
+                "bucket": sample.get("bucket"),
+                "probe_type": sample.get("probe_type"),
+                "blank": not bool(response),
+                "word_count": word_count,
+                "first_40_tokens_legible": first_legible,
+                "full_128_tokens_legible": full_legible,
+                "prompt_topic_retained": retained,
+                "max_repeated_4gram_count": sample_max_4gram,
+                "weird_hyphen_or_subword_count": weird_count,
+                "unfinished_output": unfinished,
+                "generic_attractor_rate": round(generic_rate, 6),
+                "domain_boilerplate_hits": boilerplate_hits,
+                "domain_phrase_accurate": phrase_accuracy,
+                "narrative_expository_drift": narrative_drift,
+                "everyday_medical_or_child_drift": everyday_medical_drift,
+                "semantic_drift_score": round(min(drift_score, 1.0), 6),
+            }
+        )
+
+    sample_count = len(samples)
+    domain_boilerplate_repetition_rate = domain_boilerplate_samples / max(sample_count, 1)
+    domain_phrase_accuracy = (
+        domain_phrase_accurate / max(domain_phrase_total, 1)
+        if domain_phrase_total
+        else None
+    )
+    repeated_phrase_rate = repeated_phrase_samples / max(sample_count, 1)
+    weird_hyphen_or_subword_rate = weird_hyphen_total / max(sum(len(_raw_words(str(sample.get("clean_response") or sample.get("response") or ""))) for sample in samples), 1)
+    unfinished_output_rate = unfinished_count / max(sample_count, 1)
+    generic_attractor_rate = generic_attractor_samples / max(sample_count, 1)
+    semantic_drift_score = sum(drift_scores) / max(len(drift_scores), 1)
+
+    reasons: list[str] = []
+    if blank_count:
+        reasons.append("blank_sample_output")
+    if first_40_legible < min(10, sample_count):
+        reasons.append("first_40_tokens_not_legible_enough")
+    if topic_retained < min(8, sample_count):
+        reasons.append("prompt_topic_retention_too_low")
+    if max_repeated_4gram_count >= 4:
+        reasons.append("dominant_repeated_4gram")
+    if weird_hyphen_or_subword_rate > 0.025 or weird_hyphen_samples >= max(2, sample_count // 5):
+        reasons.append("weird_hyphen_or_subword_artifacts")
+    if domain_phrase_total and domain_boilerplate_samples >= domain_phrase_total:
+        reasons.append("domain_boilerplate_repetition")
+    if domain_phrase_accuracy is not None and domain_phrase_accuracy < 0.5:
+        reasons.append("domain_phrase_accuracy_too_low")
+    if narrative_drift_count >= 2:
+        reasons.append("narrative_prompts_drift_to_expository_history")
+    if everyday_medical_drift_count >= 2:
+        reasons.append("everyday_prompts_drift_to_medical_body_child_content")
+    if generic_attractor_rate > 0.4:
+        reasons.append("generic_attractor_collapse")
+    if semantic_drift_score > 0.45:
+        reasons.append("semantic_drift_too_high")
+
+    aggregate = {
+        "sample_count": sample_count,
+        "blank_count": blank_count,
+        "first_40_tokens_legible_count": first_40_legible,
+        "first_40_tokens_legible_rate": first_40_legible / max(sample_count, 1),
+        "full_128_tokens_legible_count": full_128_legible,
+        "full_128_tokens_legible_rate": full_128_legible / max(sample_count, 1),
+        "prompt_topic_retention_count": topic_retained,
+        "prompt_topic_retention_rate": topic_retained / max(sample_count, 1),
+        "repeated_phrase_rate": repeated_phrase_rate,
+        "max_repeated_4gram_count": max_repeated_4gram_count,
+        "weird_hyphen_or_subword_rate": weird_hyphen_or_subword_rate,
+        "unfinished_output_rate": unfinished_output_rate,
+        "generic_attractor_rate": generic_attractor_rate,
+        "domain_boilerplate_repetition_rate": domain_boilerplate_repetition_rate,
+        "domain_phrase_accuracy": domain_phrase_accuracy,
+        "semantic_drift_score": semantic_drift_score,
+        "narrative_expository_drift_count": narrative_drift_count,
+        "everyday_medical_or_child_drift_count": everyday_medical_drift_count,
+        "top_domain_boilerplate_phrases": [
+            {"phrase": phrase, "count": count}
+            for phrase, count in sorted(
+                cross_sample_domain_boilerplate_counter.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:5]
+        ],
+    }
+    return {
+        "raw_lm_quality_gate_passed": not reasons,
+        "raw_lm_quality_gate_reasons": reasons,
+        "per_sample_quality": per_sample,
+        "aggregate_quality_metrics": aggregate,
+        **aggregate,
+    }
+
+
+def raw_lm_quality_status(
+    short_stable_quality: dict[str, Any],
+    long_stress_quality: dict[str, Any],
+) -> str:
+    if bool(short_stable_quality.get("raw_lm_quality_gate_passed")) and bool(
+        long_stress_quality.get("raw_lm_quality_gate_passed")
+    ):
+        return "usable_raw_lm"
+    short_metrics = short_stable_quality.get("aggregate_quality_metrics", short_stable_quality)
+    long_metrics = long_stress_quality.get("aggregate_quality_metrics", long_stress_quality)
+    if (
+        float(short_metrics.get("first_40_tokens_legible_rate", 0.0)) >= 0.75
+        and float(short_metrics.get("prompt_topic_retention_rate", 0.0)) >= 0.55
+        and float(long_metrics.get("semantic_drift_score", 1.0)) <= 0.4
+        and float(long_metrics.get("generic_attractor_rate", 1.0)) <= 0.3
+    ):
+        return "improving_raw_lm"
+    return "weak_raw_lm"

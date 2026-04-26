@@ -11,6 +11,7 @@ from config import DataConfig, DataSourceConfig, TokenizerConfig
 from data.dataset import DatasetBuilder, IndexedDataset, split_dataset_for_validation
 from posttrain.eval import (
     _clean_generated_response,
+    assess_raw_lm_sample_behavior,
     assess_sample_behavior,
     ensure_no_regression_prompt_overlap,
     evaluate_pretrain_family_holdouts,
@@ -402,6 +403,41 @@ def test_assess_sample_behavior_flags_grounded_failures():
     assert "source_attribution_failures" in behavior["promotion_blockers"]
     assert "grounded_abstention_failures" in behavior["promotion_blockers"]
     assert behavior["collapse_detected"] is True
+
+
+def test_assess_raw_lm_sample_behavior_catches_sentence_shaped_drift():
+    samples = [
+        {
+            "id": "domain_catalog_01",
+            "bucket": "domain_catalog_prose",
+            "probe_type": "domain_readiness",
+            "prompt": "This semester course carries one-half credit and is open to juniors and seniors who",
+            "clean_response": "have the ability to read and read. The catalog entry should be read for any placement or departmental approval notes. The catalog entry should be read for any placement or departmental approval notes.",
+        },
+        {
+            "id": "narrative_descriptive_01",
+            "bucket": "narrative_descriptive_prose",
+            "probe_type": "general_legibility",
+            "prompt": "By the time the bus reached the edge of town, the rain had",
+            "clean_response": "been in the early 1990s when the United States population was first known for the largest city in the world.",
+        },
+        {
+            "id": "everyday_practical_01",
+            "bucket": "everyday_practical_prose",
+            "probe_type": "general_legibility",
+            "prompt": "When a person is trying to recover from a chaotic week, one useful first step is",
+            "clean_response": "to improve body health, diet, doctor visits, blood pressure, and symptoms for a child in the home.",
+        },
+    ]
+
+    behavior = assess_raw_lm_sample_behavior(samples)
+
+    assert behavior["raw_lm_quality_gate_passed"] is False
+    assert "prompt_topic_retention_too_low" in behavior["raw_lm_quality_gate_reasons"]
+    assert "domain_boilerplate_repetition" in behavior["raw_lm_quality_gate_reasons"]
+    assert "narrative_prompts_drift_to_expository_history" not in behavior["raw_lm_quality_gate_reasons"]
+    assert behavior["domain_phrase_accuracy"] < 1.0
+    assert behavior["per_sample_quality"][0]["max_repeated_4gram_count"] >= 2
 
 
 def test_evaluate_pretrain_family_holdouts_reports_family_metrics(

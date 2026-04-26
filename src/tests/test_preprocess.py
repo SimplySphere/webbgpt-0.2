@@ -13,6 +13,16 @@ def _broad_source() -> DataSourceConfig:
     )
 
 
+def _domain_source() -> DataSourceConfig:
+    return DataSourceConfig(
+        name="catalog_expanded_corpus",
+        format="text",
+        quality_filter=True,
+        quality_filter_mode="domain_lm",
+        pii_scrub=False,
+    )
+
+
 def test_broad_lm_filter_drops_url_heavy_documents():
     text = (
         "This page collects classroom resources and short public explanations for students. "
@@ -57,3 +67,51 @@ def test_broad_lm_filter_keeps_clean_paragraph_documents():
     assert result.record is not None
     assert result.dropped_reason is None
     assert result.record.text.startswith("Students often make stronger progress")
+
+
+def test_domain_lm_filter_removes_source_section_scaffolding_from_kept_text():
+    text = (
+        "Source: course_catalog_2025_26.html. Section: Course Planning. "
+        "Students should plan their programs for the full school year, with subsequent years of study "
+        "and college in mind."
+    )
+
+    result = clean_document(DocumentRecord(text=text, source="catalog"), DataConfig(min_document_chars=1), _domain_source())
+
+    assert result.record is not None
+    assert result.dropped_reason is None
+    assert result.record.text == (
+        "Course Planning. Students should plan their programs for the full school year, "
+        "with subsequent years of study and college in mind."
+    )
+
+
+def test_domain_lm_filter_drops_table_of_contents_fragments():
+    text = "Source: handbook.txt. Section: Contents. Honor............................................................ 10"
+
+    result = clean_document(DocumentRecord(text=text, source="handbook"), DataConfig(min_document_chars=1), _domain_source())
+
+    assert result.record is None
+    assert result.dropped_reason == "domain_lm_table_of_contents"
+
+
+def test_domain_lm_filter_drops_short_metadata_fragments_after_cleanup():
+    text = "Source: college_guidance.html. Section: Top 40 Colleges Webb Students Matriculate To Most:. Babson College"
+
+    result = clean_document(DocumentRecord(text=text, source="advising"), DataConfig(min_document_chars=1), _domain_source())
+
+    assert result.record is None
+    assert result.dropped_reason == "domain_lm_list_fragment"
+
+
+def test_domain_lm_filter_drops_structured_source_junk():
+    text = (
+        "College Guidance Team Photo of Hector Martinez Dean of College Guidance Photo of Rhemi Abrams-Fuller "
+        "Associate Dean of College Guidance. This line is long enough to pass basic length checks, "
+        "but it is media chrome rather than coherent prose for language modeling."
+    )
+
+    result = clean_document(DocumentRecord(text=text, source="advising"), DataConfig(min_document_chars=1), _domain_source())
+
+    assert result.record is None
+    assert result.dropped_reason == "domain_lm_structured_source_junk"

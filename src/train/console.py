@@ -63,7 +63,7 @@ def single_line_text(value: object) -> str:
     return " ".join(text.split())
 
 
-def simplify_samples(value: object, *, limit: int = 3) -> list[dict[str, str]]:
+def simplify_samples(value: object, *, limit: int | None = 3) -> list[dict[str, str]]:
     if not isinstance(value, list):
         return []
     simplified: list[dict[str, str]] = []
@@ -73,19 +73,27 @@ def simplify_samples(value: object, *, limit: int = 3) -> list[dict[str, str]]:
         response = sample.get("response")
         if response is None:
             response = sample.get("clean_response") or sample.get("raw_response", "")
-        simplified.append(
-            {
-                "prompt": str(sample.get("prompt", "")),
-                "response": str(response),
-            }
-        )
-        if len(simplified) >= limit:
+        output = {
+            "prompt": str(sample.get("prompt", "")),
+            "response": str(response),
+        }
+        for key in ("id", "bucket", "probe_type"):
+            if sample.get(key) is not None:
+                output[key] = str(sample.get(key))
+        simplified.append(output)
+        if limit is not None and len(simplified) >= limit:
             break
     return simplified
 
 
-def _print_samples_block(prefix: str, samples_value: object, *, closing_suffix: str = "") -> None:
-    samples = simplify_samples(samples_value)
+def _print_samples_block(
+    prefix: str,
+    samples_value: object,
+    *,
+    closing_suffix: str = "",
+    limit: int | None = 3,
+) -> None:
+    samples = simplify_samples(samples_value, limit=limit)
     if not samples:
         print(f"{prefix}; samples: []{closing_suffix}", flush=True)
         return
@@ -93,8 +101,15 @@ def _print_samples_block(prefix: str, samples_value: object, *, closing_suffix: 
     for index, sample in enumerate(samples, start=1):
         prompt = json.dumps(single_line_text(sample.get("prompt", "")), ensure_ascii=True)
         response = json.dumps(single_line_text(sample.get("response", "")), ensure_ascii=True)
+        metadata = ""
+        if sample.get("id") or sample.get("bucket") or sample.get("probe_type"):
+            metadata = (
+                f"id: {json.dumps(single_line_text(sample.get('id', '')), ensure_ascii=True)}; "
+                f"bucket: {json.dumps(single_line_text(sample.get('bucket', '')), ensure_ascii=True)}; "
+                f"probe_type: {json.dumps(single_line_text(sample.get('probe_type', '')), ensure_ascii=True)}; "
+            )
         suffix = ";" if index < len(samples) else ""
-        print(f"  sample{index}: {{prompt: {prompt}; response: {response}}}{suffix}", flush=True)
+        print(f"  sample{index}: {{{metadata}prompt: {prompt}; response: {response}}}{suffix}", flush=True)
     print(f"]{closing_suffix}", flush=True)
 
 
@@ -120,7 +135,8 @@ def print_lm_eval_event(payload: dict[str, object]) -> None:
         f"stage_elapsed_sec: {format_scalar(payload.get('stage_elapsed_sec'), key='stage_elapsed_sec')}; "
         f"stage_eta_sec: {format_scalar(payload.get('stage_eta_sec'), key='stage_eta_sec')}"
     )
-    _print_samples_block(prefix, payload.get("samples"))
+    sample_limit = None if payload.get("sample_mode") == "raw_lm" else 3
+    _print_samples_block(prefix, payload.get("samples"), limit=sample_limit)
 
 
 def print_sft_eval_event(payload: dict[str, object]) -> None:

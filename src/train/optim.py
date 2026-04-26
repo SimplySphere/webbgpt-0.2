@@ -35,18 +35,25 @@ def build_optimizer(model, train_config: TrainConfig):
     )
 
 
-def build_scheduler(optimizer, train_config: TrainConfig):
+def build_scheduler(
+    optimizer,
+    train_config: TrainConfig,
+    *,
+    max_steps_override: int | None = None,
+):
     torch = _require_torch()
+    scheduler_max_steps = int(max_steps_override or train_config.max_steps)
 
     def lr_lambda(current_step: int) -> float:
         if current_step < train_config.warmup_steps:
             return float(current_step) / float(max(1, train_config.warmup_steps))
         progress = (current_step - train_config.warmup_steps) / float(
-            max(1, train_config.max_steps - train_config.warmup_steps)
+            max(1, scheduler_max_steps - train_config.warmup_steps)
         )
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         floor = train_config.min_learning_rate / max(train_config.learning_rate, 1e-12)
         return floor + (1.0 - floor) * cosine
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    scheduler.webbgpt_max_steps = scheduler_max_steps
+    return scheduler
