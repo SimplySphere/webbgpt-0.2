@@ -157,8 +157,9 @@ def build_large_domain_lm_corpus(target_tokens: int) -> list[str]:
     )
     expanded: list[str] = []
     seen: set[str] = set()
+    token_count = 0
     pass_index = 0
-    while _approx_token_count(expanded) < target_tokens:
+    while token_count < target_tokens:
         added_this_pass = 0
         for index, line in enumerate(seed_lines):
             for candidate in _domain_expansion_templates(line, index + pass_index):
@@ -172,8 +173,9 @@ def build_large_domain_lm_corpus(target_tokens: int) -> list[str]:
                     continue
                 seen.add(key)
                 expanded.append(candidate)
+                token_count += len(candidate.split())
                 added_this_pass += 1
-                if _approx_token_count(expanded) >= target_tokens:
+                if token_count >= target_tokens:
                     return expanded
         if added_this_pass == 0:
             break
@@ -459,6 +461,10 @@ def main() -> int:
         large_output = Path(args.large_output)
         if not large_output.is_absolute():
             large_output = ROOT / large_output
+        print(
+            f"building large domain LM corpus to approximately {args.target_domain_tokens:,} tokens...",
+            flush=True,
+        )
         lines = build_large_domain_lm_corpus(args.target_domain_tokens)
         count = _write_lines(large_output, lines)
         token_count = _approx_token_count(lines)
