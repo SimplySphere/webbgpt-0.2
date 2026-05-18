@@ -15,6 +15,7 @@ from posttrain.eval import (
     assess_sample_behavior,
     ensure_no_regression_prompt_overlap,
     evaluate_pretrain_family_holdouts,
+    raw_lm_quality_status,
 )
 from tokenizer.spm import train_tokenizer
 
@@ -435,9 +436,105 @@ def test_assess_raw_lm_sample_behavior_catches_sentence_shaped_drift():
     assert behavior["raw_lm_quality_gate_passed"] is False
     assert "prompt_topic_retention_too_low" in behavior["raw_lm_quality_gate_reasons"]
     assert "domain_boilerplate_repetition" in behavior["raw_lm_quality_gate_reasons"]
-    assert "narrative_prompts_drift_to_expository_history" not in behavior["raw_lm_quality_gate_reasons"]
+    assert "boilerplate_repetition" in behavior["raw_lm_quality_gate_reasons"]
+    assert "domain_collapse" not in behavior["raw_lm_quality_gate_reasons"]
+    assert "narrative_to_expository_drift" in behavior["raw_lm_quality_gate_reasons"]
+    assert "everyday_to_medical_drift" in behavior["raw_lm_quality_gate_reasons"]
     assert behavior["domain_phrase_accuracy"] < 1.0
+    assert behavior["failure_mode_counts"]["genre_collapse"] >= 2
     assert behavior["per_sample_quality"][0]["max_repeated_4gram_count"] >= 2
+
+
+def test_assess_raw_lm_sample_behavior_flags_semantic_loops_and_malformed_tokens():
+    samples = [
+        {
+            "id": "domain_catalog_01",
+            "bucket": "domain_catalog_prose",
+            "probe_type": "domain_readiness",
+            "prompt": "This semester course carries one-half credit and is open to juniors and seniors who",
+            "clean_response": "This course is an important course for students and the course is a course about the same important thing.",
+        },
+        {
+            "id": "narrative_descriptive_01",
+            "bucket": "narrative_descriptive_prose",
+            "probe_type": "general_legibility",
+            "prompt": "When she opened the old notebook, the first thing she noticed was",
+            "clean_response": "the article described the history of the United States population and the largest city in the century.",
+        },
+        {
+            "id": "everyday_practical_01",
+            "bucket": "everyday_practical_prose",
+            "probe_type": "general_legibility",
+            "prompt": "A grocery list usually works better when items are grouped by section of the store, because",
+            "clean_response": "the product computer research study data project showed that body health diet infection heart results were important.",
+        },
+        {
+            "id": "neutral_expository_01",
+            "bucket": "neutral_expository_prose",
+            "probe_type": "general_legibility",
+            "prompt": "A short explanation is most useful when it defines the term, gives an example, and",
+            "clean_response": "scheduleite Berled inology engagingable pronting over-the-jay unforgetable 'a' or 'b' or 'c' or 'a' or 'b' or 'c'.",
+        },
+        {
+            "id": "neutral_expository_02",
+            "bucket": "neutral_expository_prose",
+            "probe_type": "general_legibility",
+            "prompt": "Clear writing becomes easier to follow when each paragraph stays focused on one main idea and",
+            "clean_response": "water river land city war water river land city war water river land city war repeats without adding an idea.",
+        },
+        {
+            "id": "neutral_expository_03",
+            "bucket": "neutral_expository_prose",
+            "probe_type": "general_legibility",
+            "prompt": "A useful explanation should define the main term before adding an example and",
+            "clean_response": "the course catalog entry should be read for prerequisites, one-half credit, and departmental approval.",
+        },
+    ]
+
+    behavior = assess_raw_lm_sample_behavior(samples)
+    reasons = set(behavior["raw_lm_quality_gate_reasons"])
+
+    assert behavior["raw_lm_quality_gate_passed"] is False
+    assert "domain_collapse" not in reasons
+    assert "catalog_advising_drift_into_unrelated_prompt" in reasons
+    assert "semantic_repetition" in reasons
+    assert "narrative_to_expository_drift" in reasons
+    assert "everyday_to_medical_drift" in reasons
+    assert "malformed_token_rate_high" in reasons
+    assert behavior["semantic_loop_detected"] is True
+    assert behavior["repeated_content_bigram_rate"] > 0.0
+    assert behavior["repeated_content_trigram_rate"] > 0.0
+    assert behavior["malformed_token_sample_count"] >= 1
+    assert behavior["per_sample_quality"][3]["malformed_token_count"] >= 7
+    assert behavior["per_sample_quality"][4]["semantic_loop_detected"] is True
+    assert behavior["per_sample_quality"][5]["catalog_domain_drift"] is True
+    assert behavior["failure_mode_counts"]["malformed_generation"] >= 1
+    assert behavior["failure_mode_counts"]["semantic_loop"] >= 1
+
+
+def test_raw_lm_quality_status_caps_major_gate_failures_at_weak():
+    almost_improving = {
+        "raw_lm_quality_gate_passed": False,
+        "raw_lm_quality_gate_reasons": ["semantic_repetition"],
+        "aggregate_quality_metrics": {
+            "first_40_tokens_legible_rate": 0.9,
+            "prompt_topic_retention_rate": 0.8,
+            "semantic_drift_score": 0.2,
+            "generic_attractor_rate": 0.1,
+        },
+    }
+    clean_long = {
+        "raw_lm_quality_gate_passed": True,
+        "raw_lm_quality_gate_reasons": [],
+        "aggregate_quality_metrics": {
+            "first_40_tokens_legible_rate": 0.9,
+            "prompt_topic_retention_rate": 0.8,
+            "semantic_drift_score": 0.2,
+            "generic_attractor_rate": 0.1,
+        },
+    }
+
+    assert raw_lm_quality_status(almost_improving, clean_long) == "weak_raw_lm"
 
 
 def test_evaluate_pretrain_family_holdouts_reports_family_metrics(
@@ -448,10 +545,11 @@ def test_evaluate_pretrain_family_holdouts_reports_family_metrics(
         "posttrain.eval.load_pretrain_family_holdouts",
         lambda *_args, **_kwargs: {
             "general_clean_prose": [
-                "Students learn through clear explanations and examples."
+                "Students learn through clear explanations and examples.",
+                "A concise paragraph can name the main idea before adding details.",
             ],
             "catalog_grounding_prose": [
-                "If a course is not listed in the catalog, the assistant should say it cannot verify it."
+                "Prerequisites describe required preparation, while recommendations describe useful background."
             ],
         },
     )
@@ -469,6 +567,42 @@ def test_evaluate_pretrain_family_holdouts_reports_family_metrics(
     assert family_eval["best_family"] in family_eval["families"]
     assert family_eval["worst_family"] in family_eval["families"]
     assert all("loss" in metrics for metrics in family_eval["families"].values())
+    assert family_eval["families"]["general_clean_prose"]["examples_evaluated"] == 2
+    assert family_eval["families"]["catalog_grounding_prose"]["examples_evaluated"] == 1
+    assert all("windows_evaluated" in metrics for metrics in family_eval["families"].values())
+    assert all(metrics["coverage_percent"] == 100.0 for metrics in family_eval["families"].values())
+    assert family_eval["coverage"]["family_count"] == 2
+    assert family_eval["coverage"]["total_examples_evaluated"] == 3
+    assert family_eval["coverage"]["total_windows_evaluated"] >= 3
+    assert family_eval["coverage"]["coverage_percent"] == 100.0
+    assert family_eval["coverage"]["sequence_length"] == 32
+
+
+def test_pretrain_family_holdout_files_are_large_clean_raw_prose():
+    holdouts_path = Path("data/eval/pretrain_family_holdouts_general.json")
+    holdouts = json.loads(holdouts_path.read_text())
+    blocked_policy_phrases = [
+        "assistant should",
+        "the assistant should",
+        "grounded answer should",
+        "grounded answers should",
+        "assistant behavior",
+        "assistant-policy",
+        "student-facing explanation",
+    ]
+
+    assert set(holdouts) == {
+        "general_clean_prose",
+        "everyday_practical_prose",
+        "narrative_descriptive_prose",
+        "school_academic_prose",
+    }
+    for family, path_text in holdouts.items():
+        path = Path(path_text)
+        lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+        lowered = "\n".join(lines).lower()
+        assert len(lines) >= 100, family
+        assert not any(phrase in lowered for phrase in blocked_policy_phrases), family
 
 
 def test_clean_generated_response_keeps_raw_and_strips_special_tokens():

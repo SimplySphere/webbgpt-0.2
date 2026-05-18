@@ -1,0 +1,30 @@
+{
+  "version": "1.0",
+  "tokenizer_path": "artifacts/tokenizer/webbgpt-local-mvp.model",
+  "sequence_length": 512,
+  "prepared_shard_size": 1024,
+  "pretraining_token_budget": 75000000,
+  "pretrain_domain_realization_gate_mode": "off",
+  "pretrain_sources": [
+    {
+      "name": "prepared_local_mvp_pretrain",
+      "path": "artifacts/runs/local-mvp/prepared/pretrain.json",
+      "format": "prepared",
+      "weight": 1.0,
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false
+    }
+  ],
+  "validation_sources": [
+    {
+      "name": "prepared_local_mvp_validation",
+      "path": "artifacts/runs/local-mvp/prepared/validation.json",
+      "format": "prepared",
+      "weight": 1.0,
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false
+    }
+  ]
+}

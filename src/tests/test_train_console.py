@@ -6,6 +6,7 @@ from train.console import (
     print_dpo_eval_event,
     print_dpo_train_event,
     print_lm_eval_event,
+    print_lm_train_event,
     round_output_numbers,
 )
 
@@ -95,6 +96,38 @@ def test_lm_eval_sample_logging_preserves_unicode_punctuation(capsys):
     assert "\\u201c" not in captured.out
     assert "\\u201d" not in captured.out
     assert "\\u2014" not in captured.out
+
+
+def test_print_lm_train_event_preserves_provenance_payload_as_json(capsys):
+    print_lm_train_event(
+        {
+            "event": "severe_low_loss_batch_provenance",
+            "step": 28137,
+            "micro_step": 112548,
+            "loss": 0.000451,
+            "tier": "severe",
+            "threshold": 0.05,
+            "source_names": ["catalog_domain_fixture"],
+            "contributors": [
+                {
+                    "source": "catalog_domain_fixture",
+                    "document_id": "catalog-7",
+                }
+            ],
+            "packed_document_count": 1,
+            "provenance": [{"source_names": ["catalog_domain_fixture"]}],
+        }
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["event"] == "severe_low_loss_batch_provenance"
+    assert payload["tier"] == "severe"
+    assert payload["source_names"] == ["catalog_domain_fixture"]
+    assert payload["contributors"][0]["document_id"] == "catalog-7"
+    assert payload["packed_document_count"] == 1
+    assert payload["provenance"][0]["source_names"] == ["catalog_domain_fixture"]
 
 
 def test_print_dpo_train_event_uses_semicolon_console_format(capsys):

@@ -208,7 +208,7 @@ def test_shared_config_pack_profile_accepts_local_mvp_alternate_train_config_nam
         _shared_config_pack_profile(
             "sample-configs/model-local-mvp.json",
             "sample-configs/data-local-mvp.json",
-            "sample-configs/train-local-mvp-sft-from-pretrain.json",
+            "sample-configs/train-local-mvp-sanity-probe.json",
         )
         == "local-mvp"
     )
@@ -248,7 +248,7 @@ def test_prepare_manual_stage_data_config_uses_profile_manifests_for_local_mvp_a
     prepared_config = cli._prepare_manual_stage_data_config(
         "sample-configs/model-local-mvp.json",
         "sample-configs/data-local-mvp.json",
-        "sample-configs/train-local-mvp-sft-from-pretrain.json",
+        "sample-configs/train-local-mvp-sanity-probe.json",
         data_config,
         TrainConfig(),
         stage_name="sft",
@@ -567,7 +567,7 @@ def test_prepare_manual_sft_train_config_rotates_existing_history_for_alt_local_
     stage_config = _prepare_manual_sft_train_config(
         "sample-configs/model-local-mvp.json",
         "sample-configs/data-local-mvp.json",
-        "sample-configs/train-local-mvp-sft-from-pretrain.json",
+        "sample-configs/train-local-mvp-sanity-probe.json",
         TrainConfig(
             run_name="webbgpt-local-mvp",
             sft_max_steps=3_000,

@@ -37,6 +37,14 @@ def test_train_config_roundtrip():
         dpo_enable_lm_health_eval=True,
         allow_weak_posttrain_validation=True,
         posttrain_top_k_checkpoints=5,
+        log_batch_provenance_extremes=True,
+        severe_low_loss_threshold=0.03,
+        suspicious_low_loss_threshold=0.08,
+        broad_low_loss_threshold=0.4,
+        low_loss_probe_threshold=0.4,
+        high_loss_probe_threshold=4.0,
+        pretrain_probe_path="data/eval/pretrain_general_regression.jsonl",
+        pretrain_family_holdouts_path="data/eval/pretrain_family_holdouts_general.json",
     )
     payload = config.to_dict()
     restored = TrainConfig.from_dict(payload)
@@ -71,6 +79,14 @@ def test_train_config_roundtrip():
     assert restored.dpo_enable_lm_health_eval is True
     assert restored.allow_weak_posttrain_validation is True
     assert restored.posttrain_top_k_checkpoints == 5
+    assert restored.log_batch_provenance_extremes is True
+    assert restored.severe_low_loss_threshold == 0.03
+    assert restored.suspicious_low_loss_threshold == 0.08
+    assert restored.broad_low_loss_threshold == 0.4
+    assert restored.low_loss_probe_threshold == 0.4
+    assert restored.high_loss_probe_threshold == 4.0
+    assert restored.pretrain_probe_path == "data/eval/pretrain_general_regression.jsonl"
+    assert restored.pretrain_family_holdouts_path == "data/eval/pretrain_family_holdouts_general.json"
 
 
 def test_tokenizer_defaults_include_special_tokens():
@@ -84,6 +100,20 @@ def test_data_config_domain_tags_present():
         lm_max_source_token_share=0.55,
         lm_max_source_repeat_rate=0.2,
         continue_readiness_min_clean_token_fraction=0.6,
+        pretrain_broad_source_quality_gate_mode="fail",
+        pretrain_domain_realization_gate_mode="informational",
+        pretrain_broad_max_junk_score=0.07,
+        pretrain_broad_max_medical_body_density=0.02,
+        pretrain_broad_max_navigation_text_density=0.01,
+        pretrain_broad_max_malformed_fragment_density=0.004,
+        pretrain_broad_max_generic_article_formula_density=0.015,
+        pretrain_curated_max_product_commercial_density=0.006,
+        pretrain_curated_max_dictionary_fragment_density=0.005,
+        pretrain_curated_max_page_boilerplate_density=0.007,
+        num_workers=4,
+        preprocessing_num_workers=2,
+        tokenizer_num_workers=3,
+        audit_num_workers=5,
         continue_readiness_min_documents=100,
         continue_readiness_min_source_families=2,
         continue_readiness_max_single_source_share=0.7,
@@ -92,6 +122,20 @@ def test_data_config_domain_tags_present():
     assert "course_catalog" in config.domain_tags
     restored = DataConfig.from_dict(config.to_dict())
     assert restored.lm_weighted_source_token_budget == 4096
+    assert restored.pretrain_domain_realization_gate_mode == "informational"
+    assert restored.pretrain_broad_source_quality_gate_mode == "fail"
+    assert restored.pretrain_broad_max_junk_score == 0.07
+    assert restored.pretrain_broad_max_medical_body_density == 0.02
+    assert restored.pretrain_broad_max_navigation_text_density == 0.01
+    assert restored.pretrain_broad_max_malformed_fragment_density == 0.004
+    assert restored.pretrain_broad_max_generic_article_formula_density == 0.015
+    assert restored.pretrain_curated_max_product_commercial_density == 0.006
+    assert restored.pretrain_curated_max_dictionary_fragment_density == 0.005
+    assert restored.pretrain_curated_max_page_boilerplate_density == 0.007
+    assert restored.num_workers == 4
+    assert restored.preprocessing_num_workers == 2
+    assert restored.tokenizer_num_workers == 3
+    assert restored.audit_num_workers == 5
     assert restored.continue_readiness_min_documents == 100
     assert restored.continue_readiness_max_repeat_rate == 0.15
 
@@ -130,6 +174,9 @@ def test_data_source_config_roundtrip_with_extended_fields():
 
     domain_source = DataSourceConfig(name="domain", quality_filter_mode="domain_lm")
     assert DataSourceConfig.from_dict(domain_source.to_dict()).quality_filter_mode == "domain_lm"
+
+    curated_source = DataSourceConfig(name="curated", quality_filter_mode="curated_lm")
+    assert DataSourceConfig.from_dict(curated_source.to_dict()).quality_filter_mode == "curated_lm"
 
 
 def test_eval_config_roundtrip_with_release_gates():

@@ -78,6 +78,17 @@ def _require_trusted_artifact(
     )
 
 
+def _apply_data_worker_overrides(config: DataConfig, args: argparse.Namespace) -> None:
+    if getattr(args, "num_workers", None) is not None:
+        config.num_workers = int(args.num_workers)
+    if getattr(args, "preprocessing_num_workers", None) is not None:
+        config.preprocessing_num_workers = int(args.preprocessing_num_workers)
+    if getattr(args, "tokenizer_num_workers", None) is not None:
+        config.tokenizer_num_workers = int(args.tokenizer_num_workers)
+    if getattr(args, "audit_num_workers", None) is not None:
+        config.audit_num_workers = int(args.audit_num_workers)
+
+
 def _build_tokenizer_corpus_worker(
     config_payload: dict[str, object],
     connection: mp.connection.Connection,
@@ -183,10 +194,35 @@ def _parse_args() -> argparse.Namespace:
     )
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--force-rebuild", action="store_true")
+    prepare.add_argument(
+        "--num-workers",
+        type=int,
+        help="Default data-preparation worker count; 0 or 1 runs serially.",
+    )
+    prepare.add_argument(
+        "--preprocessing-num-workers",
+        type=int,
+        help="Worker count for CPU-heavy LM preprocessing/filtering; 0 or 1 runs serially.",
+    )
+    prepare.add_argument(
+        "--tokenizer-num-workers",
+        type=int,
+        help="Worker count for LM document tokenization; 0 or 1 runs serially.",
+    )
 
     audit = subparsers.add_parser("audit-data", help="Audit LM corpus sources for a stage")
     audit.add_argument("--config", required=True)
     audit.add_argument("--stage", choices=["pretrain", "continue", "validation"], required=True)
+    audit.add_argument(
+        "--num-workers",
+        type=int,
+        help="Default audit worker count; 0 or 1 runs serially.",
+    )
+    audit.add_argument(
+        "--audit-num-workers",
+        type=int,
+        help="Worker count for audit scans; 0 or 1 runs serially.",
+    )
 
     train_pre = subparsers.add_parser("train-pretrain", help="Run base pretraining")
     train_pre.add_argument("--model-config", required=True)
@@ -548,107 +584,8 @@ def _write_default_configs(output_dir: str) -> None:
                     "max_records": None,
                 }
             ],
-            "continued_pretrain_sources": [
-                {
-                    "name": "education_domain_corpus",
-                    "path": "data/domain/education_corpus.txt",
-                    "paths": [],
-                    "split": "train",
-                    "format": "text",
-                    "dataset_name": None,
-                    "dataset_config_name": None,
-                    "dataset_revision": None,
-                    "streaming": False,
-                    "weight": 1.0,
-                    "text_field": "text",
-                    "messages_field": "messages",
-                    "prompt_field": "prompt",
-                    "chosen_field": "chosen",
-                    "rejected_field": "rejected",
-                    "metadata_fields": [],
-                    "language": "en",
-                    "quality_filter": False,
-                    "deduplicate": False,
-                    "pii_scrub": False,
-                    "skip_records": 0,
-                    "max_records": None,
-                },
-                {
-                    "name": "advising_domain_corpus",
-                    "path": "data/domain/advising_corpus.txt",
-                    "paths": [],
-                    "split": "train",
-                    "format": "text",
-                    "dataset_name": None,
-                    "dataset_config_name": None,
-                    "dataset_revision": None,
-                    "streaming": False,
-                    "weight": 1.0,
-                    "text_field": "text",
-                    "messages_field": "messages",
-                    "prompt_field": "prompt",
-                    "response_field": "response",
-                    "chosen_field": "chosen",
-                    "rejected_field": "rejected",
-                    "metadata_fields": [],
-                    "language": "en",
-                    "quality_filter": False,
-                    "deduplicate": False,
-                    "pii_scrub": False,
-                    "skip_records": 0,
-                    "max_records": None,
-                },
-                {
-                    "name": "philosophy_domain_corpus",
-                    "path": "data/domain/philosophy_corpus.txt",
-                    "paths": [],
-                    "split": "train",
-                    "format": "text",
-                    "dataset_name": None,
-                    "dataset_config_name": None,
-                    "dataset_revision": None,
-                    "streaming": False,
-                    "weight": 1.0,
-                    "text_field": "text",
-                    "messages_field": "messages",
-                    "prompt_field": "prompt",
-                    "response_field": "response",
-                    "chosen_field": "chosen",
-                    "rejected_field": "rejected",
-                    "metadata_fields": [],
-                    "language": "en",
-                    "quality_filter": False,
-                    "deduplicate": False,
-                    "pii_scrub": False,
-                    "skip_records": 0,
-                    "max_records": None,
-                },
-                {
-                    "name": "catalog_domain_corpus",
-                    "path": "data/domain/catalog_corpus.txt",
-                    "paths": [],
-                    "split": "train",
-                    "format": "text",
-                    "dataset_name": None,
-                    "dataset_config_name": None,
-                    "dataset_revision": None,
-                    "streaming": False,
-                    "weight": 1.0,
-                    "text_field": "text",
-                    "messages_field": "messages",
-                    "prompt_field": "prompt",
-                    "response_field": "response",
-                    "chosen_field": "chosen",
-                    "rejected_field": "rejected",
-                    "metadata_fields": [],
-                    "language": "en",
-                    "quality_filter": False,
-                    "deduplicate": False,
-                    "pii_scrub": False,
-                    "skip_records": 0,
-                    "max_records": None,
-                }
-            ],
+            "continued_pretraining_token_budget": 0,
+            "continued_pretrain_sources": [],
             "sft_sources": [
                 {
                     "name": "public_sft_seed",
@@ -899,27 +836,50 @@ def _write_default_configs(output_dir: str) -> None:
             "tokenizer_path": "artifacts/tokenizer/webbgpt-local-mvp.model",
             "sequence_length": 512,
             "prepared_shard_size": 1024,
-            "pretraining_token_budget": 200_000_000,
-            "continued_pretraining_token_budget": 5_000_000,
+            "pretraining_token_budget": 75_000_000,
+            "continued_pretraining_token_budget": 0,
+            "min_document_chars": 320,
+            "max_document_chars": 200_000,
+            "lm_weighted_source_token_budget": 32_768,
+            "lm_max_source_token_share": 0.65,
+            "lm_max_source_repeat_rate": 0.35,
+            "pretrain_domain_realization_gate_mode": "off",
+            "pretrain_broad_source_quality_gate_mode": "warn",
+            "pretrain_broad_max_junk_score": 0.055,
+            "pretrain_broad_max_medical_body_density": 0.018,
+            "pretrain_broad_max_navigation_text_density": 0.01,
+            "pretrain_broad_max_malformed_fragment_density": 0.004,
+            "pretrain_broad_max_generic_article_formula_density": 0.015,
+            "pretrain_curated_max_product_commercial_density": 0.008,
+            "pretrain_curated_max_dictionary_fragment_density": 0.006,
+            "pretrain_curated_max_page_boilerplate_density": 0.006,
             "pretrain_sources": [
-                _local_text_source(
-                    "local_mvp_pretrain_corpus",
-                    "data/raw/tokenizer_corpus_local_mvp.txt",
-                    skip_records=4096,
-                )
+                {
+                    **_local_text_source(
+                        "local_mvp_pretrain_corpus",
+                        "data/raw/tokenizer_corpus_local_mvp.txt",
+                        skip_records=4096,
+                    ),
+                    "family": "curated_real_local_prose",
+                    "weight": 0.55,
+                    "quality_filter": True,
+                    "quality_filter_mode": "curated_lm",
+                    "deduplicate": True,
+                },
+                {
+                    **_local_text_source(
+                        "fineweb_extension_corpus",
+                        "data/raw/tokenizer_corpus.txt",
+                        skip_records=41668,
+                    ),
+                    "family": "curated_real_fineweb_prose",
+                    "weight": 0.45,
+                    "quality_filter": True,
+                    "quality_filter_mode": "curated_lm",
+                    "deduplicate": True,
+                },
             ],
-            "continued_pretrain_sources": [
-                _local_text_source(
-                    "local_mvp_continue_domain_mix",
-                    "data/domain/local_mvp_continue_corpus.txt",
-                ),
-                _local_text_source(
-                    "local_mvp_general_refresh",
-                    "data/raw/tokenizer_corpus_local_mvp.txt",
-                    skip_records=8192,
-                    max_records=4096,
-                ),
-            ],
+            "continued_pretrain_sources": [],
             "sft_sources": [
                 _local_jsonl_source("local_sft_examples", "data/local/sft.jsonl"),
                 _local_jsonl_source("public_sft_seed", "data/posttrain/sft_public_seed.jsonl"),
@@ -953,11 +913,17 @@ def _write_default_configs(output_dir: str) -> None:
                 ),
             ],
             "validation_sources": [
-                _local_text_source(
-                    "local_mvp_validation_corpus",
-                    "data/raw/tokenizer_corpus_local_mvp.txt",
-                    max_records=4096,
-                )
+                {
+                    **_local_text_source(
+                        "local_mvp_curated_validation_corpus",
+                        "data/raw/tokenizer_corpus_local_mvp.txt",
+                        max_records=4096,
+                    ),
+                    "family": "curated_real_validation_prose",
+                    "quality_filter": True,
+                    "quality_filter_mode": "curated_lm",
+                    "deduplicate": True,
+                }
             ],
         },
         base / "data-local-mvp.json",
@@ -966,47 +932,33 @@ def _write_default_configs(output_dir: str) -> None:
         {
             **TrainConfig(
                 run_name="webbgpt-local-mvp",
-                global_batch_size=16,
+                global_batch_size=4,
                 micro_batch_size=1,
-                learning_rate=5e-4,
-                min_learning_rate=5e-5,
-                warmup_steps=200,
+                learning_rate=3e-4,
+                min_learning_rate=3e-5,
+                warmup_steps=1_000,
                 max_steps=20_000,
-                continued_learning_rate=1e-4,
-                continued_min_learning_rate=1e-5,
-                continued_warmup_steps=25,
-                continued_max_steps=250,
-                sft_learning_rate=3e-5,
-                sft_min_learning_rate=3e-6,
-                sft_warmup_steps=10,
-                sft_validation_min_examples=16,
-                require_explicit_sft_validation=True,
-                sft_max_epochs=5,
-                sft_evals_per_epoch=4,
-                sft_min_eval_interval_steps=25,
-                sft_early_stopping_patience_evals=2,
-                sft_best_min_delta=0.02,
-                sft_max_steps=200,
-                sft_sample_every_steps=100,
-                dpo_learning_rate=2.5e-5,
-                dpo_min_learning_rate=2.5e-6,
-                dpo_warmup_steps=10,
-                dpo_validation_min_examples=16,
-                require_explicit_dpo_validation=True,
-                dpo_evals_per_epoch=4,
-                dpo_early_stopping_patience_evals=2,
-                dpo_best_min_delta=0.005,
-                dpo_enable_lm_health_eval=True,
-                dpo_max_steps=200,
-                allow_weak_posttrain_validation=False,
                 posttrain_top_k_checkpoints=3,
                 log_every_steps=10,
                 eval_every_steps=200,
-                num_eval_batches=8,
+                num_eval_batches=64,
+                final_eval_full_validation=True,
+                final_num_eval_batches=None,
+                pretrain_probe_path="data/eval/pretrain_general_regression.jsonl",
+                pretrain_family_holdouts_path="data/eval/pretrain_family_holdouts_general.json",
+                log_batch_provenance_extremes=True,
+                severe_low_loss_threshold=0.05,
+                suspicious_low_loss_threshold=0.1,
+                broad_low_loss_threshold=0.5,
+                low_loss_probe_threshold=0.5,
+                high_loss_probe_threshold=None,
                 compile_model=False,
                 use_bf16=False,
                 gradient_accumulation_steps=4,
                 activation_checkpointing=False,
+                pretrain_progress_mode="prepared_tokens",
+                pretrain_stop_mode="one_prepared_pass",
+                pretrain_flush_final_partial_accumulation=True,
             ).to_dict(),
             "checkpoint": {
                 "output_dir": "artifacts/runs/local-mvp/checkpoints/pretrain",
@@ -1028,7 +980,7 @@ def _write_default_configs(output_dir: str) -> None:
                 intermediate_size=11008,
                 num_hidden_layers=32,
                 num_attention_heads=32,
-                num_key_value_heads=8,
+                num_key_value_heads=32,
                 max_position_embeddings=4096,
                 use_flash_attention=True,
                 gradient_checkpointing=True,
@@ -1043,7 +995,7 @@ def _write_default_configs(output_dir: str) -> None:
             "sequence_length": 4096,
             "prepared_shard_size": 1024,
             "pretraining_token_budget": 200_000_000_000,
-            "continued_pretraining_token_budget": 20_000_000_000,
+            "continued_pretraining_token_budget": 0,
             "pretrain_sources": [
                 _hf_text_source(
                     "fineweb_edu_pretrain",
@@ -1052,12 +1004,7 @@ def _write_default_configs(output_dir: str) -> None:
                     skip_records=4096,
                 )
             ],
-            "continued_pretrain_sources": [
-                _local_text_source("education_domain_corpus", "data/domain/education_corpus.txt"),
-                _local_text_source("advising_domain_corpus", "data/domain/advising_corpus.txt"),
-                _local_text_source("philosophy_domain_corpus", "data/domain/philosophy_corpus.txt"),
-                _local_text_source("catalog_domain_corpus", "data/domain/catalog_corpus.txt"),
-            ],
+            "continued_pretrain_sources": [],
             "sft_sources": [
                 _local_jsonl_source("public_sft_seed", "data/posttrain/sft_public_seed.jsonl"),
                 _local_jsonl_source("domain_sft_seed", "data/posttrain/sft_domain_synthetic.jsonl"),
@@ -1177,21 +1124,8 @@ def _write_default_configs(output_dir: str) -> None:
                     "pii_scrub": False,
                 }
             ],
-            "continued_pretrain_sources": [
-                {
-                    "name": "local_tokenizer_corpus",
-                    "path": "data/raw/tokenizer_corpus.txt",
-                    "split": "train",
-                    "format": "text",
-                    "weight": 1.0,
-                    "text_field": "text",
-                    "metadata_fields": [],
-                    "language": "en",
-                    "quality_filter": False,
-                    "deduplicate": False,
-                    "pii_scrub": False,
-                }
-            ],
+            "continued_pretraining_token_budget": 0,
+            "continued_pretrain_sources": [],
             "sft_sources": [
                 {
                     "name": "local_sft_examples",
@@ -2287,70 +2221,6 @@ def _write_default_local_examples() -> None:
     }
     _write_seed_file(catalog_dir / "webb_catalog.json", json.dumps(catalog_payload, indent=2) + "\n")
 
-    continue_documents: list[str] = []
-    for corpus_path in (
-        domain_dir / "education_corpus.txt",
-        domain_dir / "advising_corpus.txt",
-        domain_dir / "philosophy_corpus.txt",
-        domain_dir / "catalog_corpus.txt",
-    ):
-        for line in corpus_path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            continue_documents.append(
-                "WebbGPT local-MVP domain guidance: "
-                f"{line} This text should shape a calm, grounded academic assistant that explains clearly, "
-                "states uncertainty honestly, and avoids guessing when catalog information is incomplete."
-            )
-
-    institutions = {item["id"]: item for item in catalog_payload["institutions"]}
-    programs = {item["id"]: item for item in catalog_payload["programs"]}
-    courses = {item["id"]: item for item in catalog_payload["courses"]}
-    terms = {item["id"]: item for item in catalog_payload["terms"]}
-    for program in catalog_payload["programs"]:
-        institution = institutions.get(program["institution_id"], {})
-        requirements = program.get("requirements") or {}
-        minimum_credits = requirements.get("minimum_credits")
-        continue_documents.append(
-            f"{institution.get('name', 'The institution')} offers program {program['code']}, titled {program['title']}. "
-            f"{program['description']} The program currently requires at least {minimum_credits} credits. "
-            "A grounded assistant should present program requirements as catalog facts, separate facts from advice, "
-            "and recommend checking the current catalog when a student needs term-specific confirmation."
-        )
-    for course in catalog_payload["courses"]:
-        program = programs.get(course.get("program_id"))
-        program_text = (
-            f"The course belongs to the program {program['code']} titled {program['title']}."
-            if program is not None
-            else "The course is not tied to a specific demo program entry."
-        )
-        prerequisites = course.get("prerequisites") or "No prerequisite is listed in the demo catalog."
-        level = (course.get("attributes") or {}).get("level", "unspecified")
-        continue_documents.append(
-            f"Catalog entry for {course['code']} {course['title']}: {course['description']} "
-            f"It carries {course['credits']} credits and is labeled {level}. {program_text} "
-            f"Prerequisite status: {prerequisites} A careful assistant should explain the course in plain English, "
-            "cite the catalog when using these details, and avoid inventing requirements that are not shown."
-        )
-    for section in catalog_payload["sections"]:
-        course = courses.get(section["course_id"], {})
-        term = terms.get(section["term_id"], {})
-        meeting_times = section.get("meeting_times") or {}
-        meeting_days = ", ".join(meeting_times.get("days") or [])
-        continue_documents.append(
-            f"Section data for {course.get('code', 'the course')} in term {term.get('code', 'unknown term')}: "
-            f"instructor {section['instructor']}, meeting on {meeting_days} at {meeting_times.get('time', 'unknown time')}, "
-            f"with modality {section['modality']}. The section has {section['seats_available']} available seats out of "
-            f"{section['seats_total']} total seats. A grounded assistant should treat section and seat data as term-specific "
-            "catalog facts and should not generalize live availability beyond the listed term."
-        )
-
-    _write_seed_file(
-        domain_dir / "local_mvp_continue_corpus.txt",
-        "\n".join(document.strip() for document in continue_documents if document.strip()) + "\n"
-    )
-
 
 def _completed_checkpoint_dirs(output_dir: str | Path) -> list[Path]:
     return sorted(
@@ -3247,11 +3117,9 @@ def _run_main_pipeline(
                 "local-mvp tokenizer_path must point at the tokenizer artifact produced by the configured tokenizer model_prefix."
             )
         print(
-            "WebbGPT: using local-mvp profile "
+            "WebbGPT: using local-mvp curated-real-data pretrain profile "
             f"(pretrain={data_config.pretraining_token_budget:,} tokens, "
-            f"continue={data_config.continued_pretraining_token_budget:,} tokens, "
-            f"steps={train_config.max_steps:,}/{train_config.continued_max_steps:,}/"
-            f"{train_config.sft_max_steps:,}/{train_config.dpo_max_steps:,}).",
+            f"steps={train_config.max_steps:,}; posttraining is not run by default).",
             file=sys.stderr,
             flush=True,
         )
@@ -3315,11 +3183,14 @@ def _run_main_pipeline(
         )
 
     print("WebbGPT: materializing prepared datasets.", file=sys.stderr, flush=True)
-    manifest_keys = ["validation", "pretrain", "continue", "sft", "preference"]
-    if data_config.sft_validation_sources:
-        manifest_keys.append("sft_validation")
-    if data_config.preference_validation_sources:
-        manifest_keys.append("preference_validation")
+    if profile == "local-mvp":
+        manifest_keys = ["validation", "pretrain"]
+    else:
+        manifest_keys = ["validation", "pretrain", "continue", "sft", "preference"]
+        if data_config.sft_validation_sources:
+            manifest_keys.append("sft_validation")
+        if data_config.preference_validation_sources:
+            manifest_keys.append("preference_validation")
     prepared_manifests = _materialize_profile_prepared_manifests(
         profile,
         data_config,
@@ -3351,6 +3222,14 @@ def _run_main_pipeline(
     print("WebbGPT: running pretraining stage.", file=sys.stderr, flush=True)
     run_pretraining(model_config, prepared_data_config, pretrain_config)
     pretrain_checkpoint = _latest_checkpoint_dir(pretrain_config.checkpoint.output_dir)
+    if profile == "local-mvp":
+        print(
+            "WebbGPT: local-mvp stops after curated base pretraining. "
+            "Run SFT/RAG/domain grounding explicitly after selecting a usable base checkpoint.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
 
     continued_config = _stage_train_config(
         train_config,
@@ -3496,6 +3375,7 @@ def main() -> int:
         from data.dataset import DatasetBuilder
 
         config = load_config(args.config, DataConfig)
+        _apply_data_worker_overrides(config, args)
         builder = DatasetBuilder(config)
         manifest = builder.prepare_stage(args.stage, args.output, force_rebuild=args.force_rebuild)
         print(dump_rounded_json(manifest, indent=2), flush=True)
@@ -3505,6 +3385,7 @@ def main() -> int:
         from data.dataset import DatasetBuilder
 
         config = load_config(args.config, DataConfig)
+        _apply_data_worker_overrides(config, args)
         builder = DatasetBuilder(config)
         if args.stage == "continue":
             payload = builder.assess_continue_readiness()

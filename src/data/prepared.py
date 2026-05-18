@@ -245,6 +245,89 @@ def validate_resume_state_files(state: dict[str, Any]) -> None:
             raise RuntimeError(f"Prepared-data dedupe hash chunk is missing: {raw_path}")
 
 
+def _missing_artifact_message(manifest_path: Path, raw_path: str, *, key: str) -> str:
+    return (
+        f"Prepared manifest {manifest_path} references missing shard artifact {raw_path!r} "
+        f"for {key}. Re-run with --force-rebuild or restore the shard directory."
+    )
+
+
+def _require_artifact_path(manifest_path: Path, shard: dict[str, Any], key: str) -> None:
+    raw_path = shard.get(key)
+    if not raw_path:
+        raise RuntimeError(
+            f"Prepared manifest {manifest_path} has a shard missing required artifact field {key!r}. "
+            "Re-run with --force-rebuild or restore the shard directory."
+        )
+    if not Path(raw_path).exists():
+        raise RuntimeError(_missing_artifact_message(manifest_path, str(raw_path), key=key))
+
+
+def _check_optional_artifact_path(manifest_path: Path, shard: dict[str, Any], key: str) -> None:
+    raw_path = shard.get(key)
+    if raw_path and not Path(raw_path).exists():
+        raise RuntimeError(_missing_artifact_message(manifest_path, str(raw_path), key=key))
+
+
+def validate_prepared_manifest_artifacts(
+    manifest_path: str | Path,
+    *,
+    expected_kind: str | None = None,
+) -> dict[str, Any]:
+    path = Path(manifest_path)
+    if not path.exists():
+        raise RuntimeError(
+            f"Prepared manifest {path} does not exist. "
+            "Re-run prepare-data or restore the prepared manifest and shard directory."
+        )
+    manifest = load_prepared_manifest(path)
+    kind = manifest.get("kind")
+    if expected_kind is not None and kind != expected_kind:
+        raise RuntimeError(
+            f"Prepared manifest {path} has kind {kind!r}, expected {expected_kind!r}."
+        )
+    shards = manifest.get("shards")
+    if not isinstance(shards, list) or not shards:
+        raise RuntimeError(
+            f"Prepared manifest {path} has no shard entries. "
+            "Re-run with --force-rebuild or restore the shard directory."
+        )
+
+    total_rows = 0
+    for index, shard in enumerate(shards):
+        if not isinstance(shard, dict):
+            raise RuntimeError(f"Prepared manifest {path} has invalid shard entry at index {index}.")
+        rows = int(shard.get("rows", 0) or 0)
+        if rows <= 0:
+            raise RuntimeError(
+                f"Prepared manifest {path} has shard {index} with non-positive rows={rows}. "
+                "Re-run with --force-rebuild or restore the shard directory."
+            )
+        total_rows += rows
+        if kind == "packed_lm":
+            _require_artifact_path(path, shard, "path")
+            _check_optional_artifact_path(path, shard, "metadata_path")
+        elif kind == "sft":
+            _require_artifact_path(path, shard, "input_ids_path")
+            _require_artifact_path(path, shard, "labels_path")
+            _check_optional_artifact_path(path, shard, "metadata_path")
+        elif kind == "preference":
+            _require_artifact_path(path, shard, "chosen_input_ids_path")
+            _require_artifact_path(path, shard, "rejected_input_ids_path")
+            _check_optional_artifact_path(path, shard, "metadata_path")
+        else:
+            raise RuntimeError(f"Prepared manifest {path} has unsupported kind {kind!r}.")
+
+    if kind == "packed_lm" and manifest.get("num_sequences") is not None:
+        expected_rows = int(manifest.get("num_sequences", 0))
+        if expected_rows != total_rows:
+            raise RuntimeError(
+                f"Prepared manifest {path} has num_sequences={expected_rows}, "
+                f"but shard rows sum to {total_rows}. Re-run with --force-rebuild or restore the shard directory."
+            )
+    return manifest
+
+
 def prepared_manifest_trust_flags(manifest: dict[str, Any]) -> list[str]:
     version = str(manifest.get("version", "1.0"))
     kind = manifest.get("kind")
@@ -670,7 +753,7 @@ def write_preference_artifacts(
 class _PreparedDatasetBase:
     def __init__(self, manifest_path: str | Path):
         self.manifest_path = str(manifest_path)
-        self.manifest = load_prepared_manifest(manifest_path)
+        self.manifest = validate_prepared_manifest_artifacts(manifest_path)
         self.trust_flags = prepared_manifest_trust_flags(self.manifest)
         self.artifact_status = derive_artifact_status(self.trust_flags)
         self.sequence_length = int(self.manifest["sequence_length"])
@@ -719,6 +802,7 @@ class PreparedPackedDataset(_PreparedDatasetBase):
         shard_index, row_index = self._resolve_index(index)
         sequence = torch.tensor(self._array(shard_index)[row_index], dtype=torch.long)
         attention_mask = (sequence != self.pad_token_id).long()
+        approximate_token_count = int(attention_mask.sum().item())
         labels = sequence.clone()
         labels[attention_mask == 0] = -100
         metadata = {}
@@ -736,6 +820,7 @@ class PreparedPackedDataset(_PreparedDatasetBase):
                     "source_names": list(metadata.get("source_names", [])),
                     "contributors": list(metadata.get("contributors", [])),
                     "packed_document_count": int(metadata.get("packed_document_count", 0)),
+                    "approximate_token_count": approximate_token_count,
                 },
                 sort_keys=True,
             ),

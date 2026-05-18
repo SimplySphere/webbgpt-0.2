@@ -5,6 +5,7 @@ import json
 import math
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,7 @@ from train.console import dump_rounded_json
 from train.distributed import barrier, is_main_process
 
 MAX_NONFINITE_EVENT_SAMPLES = 8
+LOW_LOSS_TIER_ORDER = ("severe", "suspicious", "broad")
 
 
 def _require_torch():
@@ -49,6 +51,112 @@ class TrainState:
     final_partial_accumulation_flushed: bool = False
     final_partial_microbatches: int = 0
     dataloader_passes_completed: int = 0
+    low_loss_event_count: int = 0
+    low_loss_event_steps: set[int] = field(default_factory=set)
+    low_loss_events_by_tier: dict[str, int] = field(default_factory=dict)
+    low_loss_events_by_source: dict[str, int] = field(default_factory=dict)
+    low_loss_events_by_source_by_tier: dict[str, dict[str, int]] = field(default_factory=dict)
+    low_loss_events_by_contributor: dict[str, int] = field(default_factory=dict)
+    min_low_loss_event: dict[str, Any] | None = None
+    min_low_loss_event_by_tier: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+def low_loss_summary_from_state(state: TrainState, *, top_k: int = 10) -> dict[str, Any]:
+    raw_source_counts = getattr(state, "low_loss_events_by_source", {}) or {}
+    source_counts = dict(sorted(dict(raw_source_counts).items()))
+    raw_tier_counts = getattr(state, "low_loss_events_by_tier", {}) or {}
+    tier_counts = {
+        tier: int(raw_tier_counts.get(tier, 0))
+        for tier in LOW_LOSS_TIER_ORDER
+        if int(raw_tier_counts.get(tier, 0)) > 0
+    }
+    raw_source_counts_by_tier = getattr(state, "low_loss_events_by_source_by_tier", {}) or {}
+    source_counts_by_tier = {
+        source: {
+            tier: int(tier_counts.get(tier, 0))
+            for tier in LOW_LOSS_TIER_ORDER
+            if int(tier_counts.get(tier, 0)) > 0
+        }
+        for source, tier_counts in sorted(dict(raw_source_counts_by_tier).items())
+        if isinstance(tier_counts, dict)
+    }
+    raw_contributor_counts = getattr(state, "low_loss_events_by_contributor", {}) or {}
+    low_loss_event_steps = getattr(state, "low_loss_event_steps", set()) or set()
+    top_sources = [
+        {"source": source, "count": count}
+        for source, count in sorted(
+            source_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:top_k]
+    ]
+    top_contributors: list[dict[str, Any]] = []
+    for raw_key, count in sorted(
+        dict(raw_contributor_counts).items(),
+        key=lambda item: (-item[1], item[0]),
+    )[:top_k]:
+        try:
+            contributor = json.loads(raw_key)
+        except json.JSONDecodeError:
+            contributor = {"key": raw_key}
+        if isinstance(contributor, dict):
+            top_contributors.append({**contributor, "count": int(count)})
+    return {
+        "low_loss_event_count": int(getattr(state, "low_loss_event_count", 0)),
+        "unique_low_loss_steps": len(low_loss_event_steps),
+        "low_loss_events_by_tier": tier_counts,
+        "low_loss_events_by_source": source_counts,
+        "low_loss_events_by_source_by_tier": source_counts_by_tier,
+        "min_low_loss_event": getattr(state, "min_low_loss_event", None),
+        "min_low_loss_event_by_tier": getattr(state, "min_low_loss_event_by_tier", {}),
+        "top_low_loss_sources": top_sources,
+        "top_low_loss_contributors": top_contributors,
+    }
+
+
+def _low_loss_thresholds(train_config: TrainConfig) -> dict[str, float]:
+    thresholds = {
+        "severe": train_config.severe_low_loss_threshold,
+        "suspicious": train_config.suspicious_low_loss_threshold,
+        "broad": (
+            train_config.broad_low_loss_threshold
+            if train_config.broad_low_loss_threshold is not None
+            else train_config.low_loss_probe_threshold
+        ),
+    }
+    return {
+        tier: float(value)
+        for tier, value in thresholds.items()
+        if value is not None
+    }
+
+
+def _low_loss_tier_for_value(raw_loss_value: float, thresholds: dict[str, float]) -> tuple[str, float] | None:
+    for tier in LOW_LOSS_TIER_ORDER:
+        threshold = thresholds.get(tier)
+        if threshold is not None and raw_loss_value < threshold:
+            return tier, threshold
+    return None
+
+
+def _low_loss_event_name(tier: str) -> str:
+    return f"{tier}_low_loss_batch_provenance"
+
+
+def _contributor_key(contributor: dict[str, Any]) -> str:
+    payload = {
+        "source": str(contributor.get("source") or "unknown"),
+        "family": str(contributor.get("family") or ""),
+        "document_id": str(contributor.get("document_id") or ""),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _should_emit_low_loss_event(tier: str, tier_count: int) -> bool:
+    if tier == "severe":
+        return True
+    if tier == "suspicious":
+        return tier_count <= 10 or tier_count % 100 == 0
+    return False
 
 
 @dataclass(slots=True)
@@ -99,6 +207,16 @@ def _infer_batch_size(batch: dict[str, Any]) -> int:
     return 1
 
 
+def _token_count_from_attention_mask(batch: dict[str, Any]) -> int | None:
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is not None and hasattr(attention_mask, "sum"):
+        try:
+            return int(attention_mask.sum().item())
+        except Exception:
+            return None
+    return None
+
+
 def _world_size() -> int:
     _, dist, _ = _require_torch()
     return int(dist.get_world_size()) if dist is not None and dist.is_initialized() else 1
@@ -138,35 +256,133 @@ def _model_inputs(batch: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in batch.items() if isinstance(value, torch.Tensor)}
 
 
-def _summarize_nonfinite_batch(batch: dict[str, Any], *, step: int, loss_value: float) -> dict[str, Any]:
-    attention_mask = batch.get("attention_mask")
-    tokens_in_batch = None
-    if attention_mask is not None and hasattr(attention_mask, "sum"):
-        try:
-            tokens_in_batch = int(attention_mask.sum().item())
-        except Exception:
-            tokens_in_batch = None
-    provenance_entries: list[dict[str, Any]] = []
+def _provenance_json_values(batch: dict[str, Any]) -> list[str]:
     raw_provenance = batch.get("provenance_json")
     if isinstance(raw_provenance, str):
-        raw_values = [raw_provenance]
-    elif isinstance(raw_provenance, list):
-        raw_values = [value for value in raw_provenance if isinstance(value, str)]
-    else:
-        raw_values = []
-    for raw_value in raw_values[:3]:
+        return [raw_provenance]
+    if isinstance(raw_provenance, list):
+        return [value for value in raw_provenance if isinstance(value, str)]
+    if isinstance(raw_provenance, tuple):
+        return [value for value in raw_provenance if isinstance(value, str)]
+    return []
+
+
+def _parse_batch_provenance_entries(batch: dict[str, Any], *, limit: int | None = None) -> list[dict[str, Any]]:
+    provenance_entries: list[dict[str, Any]] = []
+    raw_values = _provenance_json_values(batch)
+    selected_values = raw_values if limit is None else raw_values[:limit]
+    for raw_value in selected_values:
         try:
             parsed = json.loads(raw_value)
         except Exception:
             continue
         if isinstance(parsed, dict):
             provenance_entries.append(parsed)
-    return {
+    return provenance_entries
+
+
+def _batch_token_id_preview(batch: dict[str, Any], *, max_tokens: int = 32) -> list[int] | None:
+    input_ids = batch.get("input_ids")
+    if input_ids is None:
+        return None
+    try:
+        first_row = input_ids[0] if hasattr(input_ids, "__getitem__") else input_ids
+        if hasattr(first_row, "detach"):
+            values = first_row.detach().cpu().tolist()
+        elif hasattr(first_row, "tolist"):
+            values = first_row.tolist()
+        else:
+            values = list(first_row)
+        return [int(value) for value in values[:max_tokens]]
+    except Exception:
+        return None
+
+
+def _summarize_batch_provenance(
+    batch: dict[str, Any],
+    *,
+    step: int,
+    loss_value: float,
+    event: str,
+    threshold: float | None = None,
+    include_token_preview: bool = False,
+    provenance_limit: int | None = None,
+) -> dict[str, Any]:
+    tokens_in_batch = _token_count_from_attention_mask(batch)
+    provenance_entries = _parse_batch_provenance_entries(batch, limit=provenance_limit)
+    source_name_values = [
+        source_name
+        for entry in provenance_entries
+        for source_name in (
+            entry.get("source_names", [])
+            if isinstance(entry.get("source_names", []), list)
+            else []
+        )
+    ]
+    source_names = sorted(
+        {
+            str(source_name)
+            for source_name in source_name_values
+            if str(source_name)
+        }
+    )
+    contributors = [
+        dict(contributor)
+        for entry in provenance_entries
+        for contributor in (
+            entry.get("contributors", [])
+            if isinstance(entry.get("contributors", []), list)
+            else []
+        )
+        if isinstance(contributor, dict)
+    ]
+    packed_document_count = sum(
+        int(entry.get("packed_document_count", 0))
+        for entry in provenance_entries
+        if isinstance(entry.get("packed_document_count", 0), (int, float))
+    )
+    if packed_document_count <= 0 and contributors:
+        packed_document_count = len(contributors)
+    approximate_token_count = sum(
+        int(entry.get("approximate_token_count", 0))
+        for entry in provenance_entries
+        if isinstance(entry.get("approximate_token_count", 0), (int, float))
+    )
+    if approximate_token_count <= 0 and tokens_in_batch is not None:
+        approximate_token_count = tokens_in_batch
+    payload: dict[str, Any] = {
+        "event": event,
         "step": step,
         "loss": loss_value,
+        "threshold": threshold,
+        "source_names": source_names,
+        "contributors": contributors[:20],
+        "contributor_count": len(contributors),
+        "packed_document_count": packed_document_count,
+        "approximate_token_count": approximate_token_count,
         "tokens_in_batch": tokens_in_batch,
         "examples_in_batch": _infer_batch_size(batch),
-        "provenance": provenance_entries,
+        "provenance": provenance_entries[:5],
+    }
+    if include_token_preview:
+        preview = _batch_token_id_preview(batch)
+        if preview is not None:
+            payload["token_id_preview"] = preview
+    return payload
+
+
+def _summarize_nonfinite_batch(batch: dict[str, Any], *, step: int, loss_value: float) -> dict[str, Any]:
+    summary = _summarize_batch_provenance(
+        batch,
+        step=step,
+        loss_value=loss_value,
+        event="nonfinite_loss_batch_provenance",
+        provenance_limit=3,
+    )
+    return {
+        **summary,
+        "step": step,
+        "loss": loss_value,
     }
 
 
@@ -328,6 +544,60 @@ def run_training(
             state.nonfinite_event_samples = list(
                 persisted.get("nonfinite_event_samples", state.nonfinite_event_samples)
             )
+            state.low_loss_event_count = int(
+                persisted.get("low_loss_event_count", state.low_loss_event_count)
+            )
+            state.low_loss_event_steps = {
+                int(step)
+                for step in persisted.get("low_loss_event_steps", state.low_loss_event_steps)
+            }
+            state.low_loss_events_by_tier = {
+                str(tier): int(count)
+                for tier, count in dict(
+                    persisted.get("low_loss_events_by_tier", state.low_loss_events_by_tier)
+                ).items()
+            }
+            state.low_loss_events_by_source = {
+                str(source): int(count)
+                for source, count in dict(
+                    persisted.get("low_loss_events_by_source", state.low_loss_events_by_source)
+                ).items()
+            }
+            state.low_loss_events_by_source_by_tier = {
+                str(source): {
+                    str(tier): int(count)
+                    for tier, count in dict(tier_counts).items()
+                }
+                for source, tier_counts in dict(
+                    persisted.get(
+                        "low_loss_events_by_source_by_tier",
+                        state.low_loss_events_by_source_by_tier,
+                    )
+                ).items()
+            }
+            state.low_loss_events_by_contributor = {
+                str(contributor): int(count)
+                for contributor, count in dict(
+                    persisted.get(
+                        "low_loss_events_by_contributor",
+                        state.low_loss_events_by_contributor,
+                    )
+                ).items()
+            }
+            min_low_loss_event = persisted.get("min_low_loss_event", state.min_low_loss_event)
+            state.min_low_loss_event = (
+                dict(min_low_loss_event) if isinstance(min_low_loss_event, dict) else None
+            )
+            state.min_low_loss_event_by_tier = {
+                str(tier): dict(event)
+                for tier, event in dict(
+                    persisted.get(
+                        "min_low_loss_event_by_tier",
+                        state.min_low_loss_event_by_tier,
+                    )
+                ).items()
+                if isinstance(event, dict)
+            }
     model = maybe_compile_model(model, train_config.compile_model)
 
     micro_step = 0
@@ -379,6 +649,17 @@ def run_training(
                 "final_partial_accumulation_flushed": state.final_partial_accumulation_flushed,
                 "final_partial_microbatches": state.final_partial_microbatches,
                 "dataloader_passes_completed": state.dataloader_passes_completed,
+                "low_loss_event_count": state.low_loss_event_count,
+                "low_loss_event_steps": sorted(state.low_loss_event_steps),
+                "low_loss_events_by_tier": dict(state.low_loss_events_by_tier),
+                "low_loss_events_by_source": dict(state.low_loss_events_by_source),
+                "low_loss_events_by_source_by_tier": {
+                    tier: dict(source_counts)
+                    for tier, source_counts in state.low_loss_events_by_source_by_tier.items()
+                },
+                "low_loss_events_by_contributor": dict(state.low_loss_events_by_contributor),
+                "min_low_loss_event": state.min_low_loss_event,
+                "min_low_loss_event_by_tier": dict(state.min_low_loss_event_by_tier),
             }
         }
         current_metadata = _current_checkpoint_metadata()
@@ -423,6 +704,16 @@ def run_training(
     def _write_selection_metadata(best_path: Path, payload: dict[str, Any]) -> None:
         selection_path = best_path / "selection.json"
         selection_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    def _read_selection_metadata(checkpoint_path: Path) -> dict[str, Any] | None:
+        selection_path = checkpoint_path / "selection.json"
+        if not selection_path.exists():
+            return None
+        try:
+            payload = json.loads(selection_path.read_text())
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _percent(completed: int | float | None, total: int | float | None) -> float | None:
         if completed is None or total is None:
@@ -471,6 +762,359 @@ def run_training(
             time.perf_counter() - stage_start_time,
             *_progress_counts(completed_steps),
         )
+
+    def _emit_train_payload(payload: dict[str, Any]) -> None:
+        if train_event_printer is not None:
+            train_event_printer(payload)
+        else:
+            print(dump_rounded_json(payload))
+
+    def _record_low_loss_event(payload: dict[str, Any], *, tier: str) -> int:
+        state.low_loss_event_count += 1
+        state.low_loss_event_steps.add(int(payload.get("step", state.step)))
+        tier_counts = Counter(state.low_loss_events_by_tier)
+        tier_counts.update([tier])
+        state.low_loss_events_by_tier = dict(tier_counts)
+        source_names = payload.get("source_names")
+        if isinstance(source_names, list) and source_names:
+            sources = [str(source_name) for source_name in source_names if str(source_name)]
+        else:
+            sources = ["unknown"]
+        source_counts = Counter(state.low_loss_events_by_source)
+        source_counts.update(sources)
+        state.low_loss_events_by_source = dict(source_counts)
+        source_tier_counts = {
+            str(raw_source): dict(raw_counts)
+            for raw_source, raw_counts in state.low_loss_events_by_source_by_tier.items()
+        }
+        for source in sources:
+            source_tier_counter = Counter(source_tier_counts.get(source, {}))
+            source_tier_counter.update([tier])
+            source_tier_counts[source] = dict(source_tier_counter)
+        state.low_loss_events_by_source_by_tier = source_tier_counts
+        contributor_counts = Counter(state.low_loss_events_by_contributor)
+        contributors = payload.get("contributors")
+        if isinstance(contributors, list):
+            contributor_counts.update(
+                _contributor_key(contributor)
+                for contributor in contributors
+                if isinstance(contributor, dict)
+            )
+        state.low_loss_events_by_contributor = dict(contributor_counts)
+        if (
+            state.min_low_loss_event is None
+            or float(payload.get("loss", math.inf)) < float(state.min_low_loss_event.get("loss", math.inf))
+        ):
+            state.min_low_loss_event = dict(payload)
+        min_for_tier = state.min_low_loss_event_by_tier.get(tier)
+        if (
+            min_for_tier is None
+            or float(payload.get("loss", math.inf)) < float(min_for_tier.get("loss", math.inf))
+        ):
+            state.min_low_loss_event_by_tier[tier] = dict(payload)
+        return int(state.low_loss_events_by_tier.get(tier, 0))
+
+    def _emit_low_loss_summary() -> None:
+        if not train_config.log_batch_provenance_extremes or not is_main_process():
+            return
+        _emit_train_payload(
+            {
+                "event": "low_loss_batch_provenance_summary",
+                "thresholds": _low_loss_thresholds(train_config),
+                **low_loss_summary_from_state(state),
+            }
+        )
+
+    def _maybe_log_batch_provenance_extreme(
+        batch: dict[str, Any],
+        *,
+        raw_loss_value: float,
+        micro_step_index: int,
+    ) -> None:
+        if not train_config.log_batch_provenance_extremes or not is_main_process():
+            return
+        low_thresholds = _low_loss_thresholds(train_config)
+        high_threshold = train_config.high_loss_probe_threshold
+        event = None
+        threshold: float | None = None
+        low_loss_tier = _low_loss_tier_for_value(raw_loss_value, low_thresholds)
+        if low_loss_tier is not None:
+            tier, threshold = low_loss_tier
+            event = _low_loss_event_name(tier)
+        elif high_threshold is not None and raw_loss_value >= float(high_threshold):
+            tier = None
+            event = "high_loss_batch_provenance"
+            threshold = float(high_threshold)
+        if event is None:
+            return
+        payload = _summarize_batch_provenance(
+            batch,
+            step=state.step,
+            loss_value=raw_loss_value,
+            event=event,
+            threshold=threshold,
+            include_token_preview=low_loss_tier is not None and low_loss_tier[0] == "severe",
+        )
+        payload["micro_step"] = micro_step_index
+        payload["gradient_accumulation_steps"] = train_config.gradient_accumulation_steps
+        if low_loss_tier is not None:
+            payload["tier"] = low_loss_tier[0]
+            tier_count = _record_low_loss_event(payload, tier=low_loss_tier[0])
+            if _should_emit_low_loss_event(low_loss_tier[0], tier_count):
+                _emit_train_payload(payload)
+            return
+        _emit_train_payload(payload)
+
+    def _selection_payload(
+        *,
+        step: int,
+        metrics: dict[str, Any],
+        payload: dict[str, Any],
+        metric_key: str,
+        selection_value: float,
+        previous_best_value: float | None,
+        previous_best_step: int | None,
+        initial_eval: bool,
+        final_eval: bool,
+        replacement_reason: str,
+    ) -> dict[str, Any]:
+        selection_payload = {
+            "stage": eval_control.stage_name if eval_control is not None else None,
+            "step": step,
+            "approx_epoch": _approx_epoch(step, initial_eval=initial_eval, final_eval=final_eval),
+            "train_dataset_size": eval_control.train_dataset_size if eval_control is not None else None,
+            "validation_dataset_size": eval_control.validation_dataset_size if eval_control is not None else None,
+            "train_examples_seen": state.examples_seen,
+            "validation_batches_evaluated": metrics.get("batches_evaluated"),
+            "validation_examples_evaluated": metrics.get("examples_evaluated"),
+            "eval_batches_used": payload.get("eval_batches_used"),
+            "eval_sequences_estimated": payload.get("eval_sequences_estimated"),
+            "validation_sequences_total": payload.get("validation_sequences_total"),
+            "eval_coverage_percent": payload.get("eval_coverage_percent"),
+            "eval_mode": payload.get("eval_mode"),
+            "selection_eval_mode": payload.get("eval_mode"),
+            "selection_eval_batches": payload.get("eval_batches_used"),
+            "selection_eval_coverage_percent": payload.get("eval_coverage_percent"),
+            "selected_from_interim_eval": not final_eval,
+            "final_selection_confirmed": bool(final_eval),
+            "final_eval_full_validation": payload.get("final_eval_full_validation"),
+            "final_num_eval_batches": payload.get("final_num_eval_batches"),
+            "run_mode": run_control.run_mode,
+            "progress_mode": run_control.progress_mode,
+            "prepared_token_target": run_control.prepared_token_target,
+            "prepared_sequence_target": run_control.prepared_sequence_target,
+            "prepared_token_progress_percent": state.prepared_token_progress_percent,
+            "prepared_sequence_progress_percent": state.prepared_sequence_progress_percent,
+            "scheduler_max_steps": run_control.scheduler_max_steps,
+            "metrics": metrics,
+            "selection_metric": metric_key,
+            "selection_value": selection_value,
+            "previous_best_value": previous_best_value,
+            "previous_best_step": previous_best_step,
+            "replacement_reason": replacement_reason,
+            "improvement_delta": (
+                None
+                if previous_best_value is None or math.isnan(selection_value)
+                else previous_best_value - selection_value
+            ),
+            "best_step_so_far": state.best_eval_step,
+        }
+        if payload.get("samples") is not None:
+            selection_payload["samples"] = payload.get("samples")
+        elif payload.get("qualitative_samples") is not None:
+            selection_payload["qualitative_samples"] = payload.get("qualitative_samples")
+        for key in (
+            "short_stable_samples",
+            "long_stress_samples",
+            "short_stable_quality",
+            "long_stress_quality",
+            "raw_lm_quality_gate_passed",
+            "raw_lm_quality_gate_reasons",
+            "model_quality_status",
+            "family_eval",
+            "family_eval_coverage",
+            "best_family",
+            "worst_family",
+        ):
+            if key in payload:
+                selection_payload[key] = payload[key]
+        return selection_payload
+
+    def _choose_final_selection(
+        *,
+        step: int,
+        current_metrics: dict[str, Any],
+        payload: dict[str, Any],
+        metric_key: str,
+        selection_value: float,
+        evaluator: Callable[[Any, Any, int | None], dict[str, Any]],
+    ) -> None:
+        if eval_control is None or best_checkpoint_name is None or not is_main_process():
+            return
+        if math.isnan(selection_value):
+            return
+        best_path = Path(checkpoint_manager.output_dir) / best_checkpoint_name
+        interim_selection = _read_selection_metadata(best_path) if best_path.exists() else None
+        previous_best_value = None if math.isinf(state.best_eval_loss) else state.best_eval_loss
+        previous_best_step = state.best_eval_step if state.best_eval_step >= 0 else None
+        current_candidate_name = f"candidate-final-step-{step:08d}"
+        current_candidate_path = checkpoint_manager.save_named(
+            current_candidate_name,
+            step=step,
+            model=model,
+            optimizer=None,
+            scheduler=None,
+            extra_state=_checkpoint_extra_state(),
+        )
+        interim_final_metrics = None
+        interim_final_value = math.inf
+        interim_step = (
+            int(interim_selection["step"])
+            if isinstance(interim_selection, dict) and interim_selection.get("step") is not None
+            else previous_best_step
+        )
+        can_confirm_interim = best_path.exists() and hasattr(checkpoint_manager, "load")
+        if can_confirm_interim:
+            checkpoint_manager.load(str(best_path), model, strict=True)
+            interim_final_metrics = evaluator(model, val_loader, payload.get("final_num_eval_batches"))
+            interim_final_value = float(interim_final_metrics.get(metric_key, math.nan))
+            if math.isnan(interim_final_value):
+                interim_final_value = math.inf
+            checkpoint_manager.load(str(current_candidate_path), model, strict=True)
+
+        choose_interim = interim_final_value <= selection_value
+        if choose_interim and interim_final_metrics is not None and interim_step is not None:
+            state.best_eval_loss = interim_final_value
+            state.best_eval_step = int(interim_step)
+            final_selection_payload = dict(interim_selection or {})
+            final_selection_payload.update(
+                {
+                    "stage": eval_control.stage_name,
+                    "step": int(interim_step),
+                    "selection_metric": metric_key,
+                    "selection_value": interim_final_value,
+                    "metrics": interim_final_metrics,
+                    "selection_eval_mode": payload.get("eval_mode"),
+                    "selection_eval_batches": payload.get("eval_batches_used"),
+                    "selection_eval_coverage_percent": payload.get("eval_coverage_percent"),
+                    "eval_mode": payload.get("eval_mode"),
+                    "eval_batches_used": payload.get("eval_batches_used"),
+                    "eval_sequences_estimated": payload.get("eval_sequences_estimated"),
+                    "validation_sequences_total": payload.get("validation_sequences_total"),
+                    "eval_coverage_percent": payload.get("eval_coverage_percent"),
+                    "selected_from_interim_eval": True,
+                    "final_selection_confirmed": True,
+                    "selected_checkpoint_path": str(best_path),
+                    "replacement_reason": "interim checkpoint confirmed by final selection eval",
+                    "best_step_so_far": state.best_eval_step,
+                    "best_interim_checkpoint": {
+                        "path": str(best_path),
+                        "step": int(interim_step),
+                        "interim_selection_value": (
+                            None if interim_selection is None else interim_selection.get("selection_value")
+                        ),
+                        "interim_eval_mode": (
+                            None if interim_selection is None else interim_selection.get("selection_eval_mode")
+                        ),
+                        "final_metrics": interim_final_metrics,
+                    },
+                    "final_checkpoint": {
+                        "path": str(current_candidate_path),
+                        "step": step,
+                        "final_metrics": current_metrics,
+                        "selection_value": selection_value,
+                    },
+                    "best_final_eval_confirmed_checkpoint": {
+                        "path": str(best_path),
+                        "step": int(interim_step),
+                        "metrics": interim_final_metrics,
+                    },
+                    "compared_checkpoints": [
+                        {
+                            "kind": "best_interim_checkpoint",
+                            "path": str(best_path),
+                            "step": int(interim_step),
+                            "metrics": interim_final_metrics,
+                        },
+                        {
+                            "kind": "final_checkpoint",
+                            "path": str(current_candidate_path),
+                            "step": step,
+                            "metrics": current_metrics,
+                        },
+                    ],
+                }
+            )
+            _write_selection_metadata(best_path, final_selection_payload)
+            checkpoint_manager.load(str(current_candidate_path), model, strict=True)
+            return
+
+        state.best_eval_loss = selection_value
+        state.best_eval_step = step
+        final_selection_payload = _selection_payload(
+            step=step,
+            metrics=current_metrics,
+            payload=payload,
+            metric_key=metric_key,
+            selection_value=selection_value,
+            previous_best_value=previous_best_value,
+            previous_best_step=previous_best_step,
+            initial_eval=False,
+            final_eval=True,
+            replacement_reason="final checkpoint selected by final selection eval",
+        )
+        final_selection_payload.update(
+            {
+                "selected_from_interim_eval": False,
+                "final_selection_confirmed": True,
+                "selected_checkpoint_path": str(best_path),
+                "best_interim_checkpoint": {
+                    "path": str(best_path) if interim_selection is not None else None,
+                    "step": interim_step,
+                    "interim_selection_value": (
+                        None if interim_selection is None else interim_selection.get("selection_value")
+                    ),
+                    "interim_eval_mode": (
+                        None if interim_selection is None else interim_selection.get("selection_eval_mode")
+                    ),
+                    "final_metrics": interim_final_metrics,
+                },
+                "final_checkpoint": {
+                    "path": str(current_candidate_path),
+                    "step": step,
+                    "final_metrics": current_metrics,
+                    "selection_value": selection_value,
+                },
+                "best_final_eval_confirmed_checkpoint": {
+                    "path": str(best_path),
+                    "step": step,
+                    "metrics": current_metrics,
+                },
+                "compared_checkpoints": [
+                    {
+                        "kind": "best_interim_checkpoint",
+                        "path": str(best_path) if interim_selection is not None else None,
+                        "step": interim_step,
+                        "metrics": interim_final_metrics,
+                    },
+                    {
+                        "kind": "final_checkpoint",
+                        "path": str(current_candidate_path),
+                        "step": step,
+                        "metrics": current_metrics,
+                    },
+                ],
+            }
+        )
+        best_path = checkpoint_manager.save_named(
+            best_checkpoint_name,
+            step=step,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            extra_state=_checkpoint_extra_state(),
+        )
+        _write_selection_metadata(best_path, final_selection_payload)
 
     def _run_eval(step: int, *, final_eval: bool, initial_eval: bool = False) -> None:
         nonlocal last_eval_step, last_eval_value, no_improvement_evals, worsening_evals, should_stop_training
@@ -537,11 +1181,12 @@ def run_training(
         selection_value = float(metrics.get(metric_key, math.nan))
         previous_best_value = None if math.isinf(state.best_eval_loss) else state.best_eval_loss
         previous_best_step = state.best_eval_step if state.best_eval_step >= 0 else None
-        if improved:
+        final_selection_pending = final_eval and eval_control is not None and best_checkpoint_name is not None
+        if improved and not final_selection_pending:
             state.best_eval_loss = selection_value
             state.best_eval_step = step
             no_improvement_evals = 0
-        elif not math.isnan(selection_value):
+        elif not math.isnan(selection_value) and not final_selection_pending:
             no_improvement_evals += 1
         if (
             not math.isnan(last_eval_value)
@@ -571,65 +1216,37 @@ def run_training(
             else:
                 print(dump_rounded_json(payload))
         _append_eval_history(payload)
+        if final_eval and eval_control is not None and best_checkpoint_name is not None:
+            _choose_final_selection(
+                step=step,
+                current_metrics=metrics,
+                payload=payload,
+                metric_key=metric_key,
+                selection_value=selection_value,
+                evaluator=evaluator,
+            )
+            last_eval_step = step
+            return
         best_path = None
         if improved:
             best_path = _save_best_checkpoint(step)
             if best_path is not None and eval_control is not None and is_main_process():
-                selection_payload = {
-                    "stage": eval_control.stage_name,
-                    "step": step,
-                    "approx_epoch": _approx_epoch(step, initial_eval=initial_eval, final_eval=final_eval),
-                    "train_dataset_size": eval_control.train_dataset_size,
-                    "validation_dataset_size": eval_control.validation_dataset_size,
-                    "train_examples_seen": state.examples_seen,
-                    "validation_batches_evaluated": metrics.get("batches_evaluated"),
-                    "validation_examples_evaluated": metrics.get("examples_evaluated"),
-                    "eval_batches_used": payload.get("eval_batches_used"),
-                    "eval_sequences_estimated": payload.get("eval_sequences_estimated"),
-                    "validation_sequences_total": payload.get("validation_sequences_total"),
-                    "eval_coverage_percent": payload.get("eval_coverage_percent"),
-                    "eval_mode": payload.get("eval_mode"),
-                    "final_eval_full_validation": payload.get("final_eval_full_validation"),
-                    "final_num_eval_batches": payload.get("final_num_eval_batches"),
-                    "run_mode": run_control.run_mode,
-                    "progress_mode": run_control.progress_mode,
-                    "prepared_token_target": run_control.prepared_token_target,
-                    "prepared_sequence_target": run_control.prepared_sequence_target,
-                    "prepared_token_progress_percent": state.prepared_token_progress_percent,
-                    "prepared_sequence_progress_percent": state.prepared_sequence_progress_percent,
-                    "scheduler_max_steps": run_control.scheduler_max_steps,
-                    "metrics": metrics,
-                    "selection_metric": metric_key,
-                    "selection_value": selection_value,
-                    "previous_best_value": previous_best_value,
-                    "previous_best_step": previous_best_step,
-                    "replacement_reason": (
+                selection_payload = _selection_payload(
+                    step=step,
+                    metrics=metrics,
+                    payload=payload,
+                    metric_key=metric_key,
+                    selection_value=selection_value,
+                    previous_best_value=previous_best_value,
+                    previous_best_step=previous_best_step,
+                    initial_eval=initial_eval,
+                    final_eval=final_eval,
+                    replacement_reason=(
                         "new best validation metric"
                         if previous_best_value is not None
                         else "first best validation checkpoint"
                     ),
-                    "improvement_delta": (
-                        None
-                        if previous_best_value is None or math.isnan(selection_value)
-                        else previous_best_value - selection_value
-                    ),
-                    "best_step_so_far": state.best_eval_step,
-                }
-                if payload.get("samples") is not None:
-                    selection_payload["samples"] = payload.get("samples")
-                elif payload.get("qualitative_samples") is not None:
-                    selection_payload["qualitative_samples"] = payload.get("qualitative_samples")
-                for key in (
-                    "short_stable_samples",
-                    "long_stress_samples",
-                    "short_stable_quality",
-                    "long_stress_quality",
-                    "raw_lm_quality_gate_passed",
-                    "raw_lm_quality_gate_reasons",
-                    "model_quality_status",
-                ):
-                    if key in payload:
-                        selection_payload[key] = payload[key]
+                )
                 _write_selection_metadata(best_path, selection_payload)
                 candidate_name = f"candidate-step-{step:08d}"
                 candidate_path = checkpoint_manager.save_named(
@@ -762,10 +1379,7 @@ def run_training(
                 payload["final_partial_accumulation_flushed"] = True
                 payload["final_partial_microbatches"] = final_partial_microbatches
             payload.update(_progress_metadata())
-            if train_event_printer is not None:
-                train_event_printer(payload)
-            else:
-                print(dump_rounded_json(payload))
+            _emit_train_payload(payload)
 
         if _should_run_scheduled_eval(state.step):
             _run_eval(state.step, final_eval=False)
@@ -823,6 +1437,11 @@ def run_training(
                         flush=True,
                     )
                 continue
+            _maybe_log_batch_provenance_extreme(
+                batch,
+                raw_loss_value=raw_loss_value,
+                micro_step_index=micro_step,
+            )
             loss = raw_loss / train_config.gradient_accumulation_steps
             loss.backward()
             tokens_this_batch = int(batch["attention_mask"].sum().item())
@@ -883,4 +1502,5 @@ def run_training(
             )
         barrier()
     _refresh_prepared_progress()
+    _emit_low_loss_summary()
     return state

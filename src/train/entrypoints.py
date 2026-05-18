@@ -8,7 +8,7 @@ from typing import Any
 
 from config import DataConfig, ModelConfig, TrainConfig, save_config
 from data.dataset import DatasetBuilder
-from data.prepared import PreparedPackedDataset
+from data.prepared import PreparedPackedDataset, validate_prepared_manifest_artifacts
 from model.transformer import CausalTransformer
 from posttrain.eval import (
     PRETRAIN_QUALITATIVE_RUBRIC,
@@ -22,7 +22,15 @@ from repro import seed_everything
 from train.checkpoint import CheckpointManager
 from train.console import print_lm_eval_event, print_lm_train_event, simplify_samples
 from train.distributed import cleanup_distributed, init_distributed, is_main_process, maybe_wrap_fsdp
-from train.loop import EvalControl, TrainingRunControl, build_dataloader, run_training, save_run_metadata, save_stage_summary
+from train.loop import (
+    EvalControl,
+    TrainingRunControl,
+    build_dataloader,
+    low_loss_summary_from_state,
+    run_training,
+    save_run_metadata,
+    save_stage_summary,
+)
 from train.optim import build_optimizer, build_scheduler
 
 
@@ -33,8 +41,25 @@ def snapshot_configs(model_config: ModelConfig, data_config: DataConfig, train_c
     save_config(train_config, config_dir / "train.json")
 
 
-PRETRAIN_PROBE_PATH = "data/eval/pretrain_regression.jsonl"
+PRETRAIN_PROBE_PATH = "data/eval/pretrain_general_regression.jsonl"
 CONTINUE_PROBE_PATH = "data/eval/continue_regression.jsonl"
+
+
+def _preflight_prepared_sources(
+    data_config: DataConfig,
+    *,
+    stage_name: str,
+) -> None:
+    stage_sources = {
+        "pretrain": data_config.pretrain_sources,
+        "continue": data_config.continued_pretrain_sources,
+    }.get(stage_name, [])
+    for source in stage_sources:
+        if source.format == "prepared":
+            validate_prepared_manifest_artifacts(source.path, expected_kind="packed_lm")
+    for source in data_config.validation_sources:
+        if source.format == "prepared":
+            validate_prepared_manifest_artifacts(source.path, expected_kind="packed_lm")
 
 
 def _effective_batch_size(train_config: TrainConfig, world_size: int) -> int:
@@ -125,6 +150,7 @@ def _lm_eval_payload_callback(
     regression_path: str,
     stage_name: str,
     sequence_length: int,
+    family_holdouts_path: str | None = None,
     best_family_eval: dict[str, Any] | None = None,
     best_raw_lm_quality: dict[str, Any] | None = None,
     train_config: TrainConfig | None = None,
@@ -187,8 +213,10 @@ def _lm_eval_payload_callback(
                 model,
                 tokenizer_path,
                 sequence_length=sequence_length,
+                holdouts_path=family_holdouts_path or "data/eval/pretrain_family_holdouts_general.json",
             )
             payload["family_eval"] = family_eval.get("families", {})
+            payload["family_eval_coverage"] = family_eval.get("coverage", {})
             payload["best_family"] = family_eval.get("best_family")
             payload["worst_family"] = family_eval.get("worst_family")
             if best_family_eval is not None and state.best_eval_step == step:
@@ -397,6 +425,9 @@ def _run_stage(
                     regression_path=regression_path,
                     stage_name=stage_name,
                     sequence_length=data_config.sequence_length,
+                    family_holdouts_path=(
+                        train_config.pretrain_family_holdouts_path if stage_name == "pretrain" else None
+                    ),
                     best_family_eval=best_family_eval if stage_name == "pretrain" else None,
                     best_raw_lm_quality=best_raw_lm_quality if stage_name == "pretrain" else None,
                     train_config=train_config,
@@ -459,6 +490,7 @@ def _run_stage(
                 "best_eval_step": None if state.best_eval_step < 0 else state.best_eval_step,
                 "nonfinite_loss_steps": state.nonfinite_loss_steps,
                 "nonfinite_event_samples": list(state.nonfinite_event_samples),
+                **low_loss_summary_from_state(state),
                 "validation_enabled": val_loader is not None,
                 "validation_dataset_size": validation_dataset_size,
                 "interim_num_eval_batches": train_config.num_eval_batches if val_loader is not None else None,
@@ -477,7 +509,17 @@ def _run_stage(
                 "probe_path": regression_path,
             }
             if stage_name == "pretrain":
+                selection_path = Path(train_config.checkpoint.output_dir) / "best-pretrain" / "selection.json"
+                selection_payload: dict[str, Any] = {}
+                if selection_path.exists():
+                    try:
+                        loaded_selection = json.loads(selection_path.read_text())
+                    except json.JSONDecodeError:
+                        loaded_selection = {}
+                    if isinstance(loaded_selection, dict):
+                        selection_payload = loaded_selection
                 summary["family_eval"] = best_family_eval.get("families", {})
+                summary["family_eval_coverage"] = best_family_eval.get("coverage", {})
                 summary["best_family"] = best_family_eval.get("best_family")
                 summary["worst_family"] = best_family_eval.get("worst_family")
                 summary["raw_lm_quality_gate_passed"] = best_raw_lm_quality.get(
@@ -495,6 +537,13 @@ def _run_stage(
                     if state.best_eval_step >= 0
                     else None
                 )
+                summary["selection_eval_mode"] = selection_payload.get("selection_eval_mode")
+                summary["selection_eval_batches"] = selection_payload.get("selection_eval_batches")
+                summary["selection_eval_coverage_percent"] = selection_payload.get(
+                    "selection_eval_coverage_percent"
+                )
+                summary["selected_from_interim_eval"] = selection_payload.get("selected_from_interim_eval")
+                summary["final_selection_confirmed"] = selection_payload.get("final_selection_confirmed")
             save_stage_summary(train_config.checkpoint.output_dir, summary)
             return summary
     finally:
@@ -510,6 +559,7 @@ def _run_stage(
 def run_pretraining(
     model_config: ModelConfig, data_config: DataConfig, train_config: TrainConfig
 ) -> dict[str, object]:
+    _preflight_prepared_sources(data_config, stage_name="pretrain")
     builder = DatasetBuilder(data_config)
     dataset = builder.build_pretrain()
     validation_dataset = builder.build_validation() if data_config.validation_sources else None
@@ -523,7 +573,7 @@ def run_pretraining(
         data_config,
         stage_config,
         stage_name="pretrain",
-        regression_path=PRETRAIN_PROBE_PATH,
+        regression_path=stage_config.pretrain_probe_path or PRETRAIN_PROBE_PATH,
     )
 
 
@@ -556,6 +606,7 @@ def run_continued_pretraining(
             )
             save_stage_summary(train_config.checkpoint.output_dir, summary)
         return summary
+    _preflight_prepared_sources(data_config, stage_name="continue")
     dataset = builder.build_continued_pretrain()
     validation_dataset = builder.build_validation() if data_config.validation_sources else None
     stage_config = TrainConfig.from_dict(train_config.to_dict())

@@ -142,10 +142,10 @@ def test_run_pretraining_wires_eval_history_control(monkeypatch, tmp_path: Path)
     data_config = DataConfig(
         tokenizer_path="artifacts/tokenizer/webbgpt.model",
         pretrain_sources=[
-            DataSourceConfig(name="prepared-pretrain", path="prepared/pretrain.json", format="prepared")
+            DataSourceConfig(name="pretrain", path="data/pretrain.jsonl", format="jsonl")
         ],
         validation_sources=[
-            DataSourceConfig(name="prepared-validation", path="prepared/validation.json", format="prepared")
+            DataSourceConfig(name="validation", path="data/validation.jsonl", format="jsonl")
         ],
     )
     train_config = TrainConfig(
@@ -201,16 +201,30 @@ def test_pretrain_eval_payload_uses_raw_lm_sampler(monkeypatch):
         entrypoints,
         "evaluate_pretrain_family_holdouts",
         lambda *_args, **_kwargs: {
-            "families": {"general_clean_prose": {"loss": 1.0}},
+            "families": {
+                "general_clean_prose": {
+                    "loss": 1.0,
+                    "examples_evaluated": 100,
+                    "windows_evaluated": 100,
+                    "coverage_percent": 100.0,
+                }
+            },
             "best_family": "general_clean_prose",
             "worst_family": "general_clean_prose",
+            "coverage": {
+                "family_count": 1,
+                "total_examples_evaluated": 100,
+                "total_windows_evaluated": 100,
+                "coverage_percent": 100.0,
+                "sequence_length": 512,
+            },
         },
     )
 
     best_family_eval: dict[str, object] = {}
     callback = entrypoints._lm_eval_payload_callback(
         "tokenizer.model",
-        regression_path="data/eval/pretrain_regression.jsonl",
+        regression_path="data/eval/pretrain_general_regression.jsonl",
         stage_name="pretrain",
         sequence_length=512,
         best_family_eval=best_family_eval,
@@ -225,7 +239,7 @@ def test_pretrain_eval_payload_uses_raw_lm_sampler(monkeypatch):
     )
 
     assert captured["raw_tokenizer_path"] == "tokenizer.model"
-    assert captured["raw_calls"][0]["regression_path"] == "data/eval/pretrain_regression.jsonl"
+    assert captured["raw_calls"][0]["regression_path"] == "data/eval/pretrain_general_regression.jsonl"
     assert captured["raw_calls"][0]["limit"] is None
     assert captured["raw_calls"][0]["temperature"] == 0.4
     assert captured["raw_calls"][0]["top_p"] == 0.9
@@ -251,7 +265,10 @@ def test_pretrain_eval_payload_uses_raw_lm_sampler(monkeypatch):
     assert payload["model_quality_status"] == "weak_raw_lm"
     assert payload["qualitative_rubric"] == entrypoints.PRETRAIN_QUALITATIVE_RUBRIC
     assert payload["best_family"] == "general_clean_prose"
+    assert payload["family_eval_coverage"]["total_examples_evaluated"] == 100
+    assert payload["family_eval_coverage"]["total_windows_evaluated"] == 100
     assert best_family_eval["best_family"] == "general_clean_prose"
+    assert best_family_eval["coverage"]["sequence_length"] == 512
 
 
 def test_non_pretrain_eval_payload_keeps_chat_sampler(monkeypatch):

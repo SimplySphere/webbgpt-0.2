@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 
+MIN_PACKED_LM_NONPAD_TOKENS = 3
+
+
 class PackedSequencePacker:
     def __init__(
         self,
@@ -39,7 +42,8 @@ class PackedSequencePacker:
 
     def _finalize_window(self, window: list[int]) -> list[int] | None:
         finalized = self._padded_window(window)
-        if sum(token != self.pad_token_id for token in finalized) <= 1:
+        # Rows with only one content token plus EOS produce a single trivial loss target.
+        if sum(token != self.pad_token_id for token in finalized) < MIN_PACKED_LM_NONPAD_TOKENS:
             self.dropped_short_windows += 1
             return None
         return finalized

@@ -196,7 +196,7 @@ class DataSourceConfig:
     metadata_fields: list[str] = field(default_factory=list)
     language: str | None = None
     quality_filter: bool = True
-    quality_filter_mode: Literal["basic", "broad_lm", "domain_lm"] = "basic"
+    quality_filter_mode: Literal["basic", "broad_lm", "curated_lm", "domain_lm"] = "basic"
     deduplicate: bool = True
     pii_scrub: bool = True
     max_records: int | None = None
@@ -217,6 +217,10 @@ class DataConfig:
     sequence_length: int = 8_192
     prepared_shard_size: int = 2_048
     seed: int = 52
+    num_workers: int = 0
+    preprocessing_num_workers: int | None = None
+    tokenizer_num_workers: int | None = None
+    audit_num_workers: int = 0
     pretrain_sources: list[DataSourceConfig] = field(default_factory=list)
     continued_pretrain_sources: list[DataSourceConfig] = field(default_factory=list)
     sft_sources: list[DataSourceConfig] = field(default_factory=list)
@@ -231,7 +235,16 @@ class DataConfig:
     lm_weighted_source_token_budget: int = 32_768
     lm_max_source_token_share: float = 0.65
     lm_max_source_repeat_rate: float = 0.1
-    pretrain_domain_realization_gate_mode: Literal["warn", "fail"] = "warn"
+    pretrain_domain_realization_gate_mode: Literal["off", "informational", "warn", "fail"] = "off"
+    pretrain_broad_source_quality_gate_mode: Literal["warn", "fail"] = "warn"
+    pretrain_broad_max_junk_score: float = 0.08
+    pretrain_broad_max_medical_body_density: float = 0.03
+    pretrain_broad_max_navigation_text_density: float = 0.015
+    pretrain_broad_max_malformed_fragment_density: float = 0.005
+    pretrain_broad_max_generic_article_formula_density: float = 0.02
+    pretrain_curated_max_product_commercial_density: float = 0.012
+    pretrain_curated_max_dictionary_fragment_density: float = 0.01
+    pretrain_curated_max_page_boilerplate_density: float = 0.012
     continue_readiness_min_clean_token_fraction: float = 0.8
     continue_readiness_min_documents: int = 1_500
     continue_readiness_min_source_families: int = 3
@@ -328,6 +341,14 @@ class TrainConfig:
     raw_lm_stable_top_p: float = 0.9
     raw_lm_stress_temperature: float = 0.7
     raw_lm_stress_top_p: float = 0.95
+    pretrain_probe_path: str = "data/eval/pretrain_general_regression.jsonl"
+    pretrain_family_holdouts_path: str = "data/eval/pretrain_family_holdouts_general.json"
+    log_batch_provenance_extremes: bool = False
+    severe_low_loss_threshold: float | None = 0.05
+    suspicious_low_loss_threshold: float | None = 0.1
+    broad_low_loss_threshold: float | None = None
+    low_loss_probe_threshold: float = 0.5
+    high_loss_probe_threshold: float | None = None
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95

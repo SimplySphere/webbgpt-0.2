@@ -78,6 +78,15 @@ def _load_manifest_arrays(manifest: dict) -> list[tuple[np.ndarray, ...]]:
     return outputs
 
 
+def _load_manifest_metadata(manifest: dict) -> list[str]:
+    rows: list[str] = []
+    for shard in manifest["shards"]:
+        metadata_path = shard.get("metadata_path")
+        if metadata_path:
+            rows.extend(Path(metadata_path).read_text().splitlines())
+    return rows
+
+
 def _assert_same_outputs(left: dict, right: dict) -> None:
     assert left["kind"] == right["kind"]
     assert left["input_fingerprint"] == right["input_fingerprint"]
@@ -89,6 +98,23 @@ def _assert_same_outputs(left: dict, right: dict) -> None:
         assert len(left_group) == len(right_group)
         for left_array, right_array in zip(left_group, right_group):
             assert np.array_equal(left_array, right_array)
+    assert _load_manifest_metadata(left) == _load_manifest_metadata(right)
+
+
+def _assert_same_lm_manifest_summary(left: dict, right: dict) -> None:
+    for key in (
+        "num_tokens",
+        "num_sequences",
+        "pad_token_id",
+        "eos_token_id",
+        "sequence_length",
+        "diagnostics",
+        "prepare_warnings",
+        "domain_realization_gate",
+        "corpus_quality_gate",
+        "broad_source_quality_gate",
+    ):
+        assert left.get(key) == right.get(key)
 
 
 def test_prepare_stage_reuses_completed_manifest(tmp_path: Path, tokenizer_path: str):
@@ -123,6 +149,133 @@ def test_prepare_stage_reuses_completed_manifest(tmp_path: Path, tokenizer_path:
     assert reused["input_fingerprint"] == manifest["input_fingerprint"]
     assert output_path.stat().st_mtime_ns == manifest_mtime
     assert shard_path.stat().st_mtime_ns == shard_mtime
+
+
+def test_parallel_prepare_matches_serial_preprocessing_and_tokenization(
+    tmp_path: Path,
+    tokenizer_path: str,
+):
+    text_path = _make_text_file(
+        tmp_path / "docs.txt",
+        [
+            "WebbGPT helps students think through course planning and requirements with clear grounded prose.",
+            "tiny",
+            "Course catalogs describe prerequisites, credits, scheduling expectations, and careful advising choices.",
+            "WebbGPT helps students think through course planning and requirements with clear grounded prose.",
+            "Academic advising conversations should stay clear, grounded, understandable, and specific.",
+        ],
+    )
+    source = DataSourceConfig(
+        name="docs",
+        path=text_path,
+        format="text",
+        quality_filter=True,
+        deduplicate=True,
+        pii_scrub=False,
+    )
+    serial_config = _base_config(tokenizer_path)
+    serial_config.min_document_chars = 20
+    serial_config.pretrain_sources = [source]
+
+    parallel_config = DataConfig.from_dict(serial_config.to_dict())
+    parallel_config.num_workers = 2
+
+    serial_manifest = DatasetBuilder(serial_config).prepare_stage(
+        "pretrain",
+        str(tmp_path / "serial" / "pretrain.json"),
+        force_rebuild=True,
+    )
+    parallel_manifest = DatasetBuilder(parallel_config).prepare_stage(
+        "pretrain",
+        str(tmp_path / "parallel" / "pretrain.json"),
+        force_rebuild=True,
+    )
+
+    _assert_same_outputs(serial_manifest, parallel_manifest)
+    _assert_same_lm_manifest_summary(serial_manifest, parallel_manifest)
+    dropped = serial_manifest["diagnostics"]["per_source"][0]["dropped_reasons"]
+    assert dropped["too_short"] == 1
+    assert dropped["duplicate"] == 1
+
+
+def test_lm_worker_exception_mentions_source_and_record():
+    builder = DatasetBuilder(DataConfig())
+    source = DataSourceConfig(name="docs")
+    result = dataset_module.LMDocumentProcessResult(
+        record_index=7,
+        is_text=True,
+        error="ValueError: broken tokenization",
+    )
+
+    with pytest.raises(RuntimeError, match="source 'docs'.*raw record 7.*broken tokenization"):
+        builder._raise_lm_document_worker_error(source, result)
+
+
+def test_prepare_stage_fails_early_when_completed_manifest_references_missing_shard(
+    tmp_path: Path,
+    tokenizer_path: str,
+):
+    text_path = _make_text_file(
+        tmp_path / "docs.txt",
+        [
+            "WebbGPT helps students think through course planning and requirements.",
+            "Course catalogs describe prerequisites, credits, and scheduling expectations.",
+            "Academic advising conversations should stay clear, grounded, and understandable.",
+        ],
+    )
+    config = _base_config(tokenizer_path)
+    config.pretrain_sources = [
+        DataSourceConfig(
+            name="docs",
+            path=text_path,
+            format="text",
+            quality_filter=False,
+            deduplicate=False,
+            pii_scrub=False,
+        )
+    ]
+    builder = DatasetBuilder(config)
+    output_path = tmp_path / "pretrain.json"
+    manifest = builder.prepare_stage("pretrain", str(output_path))
+    Path(manifest["shards"][0]["path"]).unlink()
+
+    with pytest.raises(RuntimeError, match="Re-run with --force-rebuild or restore the shard directory"):
+        builder.prepare_stage("pretrain", str(output_path))
+
+
+def test_force_rebuild_discards_completed_manifest_with_missing_shard(
+    tmp_path: Path,
+    tokenizer_path: str,
+):
+    text_path = _make_text_file(
+        tmp_path / "docs.txt",
+        [
+            "WebbGPT helps students think through course planning and requirements.",
+            "Course catalogs describe prerequisites, credits, and scheduling expectations.",
+            "Academic advising conversations should stay clear, grounded, and understandable.",
+        ],
+    )
+    config = _base_config(tokenizer_path)
+    config.pretrain_sources = [
+        DataSourceConfig(
+            name="docs",
+            path=text_path,
+            format="text",
+            quality_filter=False,
+            deduplicate=False,
+            pii_scrub=False,
+        )
+    ]
+    builder = DatasetBuilder(config)
+    output_path = tmp_path / "pretrain.json"
+    manifest = builder.prepare_stage("pretrain", str(output_path))
+    missing_path = Path(manifest["shards"][0]["path"])
+    missing_path.unlink()
+
+    rebuilt = builder.prepare_stage("pretrain", str(output_path), force_rebuild=True)
+
+    assert rebuilt["kind"] == "packed_lm"
+    assert Path(rebuilt["shards"][0]["path"]).exists()
 
 
 def test_prepare_stage_treats_empty_output_file_as_fresh_target(tmp_path: Path, tokenizer_path: str):

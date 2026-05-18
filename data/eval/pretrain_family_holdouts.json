@@ -1,7 +1,0 @@
-{
-  "general_clean_prose": "data/eval/pretrain_family_general_clean_prose.txt",
-  "everyday_practical_prose": "data/eval/pretrain_family_everyday_practical_prose.txt",
-  "advising_planning_prose": "data/eval/pretrain_family_advising_planning_prose.txt",
-  "catalog_grounding_prose": "data/eval/pretrain_family_catalog_grounding_prose.txt",
-  "narrative_descriptive_prose": "data/eval/pretrain_family_narrative_descriptive_prose.txt"
-}

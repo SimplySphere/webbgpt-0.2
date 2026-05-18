@@ -7,8 +7,11 @@ import random
 import re
 import sys
 import time
+import traceback
 from collections import Counter
-from dataclasses import asdict
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,8 +38,18 @@ from data.prepared import (
     save_prepared_manifest,
     save_resume_state,
     stage_has_partial_outputs,
+    validate_prepared_manifest_artifacts,
     validate_resume_state_files,
 )
+from data.preprocess import BROAD_LM_GENERIC_ARTICLE_FORMULAE
+from data.preprocess import BROAD_LM_MALFORMED_FRAGMENT_TERMS
+from data.preprocess import BROAD_LM_MEDICAL_BODY_TERMS
+from data.preprocess import BROAD_LM_NAVIGATION_TERMS
+from data.preprocess import BROAD_LM_DICTIONARY_FRAGMENT_TERMS
+from data.preprocess import BROAD_LM_PAGE_BOILERPLATE_TERMS
+from data.preprocess import BROAD_LM_PAGE_INSTRUCTION_PHRASES
+from data.preprocess import BROAD_LM_PRODUCT_COMMERCIAL_TERMS
+from data.preprocess import DOMAIN_LM_SYNTHETIC_SCAFFOLD_PHRASES
 from data.preprocess import clean_document
 from data.schemas import DocumentRecord, PreferenceExample, SFTExample
 from tokenizer import SentencePieceTokenizer
@@ -49,15 +62,13 @@ STANDARD_PREFERENCE_METADATA_FIELDS = ("chosen_quality_tier", "negative_type")
 LOCAL_MVP_PRETRAIN_DOMAIN_FAMILIES = {
     "advising_planning_prose",
     "catalog_grounding_prose",
+    "handbook_policy_prose",
     "webb_domain_seed_prose",
 }
 LOCAL_MVP_PRETRAIN_DOMAIN_SOURCE_NAMES = {
-    "advising_expanded_corpus",
     "advising_seed",
-    "catalog_expanded_corpus",
     "catalog_seed",
     "education_seed",
-    "handbook_catalog_distinction_corpus",
     "local_mvp_domain_seed",
     "philosophy_seed",
     "webb_domain_seed_mix",
@@ -65,8 +76,21 @@ LOCAL_MVP_PRETRAIN_DOMAIN_SOURCE_NAMES = {
 }
 LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE = 0.05
 LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS = 5_000_000
+LOCAL_MVP_PRETRAIN_MIN_DOMAIN_REALIZATION_RATIO = 0.5
 LOCAL_MVP_PRETRAIN_MAX_GENERIC_SOURCE_SHARE = 0.50
 LOCAL_MVP_PRETRAIN_REPEATED_PHRASE_WARN_COUNT = 100
+LOCAL_MVP_PRETRAIN_MAX_REPEATED_4GRAM_COUNT = 8_000
+LOCAL_MVP_PRETRAIN_MAX_REPEATED_8GRAM_COUNT = 4_000
+LOCAL_MVP_PRETRAIN_MAX_REPEATED_12GRAM_COUNT = 2_500
+LOCAL_MVP_PRETRAIN_MAX_DOMAIN_REPEATED_20GRAM_COUNT = 500
+LOCAL_MVP_PRETRAIN_MAX_NEAR_DUPLICATE_RATIO = 0.12
+LOCAL_MVP_PRETRAIN_MAX_TEMPLATE_FAMILY_DOMINANCE_SHARE = 0.20
+LOCAL_MVP_PRETRAIN_TEMPLATE_FAMILY_DOMINANCE_MIN_DOCUMENTS = 16
+LOCAL_MVP_PRETRAIN_BROAD_SYNTHETIC_META_ALLOWED_PHRASES = {"the model", "in scenario"}
+LOCAL_MVP_PRETRAIN_NEAR_DUPLICATE_GATED_SOURCE_NAMES = {
+    "catalog_domain_template_fixture",
+    "domain_lm_large_fixture",
+}
 # The SFT planner trims overrepresented buckets globally after candidate collection.
 # Targets are row-share goals first; label-token shares are diagnostics unless a bucket's
 # token share drifts badly enough to surface in review.
@@ -108,22 +132,67 @@ PROMOTABLE_DPO_NEGATIVE_TYPES = {
     "generic_greeting",
     "missing_verification",
 }
+BROAD_LM_PAGE_ARTIFACT_TERMS = (
+    *BROAD_LM_PAGE_BOILERPLATE_TERMS,
+    *BROAD_LM_PAGE_INSTRUCTION_PHRASES,
+)
 LM_JUNK_PATTERNS: dict[str, re.Pattern[str]] = {
     "excessive_hyphen_fragments": re.compile(
         r"(?:\b[A-Za-z]{1,6}-){2,}[A-Za-z]{1,10}\b|-[A-Za-z]{1,4}-|"
-        r"\b(?:Newth|F-the-s|based-in|in-in|to-in)\b"
+        rf"\b(?:{'|'.join(re.escape(term) for term in BROAD_LM_MALFORMED_FRAGMENT_TERMS)})\b",
+        re.IGNORECASE,
     ),
     "broken_quote_fragments": re.compile(r"(?:[\"'“”‘’]\s*){3,}|(?:\b[a-zA-Z]\s+[\"'“”‘’]\s*){2,}"),
-    "navigation_like_text": re.compile(r"\b(?:home|menu|search|subscribe|cookie|privacy policy)\b", re.IGNORECASE),
+    "navigation_like_text": re.compile(
+        rf"\b(?:{'|'.join(re.escape(term) for term in BROAD_LM_NAVIGATION_TERMS)})\b",
+        re.IGNORECASE,
+    ),
     "generic_article_formula": re.compile(
-        r"\b(?:the most important|in the same time|the first step|the process)\b",
+        rf"\b(?:{'|'.join(re.escape(term) for term in BROAD_LM_GENERIC_ARTICLE_FORMULAE)})\b",
         re.IGNORECASE,
     ),
     "medical_body_health": re.compile(
-        r"\b(?:blood|body|child|children|diabetes|diet|doctor|food|health|medical|pain|symptoms)\b",
+        rf"\b(?:{'|'.join(re.escape(term) for term in BROAD_LM_MEDICAL_BODY_TERMS)})\b",
+        re.IGNORECASE,
+    ),
+    "product_commercial": re.compile(
+        rf"\b(?:{'|'.join(re.escape(term) for term in BROAD_LM_PRODUCT_COMMERCIAL_TERMS)})\b",
+        re.IGNORECASE,
+    ),
+    "dictionary_fragment": re.compile(
+        rf"\b(?:{'|'.join(re.escape(term) for term in BROAD_LM_DICTIONARY_FRAGMENT_TERMS)})\b",
+        re.IGNORECASE,
+    ),
+    "page_boilerplate": re.compile(
+        rf"\b(?:{'|'.join(re.escape(term) for term in BROAD_LM_PAGE_ARTIFACT_TERMS)})\b",
         re.IGNORECASE,
     ),
 }
+PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n+")
+NON_WORD_RE = re.compile(r"[^a-z\s]+")
+SENTENCE_BOUNDARY_RE = re.compile(r"[.!?]+(?:\s+|$)")
+LM_DOCUMENT_WORKER_CHUNK_SIZE = 16
+LM_DOCUMENT_WORKER_PENDING_MULTIPLIER = 2
+
+
+@dataclass(slots=True)
+class LMDocumentProcessResult:
+    record_index: int
+    is_text: bool
+    text: str = ""
+    document_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    dropped_reason: str | None = None
+    token_ids: list[int] = field(default_factory=list)
+    synthetic_meta_phrase_counts: dict[str, int] = field(default_factory=dict)
+    audit_delta: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+    traceback: str | None = None
+
+
+_LM_DOCUMENT_WORKER_CONFIG: DataConfig | None = None
+_LM_DOCUMENT_WORKER_SOURCE: DataSourceConfig | None = None
+_LM_DOCUMENT_WORKER_TOKENIZER: SentencePieceTokenizer | None = None
 
 
 def _progress(message: str) -> None:
@@ -389,6 +458,217 @@ def _top_ngram_families(text: str, *, n: int = 4, limit: int = 6) -> list[str]:
         if len(seen) >= limit:
             break
     return seen
+
+
+def _top_counter_rows(counter: Counter[str], *, limit: int = 10) -> list[dict[str, int | str]]:
+    return [
+        {"phrase": phrase, "count": int(count)}
+        for phrase, count in counter.most_common(limit)
+    ]
+
+
+def _duplicate_count(counter: Counter[str]) -> int:
+    return sum(max(int(count) - 1, 0) for count in counter.values())
+
+
+def _cluster_count(counter: Counter[str]) -> int:
+    return sum(1 for count in counter.values() if int(count) > 1)
+
+
+def _largest_cluster_size(counter: Counter[str]) -> int:
+    return max((int(count) for count in counter.values()), default=0)
+
+
+def _density(count: int, total: int) -> float:
+    return round(count / max(total, 1), 6)
+
+
+def _pattern_occurrence_count(pattern: re.Pattern[str], text: str) -> int:
+    return len(pattern.findall(text))
+
+
+def _paragraphs_for_duplicate_scan(text: str) -> list[str]:
+    paragraphs = [
+        _normalize_text(part)
+        for part in PARAGRAPH_SPLIT_RE.split(text)
+        if _normalize_text(part)
+    ]
+    return paragraphs or [_normalize_text(text)]
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _normalized_paragraph_signature(text: str) -> str:
+    normalized = text.lower()
+    normalized = re.sub(r"\d+", " ", normalized)
+    normalized = NON_WORD_RE.sub(" ", normalized)
+    normalized = _normalize_text(normalized)
+    return _hash_text(normalized) if normalized else ""
+
+
+def _update_duplicate_counters(audit_state: dict[str, Any], text: str) -> None:
+    for paragraph in _paragraphs_for_duplicate_scan(text):
+        audit_state["exact_paragraph_counter"][_hash_text(paragraph)] += 1
+        normalized_signature = _normalized_paragraph_signature(paragraph)
+        if normalized_signature:
+            audit_state["normalized_paragraph_counter"][normalized_signature] += 1
+
+
+def _update_synthetic_meta_phrase_counts(audit_state: dict[str, Any], text: str) -> None:
+    lower = text.lower()
+    for phrase in DOMAIN_LM_SYNTHETIC_SCAFFOLD_PHRASES:
+        count = lower.count(phrase)
+        if count:
+            audit_state["synthetic_meta_phrase_counter"][phrase] += count
+
+
+def _document_shape_counts(text: str) -> dict[str, int]:
+    paragraphs = _paragraphs_for_duplicate_scan(text)
+    words = _normalize_text(text).split()
+    sentences = SENTENCE_BOUNDARY_RE.findall(text)
+    return {
+        "chars": len(text),
+        "words": len(words),
+        "sentences": len(sentences),
+        "paragraphs": len(paragraphs),
+    }
+
+
+def _synthetic_meta_phrase_counts(text: str) -> dict[str, int]:
+    lower = text.lower()
+    return {
+        phrase: int(count)
+        for phrase in DOMAIN_LM_SYNTHETIC_SCAFFOLD_PHRASES
+        if (count := lower.count(phrase)) > 0
+    }
+
+
+def _lm_document_audit_delta(text: str) -> dict[str, Any]:
+    exact_paragraph_counter: Counter[str] = Counter()
+    normalized_paragraph_counter: Counter[str] = Counter()
+    for paragraph in _paragraphs_for_duplicate_scan(text):
+        exact_paragraph_counter[_hash_text(paragraph)] += 1
+        normalized_signature = _normalized_paragraph_signature(paragraph)
+        if normalized_signature:
+            normalized_paragraph_counter[normalized_signature] += 1
+
+    quality_artifact_counter: Counter[str] = Counter()
+    quality_artifact_occurrence_counter: Counter[str] = Counter()
+    for artifact_name, pattern in LM_JUNK_PATTERNS.items():
+        artifact_count = _pattern_occurrence_count(pattern, text)
+        if artifact_count > 0:
+            quality_artifact_counter[artifact_name] += 1
+            quality_artifact_occurrence_counter[artifact_name] += artifact_count
+
+    return {
+        "shape_counts": _document_shape_counts(text),
+        "quality_diagnostic_token_count": len(text.split()),
+        "phrase_counter": _top_ngram_families(text, n=4, limit=8),
+        "phrase_counter_8": _top_ngram_families(text, n=8, limit=6),
+        "phrase_counter_12": _top_ngram_families(text, n=12, limit=4),
+        "phrase_counter_20": _top_ngram_families(text, n=20, limit=3),
+        "exact_paragraph_counter": dict(exact_paragraph_counter),
+        "normalized_paragraph_counter": dict(normalized_paragraph_counter),
+        "quality_artifact_counter": dict(quality_artifact_counter),
+        "quality_artifact_occurrence_counter": dict(quality_artifact_occurrence_counter),
+    }
+
+
+def _lm_document_payload_from_item(
+    item: dict[str, Any],
+    source: DataSourceConfig,
+    record_index: int,
+) -> dict[str, Any]:
+    return {
+        "record_index": record_index,
+        "text": item.get(source.text_field, ""),
+        "metadata": {field: item.get(field) for field in source.metadata_fields},
+    }
+
+
+def _process_lm_document_payload(
+    payload: dict[str, Any],
+    data_config: DataConfig,
+    source_config: DataSourceConfig,
+    tokenizer: SentencePieceTokenizer,
+) -> LMDocumentProcessResult:
+    record_index = int(payload.get("record_index", 0))
+    raw_text = payload.get("text", "")
+    if not isinstance(raw_text, str):
+        return LMDocumentProcessResult(record_index=record_index, is_text=False)
+
+    synthetic_counts = _synthetic_meta_phrase_counts(raw_text)
+    record = DocumentRecord(
+        text=raw_text,
+        source=source_config.name,
+        metadata=dict(payload.get("metadata", {})),
+    )
+    cleaned = clean_document(record, data_config, source_config, None)
+    if cleaned.record is None:
+        return LMDocumentProcessResult(
+            record_index=record_index,
+            is_text=True,
+            dropped_reason=cleaned.dropped_reason or "dropped",
+            synthetic_meta_phrase_counts=synthetic_counts,
+        )
+
+    token_ids = tokenizer.encode(cleaned.record.text, add_bos=True, add_eos=True)
+    return LMDocumentProcessResult(
+        record_index=record_index,
+        is_text=True,
+        text=cleaned.record.text,
+        document_id=cleaned.record.document_id or "",
+        metadata=dict(cleaned.record.metadata),
+        token_ids=token_ids,
+        synthetic_meta_phrase_counts=synthetic_counts,
+        audit_delta=_lm_document_audit_delta(cleaned.record.text),
+    )
+
+
+def _init_lm_document_worker(
+    data_config_payload: dict[str, Any],
+    source_payload: dict[str, Any],
+    tokenizer_path: str,
+) -> None:
+    global _LM_DOCUMENT_WORKER_CONFIG
+    global _LM_DOCUMENT_WORKER_SOURCE
+    global _LM_DOCUMENT_WORKER_TOKENIZER
+    _LM_DOCUMENT_WORKER_CONFIG = DataConfig.from_dict(data_config_payload)
+    _LM_DOCUMENT_WORKER_SOURCE = DataSourceConfig.from_dict(source_payload)
+    _LM_DOCUMENT_WORKER_TOKENIZER = SentencePieceTokenizer(tokenizer_path)
+
+
+def _process_lm_document_chunk(payloads: list[dict[str, Any]]) -> list[LMDocumentProcessResult]:
+    if (
+        _LM_DOCUMENT_WORKER_CONFIG is None
+        or _LM_DOCUMENT_WORKER_SOURCE is None
+        or _LM_DOCUMENT_WORKER_TOKENIZER is None
+    ):
+        raise RuntimeError("LM document worker was not initialized.")
+    results: list[LMDocumentProcessResult] = []
+    for payload in payloads:
+        record_index = int(payload.get("record_index", 0))
+        try:
+            results.append(
+                _process_lm_document_payload(
+                    payload,
+                    _LM_DOCUMENT_WORKER_CONFIG,
+                    _LM_DOCUMENT_WORKER_SOURCE,
+                    _LM_DOCUMENT_WORKER_TOKENIZER,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive process boundary
+            results.append(
+                LMDocumentProcessResult(
+                    record_index=record_index,
+                    is_text=isinstance(payload.get("text", ""), str),
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
+            )
+    return results
 
 
 def _message_group_id(
@@ -694,12 +974,8 @@ class DatasetBuilder:
     def _build_prepared_dataset(self, sources: list[DataSourceConfig], expected_kind: str):
         datasets = []
         for source in sources:
-            manifest = load_prepared_manifest(source.path)
+            manifest = validate_prepared_manifest_artifacts(source.path, expected_kind=expected_kind)
             kind = manifest.get("kind")
-            if kind != expected_kind:
-                raise RuntimeError(
-                    f"Prepared source {source.path} has kind {kind!r}, expected {expected_kind!r}."
-                )
             if kind == "packed_lm":
                 datasets.append(PreparedPackedDataset(source.path))
             elif kind == "sft":
@@ -763,6 +1039,7 @@ class DatasetBuilder:
                         f"Existing prepared manifest at {manifest_path} has kind {manifest.get('kind')!r}, expected {kind!r}. "
                         "Re-run with --force-rebuild."
                     )
+                validate_prepared_manifest_artifacts(manifest_path, expected_kind=kind)
                 _progress(f"WebbGPT: reusing completed prepared stage {stage} from {manifest_path}.")
                 remove_resume_artifacts(manifest_path)
                 return "reuse", manifest
@@ -819,7 +1096,7 @@ class DatasetBuilder:
             extra={
                 "pad_token_id": pad_token_id,
                 "eos_token_id": eos_token_id,
-                "packing_version": "checkpointable-v2-short-window-guard",
+                "packing_version": "checkpointable-v3-min-3-nonpad",
             },
         )
         action, payload = self._resolve_prepare_target(
@@ -1086,8 +1363,22 @@ class DatasetBuilder:
         diagnostics["too_short_packed_sequences"] = int(packer.dropped_short_windows)
         prepare_warnings: list[str] = []
         domain_realization_gate = diagnostics.get("domain_realization_gate") if stage == "pretrain" else None
+        corpus_quality_gate = diagnostics.get("corpus_quality_gate") if stage == "pretrain" else None
+        broad_source_quality_gate = diagnostics.get("broad_source_quality_gate") if stage == "pretrain" else None
         if isinstance(domain_realization_gate, dict) and not bool(domain_realization_gate.get("passed", True)):
             message = str(domain_realization_gate.get("message", "pretrain domain realization failed"))
+            prepare_warnings.append(message)
+            _stage_progress(f"WebbGPT: {message}")
+        if isinstance(corpus_quality_gate, dict) and not bool(corpus_quality_gate.get("passed", True)):
+            message = str(corpus_quality_gate.get("message", "pretrain corpus quality gate failed"))
+            prepare_warnings.append(message)
+            _stage_progress(f"WebbGPT: {message}")
+        if isinstance(broad_source_quality_gate, dict) and not bool(
+            broad_source_quality_gate.get("passed", True)
+        ):
+            message = str(
+                broad_source_quality_gate.get("message", "pretrain broad source quality gate failed")
+            )
             prepare_warnings.append(message)
             _stage_progress(f"WebbGPT: {message}")
         manifest = {
@@ -1108,6 +1399,10 @@ class DatasetBuilder:
         }
         if isinstance(domain_realization_gate, dict):
             manifest["domain_realization_gate"] = domain_realization_gate
+        if isinstance(corpus_quality_gate, dict):
+            manifest["corpus_quality_gate"] = corpus_quality_gate
+        if isinstance(broad_source_quality_gate, dict):
+            manifest["broad_source_quality_gate"] = broad_source_quality_gate
         save_prepared_manifest(manifest_path, manifest)
         remove_resume_artifacts(manifest_path)
         _stage_progress(
@@ -1120,6 +1415,18 @@ class DatasetBuilder:
             and domain_realization_gate.get("mode") == "fail"
         ):
             raise RuntimeError(str(domain_realization_gate.get("message")))
+        if (
+            isinstance(corpus_quality_gate, dict)
+            and not bool(corpus_quality_gate.get("passed", True))
+            and corpus_quality_gate.get("mode") == "fail"
+        ):
+            raise RuntimeError(str(corpus_quality_gate.get("message")))
+        if (
+            isinstance(broad_source_quality_gate, dict)
+            and not bool(broad_source_quality_gate.get("passed", True))
+            and broad_source_quality_gate.get("mode") == "fail"
+        ):
+            raise RuntimeError(str(broad_source_quality_gate.get("message")))
         return manifest
 
     def _should_keep_sft_example(
@@ -1972,7 +2279,7 @@ class DatasetBuilder:
             + ", ".join(source.name for source in sources)
         )
         if self._uses_prepared_sources(sources):
-            manifest = load_prepared_manifest(sources[0].path)
+            manifest = validate_prepared_manifest_artifacts(sources[0].path)
             output = Path(output_path)
             output.parent.mkdir(parents=True, exist_ok=True)
             save_prepared_manifest(output, manifest)
@@ -2051,6 +2358,7 @@ class DatasetBuilder:
             "family": _source_family(source),
             "weight": float(source.weight),
             "target_share": 0.0,
+            "quality_filter_mode": source.quality_filter_mode,
             "raw_records": 0,
             "kept_documents": 0,
             "kept_tokens": 0,
@@ -2061,7 +2369,17 @@ class DatasetBuilder:
             "phrase_counter": Counter(),
             "phrase_counter_8": Counter(),
             "phrase_counter_12": Counter(),
+            "phrase_counter_20": Counter(),
+            "exact_paragraph_counter": Counter(),
+            "normalized_paragraph_counter": Counter(),
+            "synthetic_meta_phrase_counter": Counter(),
             "quality_artifact_counter": Counter(),
+            "quality_artifact_occurrence_counter": Counter(),
+            "quality_diagnostic_token_count": 0,
+            "document_char_count": 0,
+            "document_word_count": 0,
+            "document_sentence_count": 0,
+            "document_paragraph_count": 0,
         }
 
     def _serialize_lm_audit_state(self, audit_state: dict[str, Any]) -> dict[str, Any]:
@@ -2070,6 +2388,7 @@ class DatasetBuilder:
             "family": str(audit_state["family"]),
             "weight": float(audit_state["weight"]),
             "target_share": float(audit_state.get("target_share", 0.0)),
+            "quality_filter_mode": str(audit_state.get("quality_filter_mode", "basic")),
             "raw_records": int(audit_state["raw_records"]),
             "kept_documents": int(audit_state["kept_documents"]),
             "kept_tokens": int(audit_state["kept_tokens"]),
@@ -2079,7 +2398,19 @@ class DatasetBuilder:
             "phrase_counter": dict(audit_state["phrase_counter"]),
             "phrase_counter_8": dict(audit_state.get("phrase_counter_8", {})),
             "phrase_counter_12": dict(audit_state.get("phrase_counter_12", {})),
+            "phrase_counter_20": dict(audit_state.get("phrase_counter_20", {})),
+            "exact_paragraph_counter": dict(audit_state.get("exact_paragraph_counter", {})),
+            "normalized_paragraph_counter": dict(audit_state.get("normalized_paragraph_counter", {})),
+            "synthetic_meta_phrase_counter": dict(audit_state.get("synthetic_meta_phrase_counter", {})),
             "quality_artifact_counter": dict(audit_state.get("quality_artifact_counter", {})),
+            "quality_artifact_occurrence_counter": dict(
+                audit_state.get("quality_artifact_occurrence_counter", {})
+            ),
+            "quality_diagnostic_token_count": int(audit_state.get("quality_diagnostic_token_count", 0)),
+            "document_char_count": int(audit_state.get("document_char_count", 0)),
+            "document_word_count": int(audit_state.get("document_word_count", 0)),
+            "document_sentence_count": int(audit_state.get("document_sentence_count", 0)),
+            "document_paragraph_count": int(audit_state.get("document_paragraph_count", 0)),
         }
 
     def _restore_lm_audit_state(
@@ -2100,7 +2431,21 @@ class DatasetBuilder:
         audit_state["phrase_counter"] = Counter(snapshot.get("phrase_counter", {}))
         audit_state["phrase_counter_8"] = Counter(snapshot.get("phrase_counter_8", {}))
         audit_state["phrase_counter_12"] = Counter(snapshot.get("phrase_counter_12", {}))
+        audit_state["phrase_counter_20"] = Counter(snapshot.get("phrase_counter_20", {}))
+        audit_state["exact_paragraph_counter"] = Counter(snapshot.get("exact_paragraph_counter", {}))
+        audit_state["normalized_paragraph_counter"] = Counter(snapshot.get("normalized_paragraph_counter", {}))
+        audit_state["synthetic_meta_phrase_counter"] = Counter(snapshot.get("synthetic_meta_phrase_counter", {}))
         audit_state["quality_artifact_counter"] = Counter(snapshot.get("quality_artifact_counter", {}))
+        audit_state["quality_artifact_occurrence_counter"] = Counter(
+            snapshot.get("quality_artifact_occurrence_counter", {})
+        )
+        audit_state["quality_diagnostic_token_count"] = int(
+            snapshot.get("quality_diagnostic_token_count", 0)
+        )
+        audit_state["document_char_count"] = int(snapshot.get("document_char_count", 0))
+        audit_state["document_word_count"] = int(snapshot.get("document_word_count", 0))
+        audit_state["document_sentence_count"] = int(snapshot.get("document_sentence_count", 0))
+        audit_state["document_paragraph_count"] = int(snapshot.get("document_paragraph_count", 0))
         return audit_state
 
     def _realizable_lm_token_capacity(
@@ -2124,6 +2469,124 @@ class DatasetBuilder:
             max_documents = int(math.floor(unique_documents / max(1.0 - repeat_cap, 1e-8) + 1e-8))
         average_tokens = kept_tokens / max(kept_documents, 1)
         return max(kept_tokens, int(math.floor(average_tokens * max_documents + 1e-8)))
+
+    def _lm_source_report_from_audit_state(self, audit_state: dict[str, Any]) -> dict[str, Any]:
+        kept_documents = int(audit_state["kept_documents"])
+        exact_counter = Counter(audit_state.get("exact_paragraph_counter", {}))
+        normalized_counter = Counter(audit_state.get("normalized_paragraph_counter", {}))
+        near_duplicate_cluster_count = _cluster_count(normalized_counter)
+        largest_near_duplicate_cluster_size = _largest_cluster_size(normalized_counter)
+        near_duplicate_documents = sum(
+            int(count) for count in normalized_counter.values() if int(count) > 1
+        )
+        near_duplicate_ratio = near_duplicate_documents / max(kept_documents, 1)
+        phrase_counter = Counter(audit_state["phrase_counter"])
+        phrase_counter_8 = Counter(audit_state.get("phrase_counter_8", {}))
+        phrase_counter_12 = Counter(audit_state.get("phrase_counter_12", {}))
+        phrase_counter_20 = Counter(audit_state.get("phrase_counter_20", {}))
+        quality_filter_mode = str(audit_state.get("quality_filter_mode", "basic"))
+        quality_artifact_occurrences = Counter(audit_state.get("quality_artifact_occurrence_counter", {}))
+        quality_diagnostic_token_count = int(audit_state.get("quality_diagnostic_token_count", 0))
+        medical_body_density = _density(
+            int(quality_artifact_occurrences.get("medical_body_health", 0)),
+            quality_diagnostic_token_count,
+        )
+        navigation_text_density = _density(
+            int(quality_artifact_occurrences.get("navigation_like_text", 0)),
+            quality_diagnostic_token_count,
+        )
+        malformed_fragment_density = _density(
+            int(quality_artifact_occurrences.get("excessive_hyphen_fragments", 0))
+            + int(quality_artifact_occurrences.get("broken_quote_fragments", 0)),
+            quality_diagnostic_token_count,
+        )
+        generic_article_formula_density = _density(
+            int(quality_artifact_occurrences.get("generic_article_formula", 0)),
+            quality_diagnostic_token_count,
+        )
+        product_commercial_density = _density(
+            int(quality_artifact_occurrences.get("product_commercial", 0)),
+            quality_diagnostic_token_count,
+        )
+        dictionary_fragment_density = _density(
+            int(quality_artifact_occurrences.get("dictionary_fragment", 0)),
+            quality_diagnostic_token_count,
+        )
+        page_boilerplate_density = _density(
+            int(quality_artifact_occurrences.get("page_boilerplate", 0)),
+            quality_diagnostic_token_count,
+        )
+        document_word_count = int(audit_state.get("document_word_count", 0))
+        document_sentence_count = int(audit_state.get("document_sentence_count", 0))
+        document_paragraph_count = int(audit_state.get("document_paragraph_count", 0))
+        document_char_count = int(audit_state.get("document_char_count", 0))
+        broad_source_junk_score = round(
+            min(
+                1.0,
+                medical_body_density
+                + (2.0 * navigation_text_density)
+                + (4.0 * malformed_fragment_density)
+                + (2.0 * generic_article_formula_density),
+            ),
+            6,
+        )
+        return {
+            "source": str(audit_state["source"]),
+            "family": str(audit_state["family"]),
+            "weight": float(audit_state["weight"]),
+            "target_share": round(float(audit_state.get("target_share", 0.0)), 6),
+            "quality_filter_mode": quality_filter_mode,
+            "is_broad_lm_source": quality_filter_mode in {"broad_lm", "curated_lm"},
+            "raw_records": int(audit_state["raw_records"]),
+            "kept_documents": kept_documents,
+            "kept_tokens": int(audit_state["kept_tokens"]),
+            "repeated_documents": int(audit_state["repeated_documents"]),
+            "restart_count": int(audit_state.get("restart_count", 0)),
+            "repeat_rate": round(
+                int(audit_state["repeated_documents"]) / max(kept_documents, 1),
+                6,
+            ),
+            "dropped_reasons": _counter_to_sorted_dict(audit_state["dropped_reasons"]),
+            "quality_artifact_counts": _counter_to_sorted_dict(
+                Counter(audit_state.get("quality_artifact_counter", {}))
+            ),
+            "quality_artifact_occurrence_counts": _counter_to_sorted_dict(quality_artifact_occurrences),
+            "quality_diagnostic_token_count": quality_diagnostic_token_count,
+            "broad_source_junk_score": broad_source_junk_score,
+            "medical_body_density": medical_body_density,
+            "navigation_text_density": navigation_text_density,
+            "malformed_fragment_density": malformed_fragment_density,
+            "generic_article_formula_density": generic_article_formula_density,
+            "product_commercial_density": product_commercial_density,
+            "dictionary_fragment_density": dictionary_fragment_density,
+            "page_boilerplate_density": page_boilerplate_density,
+            "avg_document_chars": round(document_char_count / max(kept_documents, 1), 2),
+            "avg_document_words": round(document_word_count / max(kept_documents, 1), 2),
+            "avg_document_tokens": round(int(audit_state["kept_tokens"]) / max(kept_documents, 1), 2),
+            "avg_sentences_per_document": round(document_sentence_count / max(kept_documents, 1), 2),
+            "avg_paragraphs_per_document": round(document_paragraph_count / max(kept_documents, 1), 2),
+            "avg_sentence_words": round(document_word_count / max(document_sentence_count, 1), 2),
+            "synthetic_meta_phrase_counts": _counter_to_sorted_dict(
+                Counter(audit_state.get("synthetic_meta_phrase_counter", {}))
+            ),
+            "synthetic_meta_phrase_count": int(
+                sum(Counter(audit_state.get("synthetic_meta_phrase_counter", {})).values())
+            ),
+            "exact_paragraph_duplicate_count": int(_duplicate_count(exact_counter)),
+            "normalized_paragraph_duplicate_count": int(_duplicate_count(normalized_counter)),
+            "near_duplicate_cluster_count": int(near_duplicate_cluster_count),
+            "largest_near_duplicate_cluster_size": int(largest_near_duplicate_cluster_size),
+            "near_duplicate_ratio": round(near_duplicate_ratio, 6),
+            "near_duplicate_document_count": int(near_duplicate_documents),
+            "repeated_4gram_counts": dict(phrase_counter.most_common(10)),
+            "repeated_8gram_counts": dict(phrase_counter_8.most_common(10)),
+            "repeated_12gram_counts": dict(phrase_counter_12.most_common(10)),
+            "repeated_20gram_counts": dict(phrase_counter_20.most_common(10)),
+            "top_repeated_phrases": _top_counter_rows(phrase_counter, limit=5),
+            "top_repeated_8grams": _top_counter_rows(phrase_counter_8, limit=5),
+            "top_repeated_12grams": _top_counter_rows(phrase_counter_12, limit=5),
+            "top_repeated_20grams": _top_counter_rows(phrase_counter_20, limit=5),
+        }
 
     def _effective_target_token_allocations(
         self,
@@ -2207,6 +2670,27 @@ class DatasetBuilder:
             or family in LOCAL_MVP_PRETRAIN_DOMAIN_FAMILIES
         )
 
+    def _is_local_mvp_near_duplicate_gated_source_report(self, report: dict[str, Any]) -> bool:
+        source = str(report.get("source", ""))
+        return source in LOCAL_MVP_PRETRAIN_NEAR_DUPLICATE_GATED_SOURCE_NAMES
+
+    def _max_repeated_ngram_count_for_report(self, report: dict[str, Any], key: str) -> int:
+        return max(
+            (int(count) for count in dict(report.get(key, {})).values()),
+            default=0,
+        )
+
+    def _template_family_dominance_for_report(self, report: dict[str, Any]) -> float:
+        kept_documents = int(report.get("kept_documents", 0))
+        if kept_documents < LOCAL_MVP_PRETRAIN_TEMPLATE_FAMILY_DOMINANCE_MIN_DOCUMENTS:
+            return 0.0
+        max_repeated_count = max(
+            self._max_repeated_ngram_count_for_report(report, "repeated_8gram_counts"),
+            self._max_repeated_ngram_count_for_report(report, "repeated_12gram_counts"),
+            self._max_repeated_ngram_count_for_report(report, "repeated_20gram_counts"),
+        )
+        return max_repeated_count / max(kept_documents, 1)
+
     def _pretrain_domain_contribution_summary(
         self,
         source_reports: list[dict[str, Any]],
@@ -2232,12 +2716,20 @@ class DatasetBuilder:
         if token_share < LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE:
             failures.append("domain_share_too_low")
         realization_ratio = token_share / max(configured_target_share, 1e-8)
+        if (
+            configured_target_share >= LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE
+            and realization_ratio < LOCAL_MVP_PRETRAIN_MIN_DOMAIN_REALIZATION_RATIO
+        ):
+            failures.append("domain_realization_ratio_too_low")
+        domain_readiness_expected = not failures
         return {
-            "passed": not failures,
-            "severity": "pass" if not failures else "warning",
+            "passed": domain_readiness_expected,
+            "domain_readiness_expected": domain_readiness_expected,
+            "severity": "pass" if domain_readiness_expected else "warning",
             "failures": failures,
             "minimum_token_share": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKEN_SHARE,
             "minimum_tokens": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS,
+            "minimum_domain_realization_ratio": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_REALIZATION_RATIO,
             "minimum_recommended_domain_tokens_for_profile": LOCAL_MVP_PRETRAIN_MIN_DOMAIN_TOKENS,
             "domain_tokens": domain_tokens,
             "domain_documents": domain_documents,
@@ -2272,8 +2764,9 @@ class DatasetBuilder:
 
     def _pretrain_domain_realization_gate(self, contribution: dict[str, Any]) -> dict[str, Any]:
         failures = list(contribution.get("failures", []))
-        passed = not failures
         mode = str(self.config.pretrain_domain_realization_gate_mode)
+        informational = mode in {"off", "informational"}
+        passed = True if informational else not failures
         message = "pretrain domain realization passed"
         if not passed:
             message = (
@@ -2281,8 +2774,188 @@ class DatasetBuilder:
                 f"{', '.join(failures)} "
                 f"(domain_tokens={contribution.get('domain_tokens')}, "
                 f"token_share={contribution.get('token_share')}, "
+                f"configured_domain_share={contribution.get('configured_domain_share')}, "
+                f"domain_realization_ratio={contribution.get('domain_realization_ratio')}, "
                 f"minimum_tokens={contribution.get('minimum_tokens')}, "
-                f"minimum_token_share={contribution.get('minimum_token_share')})"
+                f"minimum_token_share={contribution.get('minimum_token_share')}, "
+                f"minimum_domain_realization_ratio={contribution.get('minimum_domain_realization_ratio')})"
+            )
+        elif informational and failures:
+            message = (
+                "pretrain domain realization tracked for information only: "
+                f"{', '.join(failures)} "
+                f"(domain_tokens={contribution.get('domain_tokens')}, "
+                f"token_share={contribution.get('token_share')}, "
+                f"configured_domain_share={contribution.get('configured_domain_share')})"
+            )
+        return {
+            "passed": passed,
+            "domain_readiness_expected": bool(contribution.get("domain_readiness_expected", passed)),
+            "mode": mode,
+            "severity": (
+                "informational"
+                if informational and failures
+                else ("pass" if passed else ("error" if mode == "fail" else "warning"))
+            ),
+            "failures": failures,
+            "message": message,
+            "domain_tokens": contribution.get("domain_tokens"),
+            "token_share": contribution.get("token_share"),
+            "configured_domain_share": contribution.get("configured_domain_share"),
+            "realized_domain_share": contribution.get("realized_domain_share"),
+            "domain_realization_ratio": contribution.get("domain_realization_ratio"),
+            "minimum_tokens": contribution.get("minimum_tokens"),
+            "minimum_token_share": contribution.get("minimum_token_share"),
+            "minimum_domain_realization_ratio": contribution.get("minimum_domain_realization_ratio"),
+        }
+
+    def _pretrain_corpus_quality_gate(self, source_reports: list[dict[str, Any]]) -> dict[str, Any]:
+        failures: list[str] = []
+        domain_reports = [
+            report for report in source_reports if self._is_local_mvp_domain_source_report(report)
+        ]
+        synthetic_meta_phrase_count = sum(
+            int(report.get("synthetic_meta_phrase_count", 0))
+            for report in source_reports
+        )
+        synthetic_meta_phrase_gate_counts_by_source: dict[str, dict[str, int]] = {}
+        domain_synthetic_meta_phrase_count = 0
+        strict_broad_synthetic_meta_phrase_count = 0
+        for report in source_reports:
+            source = str(report.get("source", ""))
+            phrase_counts = {
+                str(phrase): int(count)
+                for phrase, count in dict(report.get("synthetic_meta_phrase_counts", {})).items()
+                if int(count) > 0
+            }
+            if not phrase_counts:
+                continue
+            if self._is_local_mvp_domain_source_report(report):
+                gated_counts = phrase_counts
+                domain_synthetic_meta_phrase_count += sum(gated_counts.values())
+            else:
+                gated_counts = {
+                    phrase: count
+                    for phrase, count in phrase_counts.items()
+                    if phrase not in LOCAL_MVP_PRETRAIN_BROAD_SYNTHETIC_META_ALLOWED_PHRASES
+                }
+                strict_broad_synthetic_meta_phrase_count += sum(gated_counts.values())
+            if gated_counts:
+                synthetic_meta_phrase_gate_counts_by_source[source] = gated_counts
+
+        synthetic_meta_phrase_gate_count = (
+            domain_synthetic_meta_phrase_count + strict_broad_synthetic_meta_phrase_count
+        )
+        if synthetic_meta_phrase_gate_count > 0:
+            failures.append("synthetic_meta_phrase_count_nonzero")
+
+        repeated_ngram_counts_by_source = {
+            str(report.get("source", "")): {
+                "max_repeated_4gram_count": self._max_repeated_ngram_count_for_report(
+                    report, "repeated_4gram_counts"
+                ),
+                "max_repeated_8gram_count": self._max_repeated_ngram_count_for_report(
+                    report, "repeated_8gram_counts"
+                ),
+                "max_repeated_12gram_count": self._max_repeated_ngram_count_for_report(
+                    report, "repeated_12gram_counts"
+                ),
+                "max_repeated_20gram_count": self._max_repeated_ngram_count_for_report(
+                    report, "repeated_20gram_counts"
+                ),
+            }
+            for report in source_reports
+        }
+        max_repeated_4gram_count = max(
+            (
+                counts["max_repeated_4gram_count"]
+                for counts in repeated_ngram_counts_by_source.values()
+            ),
+            default=0,
+        )
+        if max_repeated_4gram_count > LOCAL_MVP_PRETRAIN_MAX_REPEATED_4GRAM_COUNT:
+            failures.append("repeated_4gram_count_above_limit")
+        max_repeated_8gram_count = max(
+            (
+                counts["max_repeated_8gram_count"]
+                for counts in repeated_ngram_counts_by_source.values()
+            ),
+            default=0,
+        )
+        if max_repeated_8gram_count > LOCAL_MVP_PRETRAIN_MAX_REPEATED_8GRAM_COUNT:
+            failures.append("repeated_8gram_count_above_limit")
+        max_repeated_12gram_count = max(
+            (
+                counts["max_repeated_12gram_count"]
+                for counts in repeated_ngram_counts_by_source.values()
+            ),
+            default=0,
+        )
+        if max_repeated_12gram_count > LOCAL_MVP_PRETRAIN_MAX_REPEATED_12GRAM_COUNT:
+            failures.append("repeated_12gram_count_above_limit")
+        template_family_dominance_by_source = {
+            str(report.get("source", "")): round(self._template_family_dominance_for_report(report), 6)
+            for report in source_reports
+        }
+        template_family_dominance_sources = [
+            source
+            for source, share in sorted(template_family_dominance_by_source.items())
+            if share > LOCAL_MVP_PRETRAIN_MAX_TEMPLATE_FAMILY_DOMINANCE_SHARE
+        ]
+        max_template_family_dominance_share = max(
+            template_family_dominance_by_source.values(),
+            default=0.0,
+        )
+        if template_family_dominance_sources:
+            failures.append("template_family_dominance_above_limit")
+
+        max_near_duplicate_ratio = max(
+            (float(report.get("near_duplicate_ratio", 0.0)) for report in source_reports),
+            default=0.0,
+        )
+        max_domain_near_duplicate_ratio = max(
+            (float(report.get("near_duplicate_ratio", 0.0)) for report in domain_reports),
+            default=0.0,
+        )
+        near_duplicate_gated_reports = [
+            report
+            for report in source_reports
+            if self._is_local_mvp_near_duplicate_gated_source_report(report)
+        ]
+        max_gated_domain_near_duplicate_ratio = max(
+            (
+                float(report.get("near_duplicate_ratio", 0.0))
+                for report in near_duplicate_gated_reports
+            ),
+            default=0.0,
+        )
+        if max_gated_domain_near_duplicate_ratio > LOCAL_MVP_PRETRAIN_MAX_NEAR_DUPLICATE_RATIO:
+            failures.append("near_duplicate_ratio_above_limit")
+        max_domain_repeated_20gram_count = max(
+            (
+                self._max_repeated_ngram_count_for_report(report, "repeated_20gram_counts")
+                for report in domain_reports
+            ),
+            default=0,
+        )
+        if max_domain_repeated_20gram_count > LOCAL_MVP_PRETRAIN_MAX_DOMAIN_REPEATED_20GRAM_COUNT:
+            failures.append("domain_repeated_20gram_count_above_limit")
+
+        mode = str(self.config.pretrain_domain_realization_gate_mode)
+        passed = not failures
+        message = "pretrain corpus quality gate passed"
+        if not passed:
+            message = (
+                "pretrain corpus quality gate failed: "
+                f"{', '.join(failures)} "
+                f"(synthetic_meta_phrase_gate_count={synthetic_meta_phrase_gate_count}, "
+                f"domain_synthetic_meta_phrase_count={domain_synthetic_meta_phrase_count}, "
+                f"max_repeated_4gram_count={max_repeated_4gram_count}, "
+                f"max_repeated_8gram_count={max_repeated_8gram_count}, "
+                f"max_repeated_12gram_count={max_repeated_12gram_count}, "
+                f"max_template_family_dominance_share={round(max_template_family_dominance_share, 6)}, "
+                f"max_gated_domain_near_duplicate_ratio={round(max_gated_domain_near_duplicate_ratio, 6)}, "
+                f"max_domain_repeated_20gram_count={max_domain_repeated_20gram_count})"
             )
         return {
             "passed": passed,
@@ -2290,10 +2963,189 @@ class DatasetBuilder:
             "severity": "pass" if passed else ("error" if mode == "fail" else "warning"),
             "failures": failures,
             "message": message,
-            "domain_tokens": contribution.get("domain_tokens"),
-            "token_share": contribution.get("token_share"),
-            "minimum_tokens": contribution.get("minimum_tokens"),
-            "minimum_token_share": contribution.get("minimum_token_share"),
+            "thresholds": {
+                "max_repeated_4gram_count": LOCAL_MVP_PRETRAIN_MAX_REPEATED_4GRAM_COUNT,
+                "max_repeated_8gram_count": LOCAL_MVP_PRETRAIN_MAX_REPEATED_8GRAM_COUNT,
+                "max_repeated_12gram_count": LOCAL_MVP_PRETRAIN_MAX_REPEATED_12GRAM_COUNT,
+                "max_domain_repeated_20gram_count": LOCAL_MVP_PRETRAIN_MAX_DOMAIN_REPEATED_20GRAM_COUNT,
+                "max_near_duplicate_ratio": LOCAL_MVP_PRETRAIN_MAX_NEAR_DUPLICATE_RATIO,
+                "max_template_family_dominance_share": (
+                    LOCAL_MVP_PRETRAIN_MAX_TEMPLATE_FAMILY_DOMINANCE_SHARE
+                ),
+                "template_family_dominance_min_documents": (
+                    LOCAL_MVP_PRETRAIN_TEMPLATE_FAMILY_DOMINANCE_MIN_DOCUMENTS
+                ),
+                "max_synthetic_meta_phrase_count": 0,
+            },
+            "synthetic_meta_phrase_count": synthetic_meta_phrase_count,
+            "synthetic_meta_phrase_gate_count": int(synthetic_meta_phrase_gate_count),
+            "domain_synthetic_meta_phrase_count": int(domain_synthetic_meta_phrase_count),
+            "strict_broad_synthetic_meta_phrase_count": int(strict_broad_synthetic_meta_phrase_count),
+            "synthetic_meta_phrase_gate_counts_by_source": synthetic_meta_phrase_gate_counts_by_source,
+            "repeated_ngram_counts_by_source": repeated_ngram_counts_by_source,
+            "max_repeated_4gram_count": int(max_repeated_4gram_count),
+            "max_repeated_8gram_count": int(max_repeated_8gram_count),
+            "max_repeated_12gram_count": int(max_repeated_12gram_count),
+            "template_family_dominance_by_source": template_family_dominance_by_source,
+            "template_family_dominance_sources": template_family_dominance_sources,
+            "max_template_family_dominance_share": round(
+                max_template_family_dominance_share,
+                6,
+            ),
+            "max_near_duplicate_ratio": round(max_near_duplicate_ratio, 6),
+            "max_domain_near_duplicate_ratio": round(max_domain_near_duplicate_ratio, 6),
+            "max_gated_domain_near_duplicate_ratio": round(
+                max_gated_domain_near_duplicate_ratio,
+                6,
+            ),
+            "near_duplicate_gated_sources": [
+                str(report.get("source", "")) for report in near_duplicate_gated_reports
+            ],
+            "max_domain_repeated_20gram_count": int(max_domain_repeated_20gram_count),
+        }
+
+    def _pretrain_broad_source_quality_gate(self, source_reports: list[dict[str, Any]]) -> dict[str, Any]:
+        broad_reports = [
+            report for report in source_reports if bool(report.get("is_broad_lm_source", False))
+        ]
+        thresholds = {
+            "max_broad_source_junk_score": float(self.config.pretrain_broad_max_junk_score),
+            "max_medical_body_density": float(self.config.pretrain_broad_max_medical_body_density),
+            "max_navigation_text_density": float(self.config.pretrain_broad_max_navigation_text_density),
+            "max_malformed_fragment_density": float(
+                self.config.pretrain_broad_max_malformed_fragment_density
+            ),
+            "max_generic_article_formula_density": float(
+                self.config.pretrain_broad_max_generic_article_formula_density
+            ),
+            "max_product_commercial_density": float(
+                self.config.pretrain_curated_max_product_commercial_density
+            ),
+            "max_dictionary_fragment_density": float(
+                self.config.pretrain_curated_max_dictionary_fragment_density
+            ),
+            "max_page_boilerplate_density": float(
+                self.config.pretrain_curated_max_page_boilerplate_density
+            ),
+        }
+        per_source_failures: list[dict[str, Any]] = []
+        failure_names: set[str] = set()
+        for report in broad_reports:
+            source_failures: list[str] = []
+            if float(report.get("broad_source_junk_score", 0.0)) > thresholds["max_broad_source_junk_score"]:
+                source_failures.append("broad_source_junk_score_above_limit")
+            if float(report.get("medical_body_density", 0.0)) > thresholds["max_medical_body_density"]:
+                source_failures.append("medical_body_density_above_limit")
+            if float(report.get("navigation_text_density", 0.0)) > thresholds["max_navigation_text_density"]:
+                source_failures.append("navigation_text_density_above_limit")
+            if float(report.get("malformed_fragment_density", 0.0)) > thresholds["max_malformed_fragment_density"]:
+                source_failures.append("malformed_fragment_density_above_limit")
+            if (
+                float(report.get("generic_article_formula_density", 0.0))
+                > thresholds["max_generic_article_formula_density"]
+            ):
+                source_failures.append("generic_article_formula_density_above_limit")
+            if (
+                float(report.get("product_commercial_density", 0.0))
+                > thresholds["max_product_commercial_density"]
+            ):
+                source_failures.append("product_commercial_density_above_limit")
+            if (
+                float(report.get("dictionary_fragment_density", 0.0))
+                > thresholds["max_dictionary_fragment_density"]
+            ):
+                source_failures.append("dictionary_fragment_density_above_limit")
+            if (
+                float(report.get("page_boilerplate_density", 0.0))
+                > thresholds["max_page_boilerplate_density"]
+            ):
+                source_failures.append("page_boilerplate_density_above_limit")
+            if source_failures:
+                failure_names.update(source_failures)
+                per_source_failures.append(
+                    {
+                        "source": str(report.get("source", "")),
+                        "failures": source_failures,
+                        "broad_source_junk_score": float(report.get("broad_source_junk_score", 0.0)),
+                        "medical_body_density": float(report.get("medical_body_density", 0.0)),
+                        "navigation_text_density": float(report.get("navigation_text_density", 0.0)),
+                        "malformed_fragment_density": float(report.get("malformed_fragment_density", 0.0)),
+                        "generic_article_formula_density": float(
+                            report.get("generic_article_formula_density", 0.0)
+                        ),
+                        "product_commercial_density": float(
+                            report.get("product_commercial_density", 0.0)
+                        ),
+                        "dictionary_fragment_density": float(
+                            report.get("dictionary_fragment_density", 0.0)
+                        ),
+                        "page_boilerplate_density": float(
+                            report.get("page_boilerplate_density", 0.0)
+                        ),
+                        "quality_artifact_occurrence_counts": dict(
+                            report.get("quality_artifact_occurrence_counts", {})
+                        ),
+                    }
+                )
+
+        mode = str(self.config.pretrain_broad_source_quality_gate_mode)
+        passed = not per_source_failures
+        max_scores = {
+            "max_broad_source_junk_score": round(
+                max((float(report.get("broad_source_junk_score", 0.0)) for report in broad_reports), default=0.0),
+                6,
+            ),
+            "max_medical_body_density": round(
+                max((float(report.get("medical_body_density", 0.0)) for report in broad_reports), default=0.0),
+                6,
+            ),
+            "max_navigation_text_density": round(
+                max((float(report.get("navigation_text_density", 0.0)) for report in broad_reports), default=0.0),
+                6,
+            ),
+            "max_malformed_fragment_density": round(
+                max((float(report.get("malformed_fragment_density", 0.0)) for report in broad_reports), default=0.0),
+                6,
+            ),
+            "max_generic_article_formula_density": round(
+                max(
+                    (float(report.get("generic_article_formula_density", 0.0)) for report in broad_reports),
+                    default=0.0,
+                ),
+                6,
+            ),
+            "max_product_commercial_density": round(
+                max((float(report.get("product_commercial_density", 0.0)) for report in broad_reports), default=0.0),
+                6,
+            ),
+            "max_dictionary_fragment_density": round(
+                max((float(report.get("dictionary_fragment_density", 0.0)) for report in broad_reports), default=0.0),
+                6,
+            ),
+            "max_page_boilerplate_density": round(
+                max((float(report.get("page_boilerplate_density", 0.0)) for report in broad_reports), default=0.0),
+                6,
+            ),
+        }
+        message = "pretrain broad source quality gate passed"
+        if not passed:
+            failing_sources = ", ".join(row["source"] for row in per_source_failures)
+            message = (
+                "pretrain broad source quality gate failed: "
+                f"{', '.join(sorted(failure_names))} "
+                f"(sources={failing_sources}, thresholds={thresholds})"
+            )
+        return {
+            "passed": passed,
+            "mode": mode,
+            "severity": "pass" if passed else ("error" if mode == "fail" else "warning"),
+            "failures": sorted(failure_names),
+            "message": message,
+            "thresholds": thresholds,
+            "source_count": len(broad_reports),
+            "failing_source_count": len(per_source_failures),
+            "per_source_failures": per_source_failures,
+            **max_scores,
         }
 
     def _lm_source_diagnostics(
@@ -2309,7 +3161,17 @@ class DatasetBuilder:
         phrase_counter: Counter[str] = Counter()
         phrase_counter_8: Counter[str] = Counter()
         phrase_counter_12: Counter[str] = Counter()
+        phrase_counter_20: Counter[str] = Counter()
         quality_artifact_counter: Counter[str] = Counter()
+        quality_artifact_occurrence_counter: Counter[str] = Counter()
+        synthetic_meta_phrase_counter: Counter[str] = Counter()
+        exact_paragraph_duplicate_count = 0
+        normalized_paragraph_duplicate_count = 0
+        near_duplicate_cluster_count = 0
+        largest_near_duplicate_cluster_size = 0
+        near_duplicate_ratio_by_source: dict[str, float] = {}
+        near_duplicate_ratio_by_source_family: dict[str, float] = {}
+        synthetic_meta_phrase_counter_by_source_family: dict[str, Counter[str]] = {}
         for audit_state in source_audit_states:
             kept_documents = int(audit_state["kept_documents"])
             kept_tokens = int(audit_state["kept_tokens"])
@@ -2318,32 +3180,30 @@ class DatasetBuilder:
             phrase_counter.update(audit_state["phrase_counter"])
             phrase_counter_8.update(audit_state.get("phrase_counter_8", Counter()))
             phrase_counter_12.update(audit_state.get("phrase_counter_12", Counter()))
+            phrase_counter_20.update(audit_state.get("phrase_counter_20", Counter()))
             quality_artifact_counter.update(audit_state.get("quality_artifact_counter", Counter()))
-            source_reports.append(
-                {
-                    "source": str(audit_state["source"]),
-                    "family": str(audit_state["family"]),
-                    "weight": float(audit_state["weight"]),
-                    "target_share": round(float(audit_state.get("target_share", 0.0)), 6),
-                    "raw_records": int(audit_state["raw_records"]),
-                    "kept_documents": kept_documents,
-                    "kept_tokens": kept_tokens,
-                    "repeated_documents": int(audit_state["repeated_documents"]),
-                    "restart_count": int(audit_state.get("restart_count", 0)),
-                    "repeat_rate": round(
-                        int(audit_state["repeated_documents"]) / max(kept_documents, 1),
-                        6,
-                    ),
-                    "dropped_reasons": _counter_to_sorted_dict(audit_state["dropped_reasons"]),
-                    "quality_artifact_counts": _counter_to_sorted_dict(
-                        Counter(audit_state.get("quality_artifact_counter", {}))
-                    ),
-                    "top_repeated_phrases": [
-                        {"phrase": phrase, "count": count}
-                        for phrase, count in Counter(audit_state["phrase_counter"]).most_common(5)
-                    ],
-                }
+            quality_artifact_occurrence_counter.update(
+                audit_state.get("quality_artifact_occurrence_counter", Counter())
             )
+            synthetic_meta_phrase_counter.update(audit_state.get("synthetic_meta_phrase_counter", Counter()))
+            report = self._lm_source_report_from_audit_state(audit_state)
+            exact_paragraph_duplicate_count += int(report["exact_paragraph_duplicate_count"])
+            normalized_paragraph_duplicate_count += int(report["normalized_paragraph_duplicate_count"])
+            near_duplicate_cluster_count += int(report["near_duplicate_cluster_count"])
+            largest_near_duplicate_cluster_size = max(
+                largest_near_duplicate_cluster_size,
+                int(report["largest_near_duplicate_cluster_size"]),
+            )
+            near_duplicate_ratio_by_source[str(report["source"])] = float(report["near_duplicate_ratio"])
+            family = str(report.get("family", "unknown"))
+            near_duplicate_ratio_by_source_family[family] = max(
+                near_duplicate_ratio_by_source_family.get(family, 0.0),
+                float(report["near_duplicate_ratio"]),
+            )
+            synthetic_meta_phrase_counter_by_source_family.setdefault(family, Counter()).update(
+                dict(report.get("synthetic_meta_phrase_counts", {}))
+            )
+            source_reports.append(report)
         self._finalize_lm_source_reports(
             source_reports,
             total_tokens=total_tokens,
@@ -2364,18 +3224,88 @@ class DatasetBuilder:
                 {"phrase": phrase, "count": count}
                 for phrase, count in phrase_counter.most_common(10)
             ],
-            "top_repeated_8grams": [
-                {"phrase": phrase, "count": count}
-                for phrase, count in phrase_counter_8.most_common(10)
-            ],
-            "top_repeated_12grams": [
-                {"phrase": phrase, "count": count}
-                for phrase, count in phrase_counter_12.most_common(10)
-            ],
+            "top_repeated_8grams": _top_counter_rows(phrase_counter_8, limit=10),
+            "top_repeated_12grams": _top_counter_rows(phrase_counter_12, limit=10),
+            "top_repeated_20grams": _top_counter_rows(phrase_counter_20, limit=10),
+            "repeated_4gram_counts": dict(phrase_counter.most_common(20)),
+            "repeated_8gram_counts": dict(phrase_counter_8.most_common(20)),
+            "repeated_12gram_counts": dict(phrase_counter_12.most_common(20)),
+            "repeated_20gram_counts": dict(phrase_counter_20.most_common(20)),
             "quality_artifact_counts": _counter_to_sorted_dict(quality_artifact_counter),
+            "quality_artifact_occurrence_counts": _counter_to_sorted_dict(
+                quality_artifact_occurrence_counter
+            ),
+            "broad_source_quality_scores_by_source": {
+                str(report["source"]): {
+                    "broad_source_junk_score": float(report.get("broad_source_junk_score", 0.0)),
+                    "medical_body_density": float(report.get("medical_body_density", 0.0)),
+                    "navigation_text_density": float(report.get("navigation_text_density", 0.0)),
+                    "malformed_fragment_density": float(report.get("malformed_fragment_density", 0.0)),
+                    "generic_article_formula_density": float(
+                        report.get("generic_article_formula_density", 0.0)
+                    ),
+                    "product_commercial_density": float(report.get("product_commercial_density", 0.0)),
+                    "dictionary_fragment_density": float(report.get("dictionary_fragment_density", 0.0)),
+                    "page_boilerplate_density": float(report.get("page_boilerplate_density", 0.0)),
+                }
+                for report in source_reports
+                if bool(report.get("is_broad_lm_source", False))
+            },
+            "synthetic_meta_phrase_counts_by_source": {
+                str(report["source"]): dict(report.get("synthetic_meta_phrase_counts", {}))
+                for report in source_reports
+                if int(report.get("synthetic_meta_phrase_count", 0)) > 0
+            },
+            "synthetic_meta_phrase_counts_by_source_family": {
+                family: _counter_to_sorted_dict(counter)
+                for family, counter in sorted(synthetic_meta_phrase_counter_by_source_family.items())
+                if sum(counter.values()) > 0
+            },
+            "synthetic_meta_phrase_counts": _counter_to_sorted_dict(synthetic_meta_phrase_counter),
+            "synthetic_meta_phrase_count": int(sum(synthetic_meta_phrase_counter.values())),
+            "exact_paragraph_duplicate_count": int(exact_paragraph_duplicate_count),
+            "normalized_paragraph_duplicate_count": int(normalized_paragraph_duplicate_count),
+            "near_duplicate_cluster_count": int(near_duplicate_cluster_count),
+            "largest_near_duplicate_cluster_size": int(largest_near_duplicate_cluster_size),
+            "near_duplicate_ratio_by_source": {
+                source: round(ratio, 6)
+                for source, ratio in sorted(near_duplicate_ratio_by_source.items())
+            },
+            "near_duplicate_ratio_by_source_family": {
+                family: round(ratio, 6)
+                for family, ratio in sorted(near_duplicate_ratio_by_source_family.items())
+            },
             "repeated_paragraph_hash_count": int(
                 sum(int(report["repeated_documents"]) for report in source_reports)
             ),
+            "document_shape": {
+                "avg_document_chars": round(
+                    sum(float(report.get("avg_document_chars", 0.0)) * int(report.get("kept_documents", 0)) for report in source_reports)
+                    / max(total_documents, 1),
+                    2,
+                ),
+                "avg_document_words": round(
+                    sum(float(report.get("avg_document_words", 0.0)) * int(report.get("kept_documents", 0)) for report in source_reports)
+                    / max(total_documents, 1),
+                    2,
+                ),
+                "avg_document_tokens": round(total_tokens / max(total_documents, 1), 2),
+                "avg_sentences_per_document": round(
+                    sum(float(report.get("avg_sentences_per_document", 0.0)) * int(report.get("kept_documents", 0)) for report in source_reports)
+                    / max(total_documents, 1),
+                    2,
+                ),
+                "avg_paragraphs_per_document": round(
+                    sum(float(report.get("avg_paragraphs_per_document", 0.0)) * int(report.get("kept_documents", 0)) for report in source_reports)
+                    / max(total_documents, 1),
+                    2,
+                ),
+                "avg_sentence_words": round(
+                    sum(float(report.get("avg_sentence_words", 0.0)) * int(report.get("kept_documents", 0)) for report in source_reports)
+                    / max(total_documents, 1),
+                    2,
+                ),
+            },
         }
         warnings: list[str] = []
         if diagnostics["max_single_source_token_share"] > LOCAL_MVP_PRETRAIN_MAX_GENERIC_SOURCE_SHARE:
@@ -2385,6 +3315,26 @@ class DatasetBuilder:
             for row in diagnostics["top_repeated_phrases"]
         ):
             warnings.append("repeated_phrase_count_above_local_mvp_limit")
+        if any(
+            int(row["count"]) > LOCAL_MVP_PRETRAIN_MAX_REPEATED_8GRAM_COUNT
+            for row in diagnostics["top_repeated_8grams"]
+        ):
+            warnings.append("repeated_8gram_count_above_local_mvp_limit")
+        if any(
+            int(row["count"]) > LOCAL_MVP_PRETRAIN_MAX_REPEATED_12GRAM_COUNT
+            for row in diagnostics["top_repeated_12grams"]
+        ):
+            warnings.append("repeated_12gram_count_above_local_mvp_limit")
+        if any(
+            float(self._template_family_dominance_for_report(report))
+            > LOCAL_MVP_PRETRAIN_MAX_TEMPLATE_FAMILY_DOMINANCE_SHARE
+            for report in source_reports
+        ):
+            warnings.append("template_family_dominance_above_local_mvp_limit")
+        if diagnostics["synthetic_meta_phrase_count"] > 0:
+            warnings.append("synthetic_meta_phrase_observed")
+        if diagnostics["largest_near_duplicate_cluster_size"] > 1:
+            warnings.append("near_duplicate_clusters_detected")
         if any(int(count) > 0 for count in quality_artifact_counter.values()):
             warnings.append("quality_artifacts_detected")
         diagnostics["quality_warnings"] = warnings
@@ -2396,10 +3346,27 @@ class DatasetBuilder:
             )
             diagnostics["domain_contribution"] = domain_contribution
             diagnostics["domain_realization_gate"] = self._pretrain_domain_realization_gate(domain_contribution)
-            if not domain_contribution.get("passed", True):
+            corpus_quality_gate = self._pretrain_corpus_quality_gate(source_reports)
+            diagnostics["corpus_quality_gate"] = corpus_quality_gate
+            broad_source_quality_gate = self._pretrain_broad_source_quality_gate(source_reports)
+            diagnostics["broad_source_quality_gate"] = broad_source_quality_gate
+            if (
+                str(self.config.pretrain_domain_realization_gate_mode) not in {"off", "informational"}
+                and not domain_contribution.get("passed", True)
+            ):
                 diagnostics["quality_warnings"] = [
                     *diagnostics["quality_warnings"],
                     "domain_readiness_not_expected",
+                ]
+            if not corpus_quality_gate.get("passed", True):
+                diagnostics["quality_warnings"] = [
+                    *diagnostics["quality_warnings"],
+                    "corpus_quality_gate_failed",
+                ]
+            if not broad_source_quality_gate.get("passed", True):
+                diagnostics["quality_warnings"] = [
+                    *diagnostics["quality_warnings"],
+                    "broad_source_quality_gate_failed",
                 ]
         return diagnostics
 
@@ -2446,6 +3413,8 @@ class DatasetBuilder:
                         "family": family,
                         "weight": float(report.get("weight", source.weight)),
                         "target_share": round(float(report.get("target_share", 0.0)), 6),
+                        "quality_filter_mode": str(report.get("quality_filter_mode", "basic")),
+                        "is_broad_lm_source": bool(report.get("is_broad_lm_source", False)),
                         "raw_records": int(report.get("raw_records", 0)),
                         "kept_documents": kept_documents,
                         "kept_tokens": kept_tokens,
@@ -2453,6 +3422,57 @@ class DatasetBuilder:
                         "restart_count": int(report.get("restart_count", 0)),
                         "repeat_rate": round(repeated_documents / max(kept_documents, 1), 6),
                         "dropped_reasons": dict(report.get("dropped_reasons", {})),
+                        "quality_artifact_counts": dict(report.get("quality_artifact_counts", {})),
+                        "quality_artifact_occurrence_counts": dict(
+                            report.get("quality_artifact_occurrence_counts", {})
+                        ),
+                        "quality_diagnostic_token_count": int(
+                            report.get("quality_diagnostic_token_count", 0)
+                        ),
+                        "broad_source_junk_score": float(report.get("broad_source_junk_score", 0.0)),
+                        "medical_body_density": float(report.get("medical_body_density", 0.0)),
+                        "navigation_text_density": float(report.get("navigation_text_density", 0.0)),
+                        "malformed_fragment_density": float(report.get("malformed_fragment_density", 0.0)),
+                        "generic_article_formula_density": float(
+                            report.get("generic_article_formula_density", 0.0)
+                        ),
+                        "product_commercial_density": float(
+                            report.get("product_commercial_density", 0.0)
+                        ),
+                        "dictionary_fragment_density": float(
+                            report.get("dictionary_fragment_density", 0.0)
+                        ),
+                        "page_boilerplate_density": float(
+                            report.get("page_boilerplate_density", 0.0)
+                        ),
+                        "avg_document_chars": float(report.get("avg_document_chars", 0.0)),
+                        "avg_document_words": float(report.get("avg_document_words", 0.0)),
+                        "avg_document_tokens": float(report.get("avg_document_tokens", 0.0)),
+                        "avg_sentences_per_document": float(
+                            report.get("avg_sentences_per_document", 0.0)
+                        ),
+                        "avg_paragraphs_per_document": float(
+                            report.get("avg_paragraphs_per_document", 0.0)
+                        ),
+                        "avg_sentence_words": float(report.get("avg_sentence_words", 0.0)),
+                        "synthetic_meta_phrase_counts": dict(report.get("synthetic_meta_phrase_counts", {})),
+                        "synthetic_meta_phrase_count": int(report.get("synthetic_meta_phrase_count", 0)),
+                        "exact_paragraph_duplicate_count": int(
+                            report.get("exact_paragraph_duplicate_count", 0)
+                        ),
+                        "normalized_paragraph_duplicate_count": int(
+                            report.get("normalized_paragraph_duplicate_count", 0)
+                        ),
+                        "near_duplicate_cluster_count": int(report.get("near_duplicate_cluster_count", 0)),
+                        "largest_near_duplicate_cluster_size": int(
+                            report.get("largest_near_duplicate_cluster_size", 0)
+                        ),
+                        "near_duplicate_ratio": float(report.get("near_duplicate_ratio", 0.0)),
+                        "near_duplicate_document_count": int(report.get("near_duplicate_document_count", 0)),
+                        "repeated_4gram_counts": dict(report.get("repeated_4gram_counts", {})),
+                        "repeated_8gram_counts": dict(report.get("repeated_8gram_counts", {})),
+                        "repeated_12gram_counts": dict(report.get("repeated_12gram_counts", {})),
+                        "repeated_20gram_counts": dict(report.get("repeated_20gram_counts", {})),
                     }
                 )
             for row in diagnostics.get("top_repeated_phrases", []):
@@ -2497,8 +3517,22 @@ class DatasetBuilder:
             )
             audit["domain_contribution"] = domain_contribution
             audit["domain_realization_gate"] = self._pretrain_domain_realization_gate(domain_contribution)
-            if not domain_contribution.get("passed", True):
+            corpus_quality_gate = self._pretrain_corpus_quality_gate(source_reports)
+            audit["corpus_quality_gate"] = corpus_quality_gate
+            broad_source_quality_gate = self._pretrain_broad_source_quality_gate(source_reports)
+            audit["broad_source_quality_gate"] = broad_source_quality_gate
+            if (
+                str(self.config.pretrain_domain_realization_gate_mode) not in {"off", "informational"}
+                and not domain_contribution.get("passed", True)
+            ):
                 audit["quality_warnings"] = [*audit["quality_warnings"], "domain_readiness_not_expected"]
+            if not corpus_quality_gate.get("passed", True):
+                audit["quality_warnings"] = [*audit["quality_warnings"], "corpus_quality_gate_failed"]
+            if not broad_source_quality_gate.get("passed", True):
+                audit["quality_warnings"] = [
+                    *audit["quality_warnings"],
+                    "broad_source_quality_gate_failed",
+                ]
         return audit
 
     def _iter_tokenized_documents_for_source(
@@ -2512,6 +3546,7 @@ class DatasetBuilder:
         progress_state: dict[str, Any] | None = None,
         allow_reentry: bool = False,
         max_kept_documents: int | None = None,
+        num_workers_override: int | None = None,
     ) -> Iterable[tuple[DocumentRecord, list[int]]]:
         kept_in_iterator = 0
         source_seen_ids = (
@@ -2519,63 +3554,79 @@ class DatasetBuilder:
             if allow_reentry and audit_state is not None
             else set()
         )
-        for item in self._load_source_records(source, raw_records_consumed=raw_records_consumed):
+        num_workers = self._bounded_lm_document_workers(num_workers_override=num_workers_override)
+        if num_workers > 1:
+            result_iter = self._iter_parallel_lm_document_results(
+                source,
+                raw_records_consumed=raw_records_consumed,
+                num_workers=num_workers,
+            )
+        else:
+            result_iter = self._iter_serial_lm_document_results(
+                source,
+                tokenizer=tokenizer,
+                raw_records_consumed=raw_records_consumed,
+            )
+
+        for result in result_iter:
+            if result.error is not None:
+                self._raise_lm_document_worker_error(source, result)
             if audit_state is not None:
                 audit_state["raw_records"] += 1
             if progress_state is not None:
                 progress_state["raw_records_consumed"] = int(progress_state.get("raw_records_consumed", 0)) + 1
-            text = item.get(source.text_field, "")
-            if not isinstance(text, str):
+            if not result.is_text:
                 if audit_state is not None:
                     audit_state["dropped_reasons"]["non_text"] += 1
                 continue
-            record = DocumentRecord(
-                text=text,
-                source=source.name,
-                metadata={field: item.get(field) for field in source.metadata_fields},
-            )
-            if allow_reentry and source.deduplicate and seen_hashes is not None:
-                # On a restart, allow repeats from this source while still blocking
-                # duplicates that were first introduced by other sources.
-                cleaned = clean_document(record, self.config, source, None)
-                if cleaned.record is not None:
-                    document_id = cleaned.record.document_id or ""
-                    if document_id and document_id in seen_hashes and document_id not in source_seen_ids:
-                        cleaned = type(cleaned)(record=None, dropped_reason="duplicate")
-                    elif document_id:
-                        seen_hashes.add(document_id)
-            else:
-                cleaned = clean_document(record, self.config, source, seen_hashes)
-            if cleaned.record is None:
+            if audit_state is not None:
+                self._merge_lm_counter(
+                    audit_state["synthetic_meta_phrase_counter"],
+                    result.synthetic_meta_phrase_counts,
+                )
+            if result.dropped_reason is not None:
                 if audit_state is not None:
-                    audit_state["dropped_reasons"][cleaned.dropped_reason or "dropped"] += 1
+                    audit_state["dropped_reasons"][result.dropped_reason or "dropped"] += 1
                 continue
-            token_ids = tokenizer.encode(cleaned.record.text, add_bos=True, add_eos=True)
+
+            document_id = result.document_id
+            if source.deduplicate and seen_hashes is not None:
+                if allow_reentry:
+                    # On a restart, allow repeats from this source while still blocking
+                    # duplicates that were first introduced by other sources.
+                    if document_id and document_id in seen_hashes and document_id not in source_seen_ids:
+                        if audit_state is not None:
+                            audit_state["dropped_reasons"]["duplicate"] += 1
+                        continue
+                    if document_id:
+                        seen_hashes.add(document_id)
+                else:
+                    if document_id and document_id in seen_hashes:
+                        if audit_state is not None:
+                            audit_state["dropped_reasons"]["duplicate"] += 1
+                        continue
+                    if document_id:
+                        seen_hashes.add(document_id)
+
+            token_ids = list(result.token_ids)
             if len(token_ids) <= 1:
                 if audit_state is not None:
                     audit_state["dropped_reasons"]["too_short_tokenized"] += 1
                 continue
             if audit_state is not None:
-                document_id = cleaned.record.document_id or ""
-                if document_id and document_id in audit_state["unique_document_ids"]:
-                    audit_state["repeated_documents"] += 1
-                if document_id:
-                    audit_state["unique_document_ids"].add(document_id)
-                audit_state["kept_documents"] += 1
-                audit_state["kept_tokens"] += len(token_ids)
-                for phrase in _top_ngram_families(cleaned.record.text):
-                    audit_state["phrase_counter"][phrase] += 1
-                for phrase in _top_ngram_families(cleaned.record.text, n=8, limit=4):
-                    audit_state["phrase_counter_8"][phrase] += 1
-                for phrase in _top_ngram_families(cleaned.record.text, n=12, limit=3):
-                    audit_state["phrase_counter_12"][phrase] += 1
-                for artifact_name, pattern in LM_JUNK_PATTERNS.items():
-                    if pattern.search(cleaned.record.text):
-                        audit_state["quality_artifact_counter"][artifact_name] += 1
+                self._merge_lm_accepted_audit(audit_state, result, len(token_ids))
             if progress_state is not None:
                 progress_state["accepted_records"] = int(progress_state.get("accepted_records", 0)) + 1
             kept_in_iterator += 1
-            yield cleaned.record, token_ids
+            yield (
+                DocumentRecord(
+                    text=result.text,
+                    source=source.name,
+                    document_id=document_id,
+                    metadata=dict(result.metadata),
+                ),
+                token_ids,
+            )
             if max_kept_documents is not None and kept_in_iterator >= max_kept_documents:
                 return
 
@@ -2590,6 +3641,7 @@ class DatasetBuilder:
     ) -> list[dict[str, Any]]:
         states: list[dict[str, Any]] = []
         total_weight = sum(max(float(source.weight), 1e-8) for source in sources)
+        workers_per_source = self._bounded_lm_document_workers(active_source_count=len(sources))
         for index, source in enumerate(sources):
             audit_state = (
                 self._new_lm_audit_state(source)
@@ -2622,6 +3674,7 @@ class DatasetBuilder:
                     progress_state=_progress_state,
                     allow_reentry=allow_reentry,
                     max_kept_documents=max_kept_documents,
+                    num_workers_override=workers_per_source,
                 )
 
             restart_count = 0 if progress_state is None else int(progress_state.get("restart_count", 0))
@@ -2822,11 +3875,9 @@ class DatasetBuilder:
         if self._uses_prepared_sources(sources):
             return self._audit_prepared_lm_stage(stage, sources)
         tokenizer = SentencePieceTokenizer(self.config.tokenizer_path)
-        source_reports: list[dict[str, Any]] = []
         total_documents = 0
         total_tokens = 0
-        family_counts: Counter[str] = Counter()
-        phrase_counter: Counter[str] = Counter()
+        source_audit_states: list[dict[str, Any]] = []
         shared_seen_hashes: set[str] = set()
         total_weight = sum(max(float(source.weight), 1e-8) for source in sources)
         for source in sources:
@@ -2837,62 +3888,186 @@ class DatasetBuilder:
                 tokenizer=tokenizer,
                 seen_hashes=shared_seen_hashes,
                 audit_state=audit_state,
+                num_workers_override=self._configured_lm_audit_workers(),
             ):
                 pass
             kept_documents = int(audit_state["kept_documents"])
             kept_tokens = int(audit_state["kept_tokens"])
             total_documents += kept_documents
             total_tokens += kept_tokens
-            if kept_documents > 0:
-                family_counts[str(audit_state["family"])] += 1
-            phrase_counter.update(audit_state["phrase_counter"])
-            source_reports.append(
-                {
-                    "source": source.name,
-                    "family": audit_state["family"],
-                    "weight": float(source.weight),
-                    "target_share": round(float(audit_state.get("target_share", 0.0)), 6),
-                    "raw_records": int(audit_state["raw_records"]),
-                    "kept_documents": kept_documents,
-                    "kept_tokens": kept_tokens,
-                    "repeated_documents": int(audit_state["repeated_documents"]),
-                    "restart_count": int(audit_state.get("restart_count", 0)),
-                    "repeat_rate": round(
-                        int(audit_state["repeated_documents"]) / max(kept_documents, 1),
-                        6,
-                    ),
-                    "dropped_reasons": _counter_to_sorted_dict(audit_state["dropped_reasons"]),
-                }
-            )
-        self._finalize_lm_source_reports(
-            source_reports,
+            source_audit_states.append(audit_state)
+        diagnostics = self._lm_source_diagnostics(
+            source_audit_states,
             total_tokens=total_tokens,
             total_documents=total_documents,
+            stage=stage,
         )
-        max_source_share = max((float(report["token_share"]) for report in source_reports), default=0.0)
-        max_repeat_rate = max((float(report["repeat_rate"]) for report in source_reports), default=0.0)
-        audit = {
+        return {
             "stage": stage,
             "total_documents": total_documents,
             "total_clean_tokens": total_tokens,
-            "source_reports": source_reports,
-            "source_family_count": sum(1 for count in family_counts.values() if count > 0),
-            "max_single_source_token_share": round(max_source_share, 6),
-            "max_repeat_rate": round(max_repeat_rate, 6),
-            "top_repeated_phrases": [
-                {"phrase": phrase, "count": count}
-                for phrase, count in phrase_counter.most_common(10)
-            ],
+            "source_reports": diagnostics["per_source"],
+            **diagnostics,
         }
-        if stage == "pretrain":
-            domain_contribution = self._pretrain_domain_contribution_summary(
-                source_reports,
-                total_tokens=total_tokens,
-                total_documents=total_documents,
-            )
-            audit["domain_contribution"] = domain_contribution
-            audit["domain_realization_gate"] = self._pretrain_domain_realization_gate(domain_contribution)
-        return audit
+
+    def _configured_lm_document_workers(self) -> int:
+        configured = self.config.tokenizer_num_workers
+        if configured is None:
+            configured = self.config.preprocessing_num_workers
+        if configured is None:
+            configured = self.config.num_workers
+        return max(int(configured or 0), 0)
+
+    def _configured_lm_audit_workers(self) -> int:
+        configured = self.config.audit_num_workers
+        if int(configured or 0) <= 0:
+            configured = self.config.num_workers
+        return max(int(configured or 0), 0)
+
+    def _bounded_lm_document_workers(
+        self,
+        *,
+        num_workers_override: int | None = None,
+        active_source_count: int = 1,
+    ) -> int:
+        configured = (
+            self._configured_lm_document_workers()
+            if num_workers_override is None
+            else max(int(num_workers_override), 0)
+        )
+        if configured <= 1:
+            return 0
+        source_count = max(int(active_source_count), 1)
+        return max(configured // source_count, 1)
+
+    def _iter_serial_lm_document_results(
+        self,
+        source: DataSourceConfig,
+        *,
+        tokenizer: SentencePieceTokenizer,
+        raw_records_consumed: int,
+    ) -> Iterable[LMDocumentProcessResult]:
+        record_index = int(raw_records_consumed)
+        for item in self._load_source_records(source, raw_records_consumed=raw_records_consumed):
+            record_index += 1
+            payload = _lm_document_payload_from_item(item, source, record_index)
+            try:
+                yield _process_lm_document_payload(payload, self.config, source, tokenizer)
+            except Exception as exc:
+                yield LMDocumentProcessResult(
+                    record_index=record_index,
+                    is_text=isinstance(payload.get("text", ""), str),
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
+
+    def _iter_parallel_lm_document_results(
+        self,
+        source: DataSourceConfig,
+        *,
+        raw_records_consumed: int,
+        num_workers: int,
+    ) -> Iterable[LMDocumentProcessResult]:
+        pending: deque[Future[list[LMDocumentProcessResult]]] = deque()
+        max_pending = max(num_workers * LM_DOCUMENT_WORKER_PENDING_MULTIPLIER, 1)
+        records = iter(self._load_source_records(source, raw_records_consumed=raw_records_consumed))
+        next_record_index = int(raw_records_consumed)
+        exhausted = False
+
+        def next_chunk() -> list[dict[str, Any]]:
+            nonlocal next_record_index
+            chunk: list[dict[str, Any]] = []
+            for _ in range(LM_DOCUMENT_WORKER_CHUNK_SIZE):
+                try:
+                    item = next(records)
+                except StopIteration:
+                    break
+                next_record_index += 1
+                chunk.append(_lm_document_payload_from_item(item, source, next_record_index))
+            return chunk
+
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_init_lm_document_worker,
+            initargs=(self.config.to_dict(), source.to_dict(), self.config.tokenizer_path),
+        ) as executor:
+            while True:
+                while len(pending) < max_pending and not exhausted:
+                    chunk = next_chunk()
+                    if not chunk:
+                        exhausted = True
+                        break
+                    pending.append(executor.submit(_process_lm_document_chunk, chunk))
+                if not pending:
+                    break
+                future = pending.popleft()
+                try:
+                    results = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"LM document worker failed for source {source.name!r}: {type(exc).__name__}: {exc}"
+                    ) from exc
+                yield from results
+
+    def _raise_lm_document_worker_error(
+        self,
+        source: DataSourceConfig,
+        result: LMDocumentProcessResult,
+    ) -> None:
+        details = f"\n{result.traceback}" if result.traceback else ""
+        raise RuntimeError(
+            f"LM document worker failed for source {source.name!r} at raw record "
+            f"{result.record_index}: {result.error}{details}"
+        )
+
+    def _merge_lm_counter(self, counter: Counter[str], values: dict[str, Any]) -> None:
+        counter.update({str(key): int(value) for key, value in dict(values).items()})
+
+    def _merge_lm_accepted_audit(
+        self,
+        audit_state: dict[str, Any],
+        result: LMDocumentProcessResult,
+        token_count: int,
+    ) -> None:
+        document_id = result.document_id
+        if document_id and document_id in audit_state["unique_document_ids"]:
+            audit_state["repeated_documents"] += 1
+        if document_id:
+            audit_state["unique_document_ids"].add(document_id)
+        audit_state["kept_documents"] += 1
+        audit_state["kept_tokens"] += token_count
+
+        delta = result.audit_delta
+        audit_state["quality_diagnostic_token_count"] += int(delta.get("quality_diagnostic_token_count", 0))
+        shape_counts = dict(delta.get("shape_counts", {}))
+        audit_state["document_char_count"] += int(shape_counts.get("chars", 0))
+        audit_state["document_word_count"] += int(shape_counts.get("words", 0))
+        audit_state["document_sentence_count"] += int(shape_counts.get("sentences", 0))
+        audit_state["document_paragraph_count"] += int(shape_counts.get("paragraphs", 0))
+        self._merge_lm_counter(
+            audit_state["exact_paragraph_counter"],
+            dict(delta.get("exact_paragraph_counter", {})),
+        )
+        self._merge_lm_counter(
+            audit_state["normalized_paragraph_counter"],
+            dict(delta.get("normalized_paragraph_counter", {})),
+        )
+        for phrase in list(delta.get("phrase_counter", [])):
+            audit_state["phrase_counter"][str(phrase)] += 1
+        for phrase in list(delta.get("phrase_counter_8", [])):
+            audit_state["phrase_counter_8"][str(phrase)] += 1
+        for phrase in list(delta.get("phrase_counter_12", [])):
+            audit_state["phrase_counter_12"][str(phrase)] += 1
+        for phrase in list(delta.get("phrase_counter_20", [])):
+            audit_state["phrase_counter_20"][str(phrase)] += 1
+        self._merge_lm_counter(
+            audit_state["quality_artifact_counter"],
+            dict(delta.get("quality_artifact_counter", {})),
+        )
+        self._merge_lm_counter(
+            audit_state["quality_artifact_occurrence_counter"],
+            dict(delta.get("quality_artifact_occurrence_counter", {})),
+        )
 
     def assess_continue_readiness(self) -> dict[str, Any]:
         audit = self.audit_lm_stage("continue")

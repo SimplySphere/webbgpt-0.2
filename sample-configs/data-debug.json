@@ -1,21 +1,7 @@
 {
   "allow_unsafe_code": false,
-  "continued_pretrain_sources": [
-    {
-      "deduplicate": false,
-      "format": "text",
-      "language": "en",
-      "metadata_fields": [],
-      "name": "local_tokenizer_corpus",
-      "path": "data/raw/tokenizer_corpus.txt",
-      "pii_scrub": false,
-      "quality_filter": false,
-      "split": "train",
-      "text_field": "text",
-      "weight": 1.0
-    }
-  ],
-  "continued_pretraining_token_budget": 15000000000,
+  "continued_pretrain_sources": [],
+  "continued_pretraining_token_budget": 0,
   "domain_tags": [
     "philosophy",
     "education",
@@ -153,36 +139,36 @@
   "sequence_length": 512,
   "sft_sources": [
     {
-      "deduplicate": false,
-      "format": "jsonl",
-      "language": "en",
-      "max_records": 64,
-      "metadata_fields": [],
       "name": "debug_sft_train_subset",
-      "path": "data/posttrain/sft_curated_batch_010.jsonl",
-      "pii_scrub": false,
-      "quality_filter": false,
-      "skip_records": 0,
+      "path": "data/local/sft.jsonl",
       "split": "train",
+      "format": "jsonl",
+      "weight": 1.0,
       "text_field": "text",
-      "weight": 1.0
+      "metadata_fields": [],
+      "language": "en",
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false,
+      "skip_records": 0,
+      "max_records": 64
     }
   ],
   "sft_validation_sources": [
     {
-      "deduplicate": false,
-      "format": "jsonl",
-      "language": "en",
-      "max_records": 16,
-      "metadata_fields": [],
       "name": "debug_sft_validation_subset",
-      "path": "data/posttrain/sft_curated_batch_010.jsonl",
-      "pii_scrub": false,
-      "quality_filter": false,
-      "skip_records": 64,
+      "path": "data/local/sft_validation.jsonl",
       "split": "train",
+      "format": "jsonl",
+      "weight": 1.0,
       "text_field": "text",
-      "weight": 1.0
+      "metadata_fields": [],
+      "language": "en",
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false,
+      "skip_records": 0,
+      "max_records": 16
     }
   ],
   "tokenizer_path": "artifacts/tokenizer/webbgpt.model",

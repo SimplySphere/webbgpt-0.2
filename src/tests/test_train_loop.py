@@ -76,6 +76,7 @@ class _FakeParameter:
 class _FakeModel:
     def __init__(self):
         self._parameter = _FakeParameter()
+        self.active_checkpoint = "current"
 
     def parameters(self):
         return iter([self._parameter])
@@ -103,6 +104,17 @@ class _FakeNonFiniteModel(_FakeModel):
         if self.calls == 1:
             return types.SimpleNamespace(loss=_FakeLoss(float("nan")))
         return types.SimpleNamespace(loss=_FakeLoss(1.0))
+
+
+class _FakeLossSequenceModel(_FakeModel):
+    def __init__(self, losses):
+        super().__init__()
+        self.losses = list(losses)
+
+    def __call__(self, **_batch):
+        if not self.losses:
+            return types.SimpleNamespace(loss=_FakeLoss(1.0))
+        return types.SimpleNamespace(loss=_FakeLoss(self.losses.pop(0)))
 
 
 class _FakeOptimizer:
@@ -138,6 +150,37 @@ class _FakeCheckpointManager:
         target = Path("/tmp") / f"webbgpt-{name}"
         target.mkdir(parents=True, exist_ok=True)
         return target
+
+
+class _StatefulFakeCheckpointManager:
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.named_saves = []
+        self.loads = []
+
+    def save_named(self, name, step, model, optimizer=None, scheduler=None, extra_state=None):
+        self.named_saves.append((name, step, getattr(model, "active_checkpoint", "current"), extra_state))
+        target = self.output_dir / name
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def save(self, step, model, optimizer=None, scheduler=None, extra_state=None):
+        target = self.output_dir / f"step-{step:08d}"
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def load(self, path, model, optimizer=None, scheduler=None, dataloader=None, strict=True):
+        del optimizer, scheduler, dataloader, strict
+        target = Path(path)
+        self.loads.append(str(target))
+        if target.name == "best":
+            model.active_checkpoint = "best"
+            step = 2
+        else:
+            model.active_checkpoint = "current"
+            step = 5
+        return types.SimpleNamespace(step=step, payload={"extra_state": {}})
 
 
 def test_maybe_compile_model_falls_back_when_dynamo_is_unsupported(monkeypatch, capsys):
@@ -359,6 +402,115 @@ def test_run_training_merges_eval_payload_and_saves_best_checkpoint(monkeypatch,
     assert "progress_summary" in train_payloads[0]
 
 
+def test_final_selection_confirms_interim_best_with_larger_eval(monkeypatch, tmp_path):
+    fake_checkpoint = types.ModuleType("train.checkpoint")
+    fake_checkpoint.CheckpointManager = object
+    fake_distributed = types.ModuleType("train.distributed")
+    fake_distributed.barrier = lambda: None
+    fake_distributed.is_main_process = lambda: True
+
+    monkeypatch.setitem(sys.modules, "train.checkpoint", fake_checkpoint)
+    monkeypatch.setitem(sys.modules, "train.distributed", fake_distributed)
+    sys.modules.pop("train.loop", None)
+
+    train_loop = importlib.import_module("train.loop")
+
+    def fake_require_torch():
+        return _FakeTorch(), None, None
+
+    eval_calls = []
+
+    def fake_evaluate(model, _loader, max_batches):
+        eval_calls.append((getattr(model, "active_checkpoint", "current"), max_batches))
+        if max_batches == 2:
+            loss = 0.7 if len(eval_calls) == 1 else 0.9
+            return {"loss": loss, "perplexity": loss * 10, "batches_evaluated": 2, "examples_evaluated": 2}
+        if getattr(model, "active_checkpoint", "current") == "best":
+            return {"loss": 0.6, "perplexity": 6.0, "batches_evaluated": 20, "examples_evaluated": 20}
+        return {"loss": 0.8, "perplexity": 8.0, "batches_evaluated": 20, "examples_evaluated": 20}
+
+    monkeypatch.setattr(train_loop, "_require_torch", fake_require_torch)
+    monkeypatch.setattr(train_loop, "_to_device", lambda batch, _device: batch)
+    monkeypatch.setattr(train_loop, "barrier", lambda: None)
+    monkeypatch.setattr(train_loop, "is_main_process", lambda: True)
+
+    output_dir = tmp_path / "final-selection"
+    checkpoint_manager = _StatefulFakeCheckpointManager(output_dir)
+    model = _FakeModel()
+    state = train_loop.run_training(
+        model=model,
+        train_loader=[
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+            {"attention_mask": _FakeMask(2)},
+        ],
+        train_config=TrainConfig(
+            run_name="test-final-selection",
+            global_batch_size=1,
+            max_steps=5,
+            micro_batch_size=1,
+            gradient_accumulation_steps=1,
+            learning_rate=1e-4,
+            min_learning_rate=1e-5,
+            warmup_steps=1,
+            eval_every_steps=2,
+            log_every_steps=100,
+            num_eval_batches=2,
+            checkpoint=CheckpointConfig(output_dir=str(output_dir), save_every_steps=1000),
+        ),
+        checkpoint_manager=checkpoint_manager,
+        optimizer=_FakeOptimizer(),
+        scheduler=_FakeScheduler(),
+        val_loader=[{"attention_mask": _FakeMask(2)}],
+        best_checkpoint_name="best",
+        eval_fn=fake_evaluate,
+        eval_control=train_loop.EvalControl(
+            stage_name="pretrain",
+            eval_interval_steps=2,
+            validation_max_batches=2,
+            final_validation_max_batches=20,
+            validation_dataset_size=20,
+        ),
+        eval_payload_callback=lambda *_args, **_kwargs: {
+            "family_eval": {
+                "catalog_grounding_prose": {
+                    "loss": 1.2,
+                    "examples_evaluated": 100,
+                    "windows_evaluated": 100,
+                    "coverage_percent": 100.0,
+                }
+            },
+            "family_eval_coverage": {
+                "family_count": 1,
+                "total_examples_evaluated": 100,
+                "total_windows_evaluated": 100,
+                "coverage_percent": 100.0,
+                "sequence_length": 512,
+            },
+            "best_family": "catalog_grounding_prose",
+            "worst_family": "catalog_grounding_prose",
+        },
+    )
+
+    selection = json.loads((output_dir / "best" / "selection.json").read_text())
+
+    assert state.best_eval_step == 2
+    assert state.best_eval_loss == 0.6
+    assert model.active_checkpoint == "current"
+    assert selection["selection_eval_mode"] == "final_subset"
+    assert selection["selection_eval_batches"] == 20
+    assert selection["selection_eval_coverage_percent"] == 100.0
+    assert selection["selected_from_interim_eval"] is True
+    assert selection["final_selection_confirmed"] is True
+    assert selection["family_eval_coverage"]["total_windows_evaluated"] == 100
+    assert selection["family_eval"]["catalog_grounding_prose"]["examples_evaluated"] == 100
+    assert selection["best_interim_checkpoint"]["final_metrics"]["loss"] == 0.6
+    assert selection["final_checkpoint"]["final_metrics"]["loss"] == 0.8
+    assert [call[1] for call in eval_calls] == [2, 2, 20, 20]
+
+
 def test_run_training_skips_nonfinite_losses(monkeypatch, capsys):
     fake_checkpoint = types.ModuleType("train.checkpoint")
     fake_checkpoint.CheckpointManager = object
@@ -467,6 +619,188 @@ def test_to_device_preserves_non_tensor_metadata(monkeypatch):
     moved = train_loop._to_device(batch, "cpu")
 
     assert moved["provenance_json"] == ['{"source_names":["general_clean_prose"]}']
+
+
+def test_run_training_logs_tiered_low_and_high_loss_batch_provenance(monkeypatch):
+    fake_checkpoint = types.ModuleType("train.checkpoint")
+    fake_checkpoint.CheckpointManager = object
+    fake_distributed = types.ModuleType("train.distributed")
+    fake_distributed.barrier = lambda: None
+    fake_distributed.is_main_process = lambda: True
+
+    monkeypatch.setitem(sys.modules, "train.checkpoint", fake_checkpoint)
+    monkeypatch.setitem(sys.modules, "train.distributed", fake_distributed)
+    sys.modules.pop("train.loop", None)
+
+    train_loop = importlib.import_module("train.loop")
+
+    def fake_require_torch():
+        return _FakeTorch(), None, None
+
+    monkeypatch.setattr(train_loop, "_require_torch", fake_require_torch)
+    monkeypatch.setattr(train_loop, "_to_device", lambda batch, _device: batch)
+    monkeypatch.setattr(train_loop, "barrier", lambda: None)
+    monkeypatch.setattr(train_loop, "is_main_process", lambda: True)
+
+    events: list[dict[str, object]] = []
+    train_loader = [
+        {
+            "attention_mask": _FakeMask(11),
+            "provenance_json": [
+                json.dumps(
+                    {
+                        "source_names": ["catalog_domain_fixture"],
+                        "contributors": [
+                            {
+                                "source": "catalog_domain_fixture",
+                                "family": "catalog_grounding_prose",
+                                "document_id": "doc-low",
+                            }
+                        ],
+                        "packed_document_count": 1,
+                        "approximate_token_count": 11,
+                    }
+                )
+            ],
+        },
+        {
+            "attention_mask": _FakeMask(13),
+            "provenance_json": [
+                json.dumps(
+                    {
+                        "source_names": ["advising_domain_fixture"],
+                        "contributors": [
+                            {
+                                "source": "advising_domain_fixture",
+                                "family": "advising_planning_prose",
+                                "document_id": "doc-suspicious",
+                            }
+                        ],
+                        "packed_document_count": 1,
+                        "approximate_token_count": 13,
+                    }
+                )
+            ],
+        },
+        {
+            "attention_mask": _FakeMask(15),
+            "provenance_json": [
+                json.dumps(
+                    {
+                        "source_names": ["domain_lm_fixture"],
+                        "contributors": [
+                            {
+                                "source": "domain_lm_fixture",
+                                "family": "webb_domain_seed_prose",
+                                "document_id": "doc-broad",
+                            }
+                        ],
+                        "packed_document_count": 1,
+                        "approximate_token_count": 15,
+                    }
+                )
+            ],
+        },
+        {
+            "attention_mask": _FakeMask(17),
+            "provenance_json": [
+                json.dumps(
+                    {
+                        "source_names": ["fineweb_extension_corpus"],
+                        "contributors": [
+                            {
+                                "source": "fineweb_extension_corpus",
+                                "family": "public_prose",
+                                "document_id": "doc-high",
+                            }
+                        ],
+                        "packed_document_count": 1,
+                        "approximate_token_count": 17,
+                    }
+                )
+            ],
+        },
+    ]
+
+    state = train_loop.run_training(
+        model=_FakeLossSequenceModel([0.04, 0.08, 0.2, 2.5]),
+        train_loader=train_loader,
+        train_config=TrainConfig(
+            run_name="test-provenance-extremes",
+            global_batch_size=1,
+            max_steps=4,
+            micro_batch_size=1,
+            gradient_accumulation_steps=1,
+            learning_rate=1e-4,
+            min_learning_rate=1e-5,
+            warmup_steps=1,
+            log_every_steps=1000,
+            log_batch_provenance_extremes=True,
+            severe_low_loss_threshold=0.05,
+            suspicious_low_loss_threshold=0.1,
+            broad_low_loss_threshold=0.5,
+            high_loss_probe_threshold=2.0,
+            checkpoint=CheckpointConfig(output_dir="/tmp/webbgpt-test", save_every_steps=1000),
+        ),
+        checkpoint_manager=_FakeCheckpointManager(),
+        optimizer=_FakeOptimizer(),
+        scheduler=_FakeScheduler(),
+        train_event_printer=events.append,
+    )
+
+    provenance_events = [event for event in events if str(event.get("event", "")).endswith("_loss_batch_provenance")]
+    assert state.step == 4
+    assert [event["event"] for event in provenance_events] == [
+        "severe_low_loss_batch_provenance",
+        "suspicious_low_loss_batch_provenance",
+        "high_loss_batch_provenance",
+    ]
+    assert provenance_events[0]["loss"] == 0.04
+    assert provenance_events[0]["tier"] == "severe"
+    assert provenance_events[0]["threshold"] == 0.05
+    assert provenance_events[0]["source_names"] == ["catalog_domain_fixture"]
+    assert provenance_events[0]["contributors"][0]["document_id"] == "doc-low"
+    assert provenance_events[0]["packed_document_count"] == 1
+    assert provenance_events[0]["approximate_token_count"] == 11
+    assert provenance_events[1]["loss"] == 0.08
+    assert provenance_events[1]["tier"] == "suspicious"
+    assert provenance_events[1]["threshold"] == 0.1
+    assert provenance_events[1]["source_names"] == ["advising_domain_fixture"]
+    assert provenance_events[1]["contributors"][0]["document_id"] == "doc-suspicious"
+    assert provenance_events[2]["loss"] == 2.5
+    assert provenance_events[2]["threshold"] == 2.0
+    assert provenance_events[2]["source_names"] == ["fineweb_extension_corpus"]
+    assert provenance_events[2]["contributors"][0]["document_id"] == "doc-high"
+    assert provenance_events[2]["approximate_token_count"] == 17
+    assert state.low_loss_event_count == 3
+    assert state.low_loss_events_by_tier == {"severe": 1, "suspicious": 1, "broad": 1}
+    assert state.low_loss_events_by_source == {
+        "advising_domain_fixture": 1,
+        "catalog_domain_fixture": 1,
+        "domain_lm_fixture": 1,
+    }
+    assert state.min_low_loss_event["contributors"][0]["document_id"] == "doc-low"
+    summary_events = [
+        event for event in events if event.get("event") == "low_loss_batch_provenance_summary"
+    ]
+    assert len(summary_events) == 1
+    assert summary_events[0]["low_loss_event_count"] == 3
+    assert summary_events[0]["unique_low_loss_steps"] == 3
+    assert summary_events[0]["low_loss_events_by_tier"] == {
+        "severe": 1,
+        "suspicious": 1,
+        "broad": 1,
+    }
+    assert summary_events[0]["low_loss_events_by_source_by_tier"]["domain_lm_fixture"] == {
+        "broad": 1
+    }
+    assert summary_events[0]["min_low_loss_event"]["contributors"][0]["document_id"] == "doc-low"
+    assert summary_events[0]["top_low_loss_sources"] == [
+        {"source": "advising_domain_fixture", "count": 1},
+        {"source": "catalog_domain_fixture", "count": 1},
+        {"source": "domain_lm_fixture", "count": 1},
+    ]
+    assert summary_events[0]["top_low_loss_contributors"][0]["document_id"] == "doc-broad"
 
 
 def test_run_training_honors_qualitative_stop_request(monkeypatch, capsys):

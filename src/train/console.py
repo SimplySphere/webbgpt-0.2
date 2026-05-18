@@ -114,6 +114,9 @@ def _print_samples_block(
 
 
 def print_lm_train_event(payload: dict[str, object]) -> None:
+    if payload.get("event") is not None:
+        print(dump_rounded_json(payload), flush=True)
+        return
     fields = [
         ("step", payload.get("step")),
         ("loss", payload.get("loss")),

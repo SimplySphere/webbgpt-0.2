@@ -1,12 +1,100 @@
-Students benefit from clear explanations, concise definitions, and practical examples.
-Good study habits usually combine planning, focused practice, and steady review.
-Helpful assistants answer directly when the question is clear and low risk.
-A useful paragraph introduces one main idea, develops it with evidence, and closes with a related point.
-When instructions are simple, the best response should follow them without adding unrelated background.
-Readers can understand a new concept more easily when the explanation starts with familiar language.
-Strong summaries preserve the main claim while leaving out details that do not change the meaning.
-When a process has several steps, clear writing names the order and explains why each step matters.
-An informative article should keep its topic stable from the opening sentence to the final sentence.
-Definitions are more useful when they include boundaries, examples, and common misunderstandings.
-Good public information avoids exaggeration and separates what is known from what is only possible.
-Plain prose should be coherent before it becomes clever, detailed, or persuasive.
+Clear writing usually begins with one main idea and enough context for the reader to follow it.
+A concise definition is easier to remember when it includes a boundary and a plain example.
+Strong paragraphs move from a claim to evidence and then back to the point being explained.
+Readers understand unfamiliar terms more quickly when the explanation uses familiar language first.
+A useful summary preserves the central claim without repeating every supporting detail.
+Complex topics become easier when each step is introduced in the order it matters.
+Good public information separates confirmed facts from possibilities, estimates, and opinions.
+Plain prose can be direct without becoming abrupt or leaving out necessary context.
+An explanation should stay close to its topic instead of drifting into unrelated background.
+Careful writing often names the problem before offering a solution.
+A comparison works best when both sides are described with the same level of detail.
+Readers trust a passage more when the limits of the evidence are stated clearly.
+A process description should explain what happens first, what follows, and why the order matters.
+Definitions are more useful when they mention common misunderstandings before they cause confusion.
+An informative article should keep its opening promise through the final sentence.
+Short sentences can make difficult material easier, but they still need clear connections.
+Evidence becomes more persuasive when the writer explains how it supports the conclusion.
+A useful example shows the idea in action rather than simply restating the definition.
+General advice is stronger when it gives the reader a concrete next step.
+Accurate language matters because small differences in wording can change the meaning.
+Good explanations avoid exaggeration when the available evidence is limited.
+A paragraph with too many claims can be hard to follow even when each sentence is clear.
+Readers often need a simple frame before they can understand a detailed argument.
+A careful writer distinguishes between cause, correlation, sequence, and coincidence.
+Background information should prepare the reader for the point rather than replace the point.
+When a term has several meanings, the passage should identify which meaning is being used.
+A strong transition shows how one idea leads to the next.
+Readable prose depends on structure as much as vocabulary.
+The best opening sentence gives the reader a reason to keep going.
+An example can be brief if it clearly illustrates the point.
+Reliable explanations avoid pretending that uncertain information is settled.
+A long paragraph is easier to follow when its sentences build toward one purpose.
+The conclusion of an article should connect the evidence back to the main question.
+When instructions are simple, extra commentary can make them harder to use.
+Good analysis explains not only what happened but why it matters.
+A useful distinction can prevent two similar ideas from being treated as identical.
+Technical information becomes clearer when the writer defines abbreviations before using them.
+A passage can be detailed and still remain easy to scan.
+The strongest explanation often begins with the most ordinary version of the idea.
+Readers benefit when a writer names the assumption behind a recommendation.
+A balanced account includes relevant limits without losing sight of the main point.
+Clear prose avoids making every sentence carry the same emphasis.
+An effective comparison describes similarities before emphasizing differences.
+Good writing uses examples to clarify the idea, not to distract from it.
+When evidence is incomplete, cautious language is more accurate than confident speculation.
+A paragraph should not introduce a new topic in its final sentence unless the next paragraph develops it.
+Definitions become stronger when they show what the term does not include.
+An explanation of a rule should identify both the rule and the reason for it.
+Readers can follow a sequence more easily when the passage uses concrete time markers.
+Simple language is not the same as shallow thinking.
+A useful overview gives enough structure for the details to make sense.
+Good prose makes relationships visible: cause, contrast, sequence, example, and result.
+The first draft of an explanation often improves when unnecessary framing is removed.
+Specific nouns usually help more than vague labels.
+A responsible writer avoids filling gaps in the evidence with convenient assumptions.
+An argument is easier to evaluate when its evidence is separated from its conclusion.
+A clear explanation can be brief, but it should not skip the step that makes the idea understandable.
+Readers notice when a passage changes topics without warning.
+A strong revision often replaces abstract phrasing with concrete information.
+Good informational prose answers the question it raises.
+The order of details can determine whether an explanation feels obvious or confusing.
+A useful note tells the reader what changed and why the change matters.
+When a concept is broad, examples can show the range without pretending to cover every case.
+Clear sentences reduce the effort required to understand a difficult subject.
+A good paragraph should have enough focus that its main idea can be summarized in one sentence.
+Evidence should be relevant to the claim rather than merely interesting.
+The most helpful background is the background needed for the next idea.
+Careful prose avoids hiding uncertainty behind vague phrasing.
+A practical explanation gives the reader a way to apply the idea.
+When two terms sound similar, a brief distinction can prevent a large misunderstanding.
+Readable analysis often alternates between general claims and concrete examples.
+An introduction should orient the reader without delaying the topic for too long.
+A concluding sentence can reinforce the point without repeating the opening word for word.
+Good writing gives the reader enough context to judge the importance of a detail.
+A sentence with several clauses should make the main action easy to find.
+The best examples are specific enough to be useful and simple enough to understand.
+An explanation loses force when it adds facts that do not support the point.
+Careful writers revise for order before they revise for style.
+A useful passage names the subject, describes the issue, and explains the consequence.
+Good prose can be plain and still carry a strong argument.
+When a reader reaches a difficult section, signposts can make the structure visible.
+The strongest summary leaves out details that would change nothing about the main point.
+An unfamiliar idea becomes less intimidating when it is connected to something ordinary.
+Writers improve clarity by removing repeated phrases that do not add new meaning.
+A claim should be narrow enough that the evidence can support it.
+Clear writing often depends on choosing the right level of detail.
+An effective paragraph does not ask the reader to infer the main connection alone.
+Examples should illuminate the rule rather than become a second topic.
+When a passage uses numbers, it should explain what the numbers represent.
+A careful explanation does not treat a convenient example as proof of a general rule.
+Good writing often begins by deciding what the reader needs to know next.
+The final sentence of a paragraph should leave the reader prepared for the following idea.
+A useful description balances accuracy, order, and restraint.
+When information is partial, a responsible passage states what is known and what remains unclear.
+Good prose makes the relationship between sentences easy to follow.
+An informative paragraph should be coherent before it becomes elaborate.
+The clearest explanation is usually the one that removes unnecessary choices for the reader.
+A strong piece of writing helps the reader understand both the detail and the larger pattern.
+Good revision replaces vague claims with concrete relationships between ideas.
+The strongest examples make an abstract point visible without overwhelming the paragraph.

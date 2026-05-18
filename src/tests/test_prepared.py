@@ -1,7 +1,15 @@
 from pathlib import Path
 
+import pytest
+
 from config import TokenizerConfig
-from data.prepared import encode_preference_example, encode_sft_messages
+from data.prepared import (
+    encode_preference_example,
+    encode_sft_messages,
+    save_buffer_rows,
+    save_prepared_manifest,
+    validate_prepared_manifest_artifacts,
+)
 from tokenizer.spm import SentencePieceTokenizer, train_tokenizer
 
 
@@ -122,3 +130,55 @@ def test_encode_preference_example_appends_real_eos_token(tmp_path: Path):
     )
 
     assert tokenizer.token_to_id("</s>") in token_ids
+
+
+def test_validate_prepared_manifest_artifacts_accepts_valid_packed_manifest(tmp_path: Path):
+    shard_dir = tmp_path / "pretrain"
+    shard_dir.mkdir()
+    shard_path = shard_dir / "shard-00000.npy"
+    save_buffer_rows(shard_path, [[1, 2, 3, 0]])
+    manifest_path = tmp_path / "pretrain.json"
+    save_prepared_manifest(
+        manifest_path,
+        {
+            "version": "1.0",
+            "stage": "pretrain",
+            "kind": "packed_lm",
+            "input_fingerprint": "fingerprint",
+            "tokenizer_path": "artifacts/tokenizer/webbgpt.model",
+            "sequence_length": 4,
+            "pad_token_id": 0,
+            "num_sequences": 1,
+            "num_tokens": 3,
+            "source_snapshots": [],
+            "shards": [{"path": str(shard_path), "rows": 1}],
+        },
+    )
+
+    manifest = validate_prepared_manifest_artifacts(manifest_path, expected_kind="packed_lm")
+
+    assert manifest["kind"] == "packed_lm"
+
+
+def test_validate_prepared_manifest_artifacts_fails_for_missing_shard(tmp_path: Path):
+    manifest_path = tmp_path / "pretrain.json"
+    missing_shard = tmp_path / "pretrain" / "shard-00000.npy"
+    save_prepared_manifest(
+        manifest_path,
+        {
+            "version": "1.0",
+            "stage": "pretrain",
+            "kind": "packed_lm",
+            "input_fingerprint": "fingerprint",
+            "tokenizer_path": "artifacts/tokenizer/webbgpt.model",
+            "sequence_length": 4,
+            "pad_token_id": 0,
+            "num_sequences": 1,
+            "num_tokens": 3,
+            "source_snapshots": [],
+            "shards": [{"path": str(missing_shard), "rows": 1}],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="references missing shard artifact"):
+        validate_prepared_manifest_artifacts(manifest_path, expected_kind="packed_lm")

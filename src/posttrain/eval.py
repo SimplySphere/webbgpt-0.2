@@ -12,8 +12,8 @@ from tokenizer import SentencePieceTokenizer, format_chat
 
 
 POSTTRAIN_REGRESSION_PATH = "data/eval/posttrain_regression.jsonl"
-PRETRAIN_REGRESSION_PATH = "data/eval/pretrain_regression.jsonl"
-PRETRAIN_FAMILY_HOLDOUTS_PATH = "data/eval/pretrain_family_holdouts.json"
+PRETRAIN_REGRESSION_PATH = "data/eval/pretrain_general_regression.jsonl"
+PRETRAIN_FAMILY_HOLDOUTS_PATH = "data/eval/pretrain_family_holdouts_general.json"
 PRETRAIN_QUALITATIVE_RUBRIC = [
     {
         "perplexity_band": "300+",
@@ -86,23 +86,100 @@ SOURCE_MENTION_PATTERNS: dict[str, tuple[str, ...]] = {
         "[source: handbook]",
     ),
 }
+RAW_LM_GENERIC_ATTRACTOR_CATEGORIES = {
+    "word_language_text": {
+        "word",
+        "words",
+        "language",
+        "term",
+        "terms",
+        "text",
+        "texts",
+    },
+    "book_story_article_essay": {
+        "book",
+        "books",
+        "story",
+        "stories",
+        "article",
+        "articles",
+        "essay",
+        "essays",
+    },
+    "water_fire_land_history": {
+        "water",
+        "fire",
+        "river",
+        "rivers",
+        "land",
+        "city",
+        "cities",
+        "war",
+        "wars",
+    },
+    "problem_issue_solution": {
+        "problem",
+        "problems",
+        "issue",
+        "issues",
+        "solution",
+        "solutions",
+    },
+    "data_study_research_result": {
+        "data",
+        "study",
+        "studies",
+        "research",
+        "result",
+        "results",
+    },
+    "product_computer_video_project": {
+        "product",
+        "products",
+        "computer",
+        "computers",
+        "video",
+        "videos",
+        "project",
+        "projects",
+    },
+    "student_course_class_teacher": {
+        "student",
+        "students",
+        "course",
+        "courses",
+        "class",
+        "classes",
+        "teacher",
+        "teachers",
+    },
+    "health_body_child_medical": {
+        "health",
+        "body",
+        "bodies",
+        "child",
+        "children",
+        "virus",
+        "viruses",
+        "infection",
+        "infections",
+        "diet",
+        "diets",
+        "heart",
+    },
+    "generic_fillers": {
+        "world",
+        "time",
+        "thing",
+        "things",
+        "same",
+        "important",
+        "process",
+        "people",
+    },
+}
 RAW_LM_GENERIC_ATTRACTORS = {
-    "student",
-    "students",
-    "course",
-    "courses",
-    "body",
-    "child",
-    "children",
-    "world",
-    "health",
-    "time",
-    "thing",
-    "things",
-    "same",
-    "important",
-    "process",
-    "people",
+    term for terms in RAW_LM_GENERIC_ATTRACTOR_CATEGORIES.values() for term in terms
 }
 RAW_LM_STOPWORDS = {
     "a",
@@ -171,6 +248,51 @@ RAW_LM_DOMAIN_TERMS = {
     "webb",
     "workload",
 }
+RAW_LM_CATALOG_CONTEXT_TERMS = {
+    "catalog",
+    "course",
+    "courses",
+    "class",
+    "classes",
+}
+RAW_LM_CATALOG_GROUNDING_TERMS = {
+    "approval",
+    "credit",
+    "credits",
+    "department",
+    "departmental",
+    "eligible",
+    "eligibility",
+    "enroll",
+    "enrollment",
+    "prerequisite",
+    "prerequisites",
+}
+RAW_LM_RECOMMENDATION_GROUNDING_TERMS = {
+    "background",
+    "eligible",
+    "eligibility",
+    "prerequisite",
+    "prerequisites",
+    "recommendation",
+    "recommendations",
+    "required",
+    "requirement",
+    "requirements",
+}
+RAW_LM_CREDIT_GROUNDING_TERMS = {
+    "credit",
+    "credits",
+    "eligible",
+    "eligibility",
+    "enroll",
+    "enrollment",
+    "junior",
+    "juniors",
+    "open",
+    "senior",
+    "seniors",
+}
 RAW_LM_DOMAIN_BOILERPLATE = (
     "catalog entry should be read",
     "read for any placement or departmental approval notes",
@@ -178,12 +300,36 @@ RAW_LM_DOMAIN_BOILERPLATE = (
     "a useful continuation",
     "grounded in the catalog",
 )
+RAW_LM_CATALOG_DRIFT_PATTERNS = (
+    "course catalog",
+    "catalog entry",
+    "catalog facts",
+    "catalog says",
+    "department approval",
+    "departmental approval",
+    "one-half credit",
+    "prerequisite",
+    "prerequisites",
+    "webb",
+)
 RAW_LM_NARRATIVE_DRIFT_PATTERNS = (
+    "catalog",
+    "course",
+    "students",
+    "the article",
+    "this article",
+    "the study",
+    "the research",
+    "the history of",
+    "geography",
     "in the early",
     "in the late",
     "united states",
     "population",
     "century",
+    "government",
+    "largest city",
+    "first country",
     "was first known",
     "was established",
 )
@@ -200,11 +346,51 @@ RAW_LM_EVERYDAY_MEDICAL_DRIFT_TERMS = {
     "medical",
     "pain",
     "symptoms",
+    "virus",
+    "viruses",
+    "infection",
+    "infections",
+    "heart",
+}
+RAW_LM_EVERYDAY_PRODUCT_RESEARCH_DRIFT_TERMS = {
+    "computer",
+    "computers",
+    "data",
+    "product",
+    "products",
+    "project",
+    "projects",
+    "research",
+    "study",
+    "studies",
+    "video",
+    "videos",
+}
+RAW_LM_MAJOR_FAILURE_REASONS = {
+    "prompt_topic_retention_too_low",
+    "domain_collapse",
+    "boilerplate_repetition",
+    "semantic_repetition",
+    "narrative_to_expository_drift",
+    "everyday_to_medical_drift",
+    "catalog_advising_drift_into_unrelated_prompt",
+    "malformed_token_rate_high",
 }
 RAW_WORD_RE = re.compile(r"[a-zA-Z][a-zA-Z']*")
 WEIRD_HYPHEN_RE = re.compile(
     r"(?:\b[a-zA-Z]{1,6}-){2,}[a-zA-Z]{1,10}\b|-[a-zA-Z]{1,4}-|"
     r"\b(?:Newth|F-the-s|based-in|in-in|to-in|mvp-[a-z]{1,3})\b"
+)
+MALFORMED_WORD_RE = re.compile(
+    r"\b(?:scheduleite|berled|inology|engagingable|pronting|unforgetable)\b|"
+    r"\b[a-z]{4,}ingable\b|"
+    r"\bover-the-[a-z]{2,4}\b",
+    re.IGNORECASE,
+)
+QUOTE_SYLLABLE_LOOP_RE = re.compile(
+    r"[\"'“”‘’][a-z]{1,4}[\"'“”‘’](?:\s+(?:or|and|is|means|of|in|as)\s+"
+    r"[\"'“”‘’][a-z]{1,4}[\"'“”‘’]){2,}",
+    re.IGNORECASE,
 )
 
 
@@ -764,15 +950,26 @@ def evaluate_pretrain_family_holdouts(
             family_metrics[family] = {
                 "loss": round(average_loss, 6),
                 "perplexity": round(math.exp(min(average_loss, 20.0)), 6),
+                "examples_evaluated": len(texts),
                 "windows_evaluated": len(losses),
+                "coverage_percent": 100.0,
             }
         if not family_metrics:
             return {"families": {}, "best_family": None, "worst_family": None}
         ranked = sorted(family_metrics.items(), key=lambda item: float(item[1]["loss"]))
+        total_examples = sum(int(metrics["examples_evaluated"]) for metrics in family_metrics.values())
+        total_windows = sum(int(metrics["windows_evaluated"]) for metrics in family_metrics.values())
         return {
             "families": family_metrics,
             "best_family": ranked[0][0],
             "worst_family": ranked[-1][0],
+            "coverage": {
+                "family_count": len(family_metrics),
+                "total_examples_evaluated": total_examples,
+                "total_windows_evaluated": total_windows,
+                "coverage_percent": 100.0,
+                "sequence_length": sequence_length,
+            },
         }
     finally:
         model.train(previous_training)
@@ -853,6 +1050,10 @@ def _content_keywords(text: str) -> set[str]:
     }
 
 
+def _semantic_content_words(words: list[str]) -> list[str]:
+    return [word for word in words if len(word) >= 4 and word not in RAW_LM_STOPWORDS]
+
+
 def _ngram_counts(words: list[str], n: int) -> dict[tuple[str, ...], int]:
     counts: dict[tuple[str, ...], int] = {}
     if len(words) < n:
@@ -880,6 +1081,55 @@ def _legible_raw_lm_span(text: str, *, max_words: int | None = None) -> bool:
     if max_word_count / max(len(words), 1) >= 0.22:
         return False
     return any(char in span for char in "abcdefghijklmnopqrstuvwxyz")
+
+
+def _repeated_ngram_rate(words: list[str], n: int) -> float:
+    counts = _ngram_counts(words, n)
+    total = max(len(words) - n + 1, 1)
+    repeated_extra = sum(count - 1 for count in counts.values() if count > 1)
+    return repeated_extra / total
+
+
+def _semantic_repetition_metrics(words: list[str]) -> dict[str, Any]:
+    content_words = _semantic_content_words(words)
+    content_total = len(content_words)
+    content_counts = {word: content_words.count(word) for word in set(content_words)}
+    dominant_content_word_rate = max(content_counts.values(), default=0) / max(content_total, 1)
+    bigram_rate = _repeated_ngram_rate(content_words, 2)
+    trigram_rate = _repeated_ngram_rate(content_words, 3)
+    semantic_loop_detected = bool(
+        content_total >= 8
+        and (
+            dominant_content_word_rate >= 0.24
+            or bigram_rate >= 0.18
+            or trigram_rate >= 0.12
+            or max(_ngram_counts(content_words, 3).values(), default=0) >= 3
+        )
+    )
+    return {
+        "dominant_content_word_rate": dominant_content_word_rate,
+        "repeated_content_bigram_rate": bigram_rate,
+        "repeated_content_trigram_rate": trigram_rate,
+        "semantic_loop_detected": semantic_loop_detected,
+    }
+
+
+def _generic_attractor_category_counts(words: list[str]) -> dict[str, int]:
+    return {
+        category: sum(1 for word in words if word in terms)
+        for category, terms in RAW_LM_GENERIC_ATTRACTOR_CATEGORIES.items()
+    }
+
+
+def _malformed_token_hits(text: str) -> list[str]:
+    hits = [match.group(0) for match in MALFORMED_WORD_RE.finditer(text)]
+    hits.extend(match.group(0) for match in WEIRD_HYPHEN_RE.finditer(text))
+    if QUOTE_SYLLABLE_LOOP_RE.search(text):
+        hits.append("quote_syllable_loop")
+    small_quoted_tokens = re.findall(r"[\"'“”‘’]([a-zA-Z]{1,4})[\"'“”‘’]", text)
+    if len(small_quoted_tokens) >= 6 and len(set(token.lower() for token in small_quoted_tokens)) <= 4:
+        hits.append("repeated_quoted_syllables")
+    return hits
 
 
 def _sample_topic_retained(sample: dict[str, Any], response: str) -> bool:
@@ -940,7 +1190,35 @@ def _domain_phrase_accurate(sample: dict[str, Any], response: str) -> bool | Non
     boilerplate_hits = sum(1 for phrase in RAW_LM_DOMAIN_BOILERPLATE if phrase in lower)
     if boilerplate_hits >= 2:
         return False
+    prompt_words = set(_raw_words(prompt))
+    if {"credit", "juniors", "seniors", "open"} & prompt_words or "one-half credit" in prompt:
+        return bool(words & RAW_LM_CREDIT_GROUNDING_TERMS)
+    if {"recommendation", "recommendations", "background"} & prompt_words or "different from recommendations" in prompt:
+        return bool(words & RAW_LM_RECOMMENDATION_GROUNDING_TERMS)
+    if "catalog" in bucket or "catalog" in prompt or "course" in prompt or "class" in prompt:
+        has_course_context = bool(words & RAW_LM_CATALOG_CONTEXT_TERMS)
+        has_grounding = bool(words & RAW_LM_CATALOG_GROUNDING_TERMS)
+        return has_course_context and has_grounding
+    if "domain" in probe_type:
+        return bool(words & (RAW_LM_CATALOG_GROUNDING_TERMS | RAW_LM_RECOMMENDATION_GROUNDING_TERMS))
     return True
+
+
+def _is_domain_tracking_sample(sample: dict[str, Any]) -> bool:
+    bucket = str(sample.get("bucket") or "").lower()
+    probe_type = str(sample.get("probe_type") or "").lower()
+    prompt = str(sample.get("prompt") or "").lower()
+    return "domain" in probe_type or "catalog" in bucket or "catalog" in prompt or "course" in prompt
+
+
+def _catalog_or_advising_drifted_into_unrelated_prompt(sample: dict[str, Any], response: str) -> bool:
+    if _is_domain_tracking_sample(sample):
+        return False
+    prompt = str(sample.get("prompt") or "").lower()
+    lower = response.lower()
+    if any(pattern in prompt for pattern in RAW_LM_CATALOG_DRIFT_PATTERNS):
+        return False
+    return any(pattern in lower for pattern in RAW_LM_CATALOG_DRIFT_PATTERNS)
 
 
 def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -955,11 +1233,20 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
     weird_hyphen_total = 0
     unfinished_count = 0
     generic_attractor_samples = 0
+    generic_attractor_category_totals = {category: 0 for category in RAW_LM_GENERIC_ATTRACTOR_CATEGORIES}
     domain_boilerplate_samples = 0
     domain_phrase_total = 0
     domain_phrase_accurate = 0
+    catalog_domain_drift_count = 0
     narrative_drift_count = 0
     everyday_medical_drift_count = 0
+    everyday_product_research_drift_count = 0
+    semantic_loop_count = 0
+    dominant_content_word_rates: list[float] = []
+    repeated_content_bigram_rates: list[float] = []
+    repeated_content_trigram_rates: list[float] = []
+    malformed_token_samples = 0
+    malformed_token_total = 0
     drift_scores: list[float] = []
     cross_sample_domain_boilerplate_counter: dict[str, int] = {}
 
@@ -987,6 +1274,10 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
         weird_count = len(WEIRD_HYPHEN_RE.findall(response))
         weird_hyphen_total += weird_count
         weird_hyphen_samples += int(weird_count > 0)
+        malformed_hits = _malformed_token_hits(response)
+        malformed_count = len(malformed_hits)
+        malformed_token_total += malformed_count
+        malformed_token_samples += int(malformed_count > 0)
 
         unfinished = _looks_unfinished(response)
         unfinished_count += int(unfinished)
@@ -995,6 +1286,9 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
         generic_rate = generic_count / max(word_count, 1)
         generic_attractor = generic_rate >= 0.16 or generic_count >= 20
         generic_attractor_samples += int(generic_attractor)
+        generic_category_counts = _generic_attractor_category_counts(words)
+        for category, count in generic_category_counts.items():
+            generic_attractor_category_totals[category] += count
 
         boilerplate_hits = [phrase for phrase in RAW_LM_DOMAIN_BOILERPLATE if phrase in lower]
         for phrase in boilerplate_hits:
@@ -1017,13 +1311,29 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
             and bool(set(words) & RAW_LM_EVERYDAY_MEDICAL_DRIFT_TERMS)
         )
         everyday_medical_drift_count += int(everyday_medical_drift)
+        everyday_product_research_drift = (
+            "everyday" in bucket
+            and not (prompt_words & RAW_LM_EVERYDAY_PRODUCT_RESEARCH_DRIFT_TERMS)
+            and sum(1 for word in words if word in RAW_LM_EVERYDAY_PRODUCT_RESEARCH_DRIFT_TERMS) >= 2
+        )
+        everyday_product_research_drift_count += int(everyday_product_research_drift)
+        catalog_domain_drift = _catalog_or_advising_drifted_into_unrelated_prompt(sample, response)
+        catalog_domain_drift_count += int(catalog_domain_drift)
+
+        semantic_metrics = _semantic_repetition_metrics(words)
+        dominant_content_word_rates.append(float(semantic_metrics["dominant_content_word_rate"]))
+        repeated_content_bigram_rates.append(float(semantic_metrics["repeated_content_bigram_rate"]))
+        repeated_content_trigram_rates.append(float(semantic_metrics["repeated_content_trigram_rate"]))
+        semantic_loop = bool(semantic_metrics["semantic_loop_detected"])
+        semantic_loop_count += int(semantic_loop)
 
         drift_score = 0.0
         drift_score += 0.35 if not retained else 0.0
         drift_score += 0.20 if generic_attractor else 0.0
         drift_score += 0.15 if repeated_phrase else 0.0
-        drift_score += 0.15 if weird_count > 0 else 0.0
-        drift_score += 0.10 if narrative_drift or everyday_medical_drift else 0.0
+        drift_score += 0.15 if malformed_count > 0 or weird_count > 0 else 0.0
+        drift_score += 0.15 if semantic_loop else 0.0
+        drift_score += 0.10 if narrative_drift or everyday_medical_drift or everyday_product_research_drift or catalog_domain_drift else 0.0
         drift_score += 0.05 if unfinished else 0.0
         drift_scores.append(min(drift_score, 1.0))
 
@@ -1040,12 +1350,21 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
                 "prompt_topic_retained": retained,
                 "max_repeated_4gram_count": sample_max_4gram,
                 "weird_hyphen_or_subword_count": weird_count,
+                "malformed_token_hits": malformed_hits,
+                "malformed_token_count": malformed_count,
                 "unfinished_output": unfinished,
                 "generic_attractor_rate": round(generic_rate, 6),
+                "generic_attractor_category_counts": generic_category_counts,
                 "domain_boilerplate_hits": boilerplate_hits,
                 "domain_phrase_accurate": phrase_accuracy,
+                "catalog_domain_drift": catalog_domain_drift,
                 "narrative_expository_drift": narrative_drift,
                 "everyday_medical_or_child_drift": everyday_medical_drift,
+                "everyday_product_or_research_drift": everyday_product_research_drift,
+                "dominant_content_word_rate": round(float(semantic_metrics["dominant_content_word_rate"]), 6),
+                "repeated_content_bigram_rate": round(float(semantic_metrics["repeated_content_bigram_rate"]), 6),
+                "repeated_content_trigram_rate": round(float(semantic_metrics["repeated_content_trigram_rate"]), 6),
+                "semantic_loop_detected": semantic_loop,
                 "semantic_drift_score": round(min(drift_score, 1.0), 6),
             }
         )
@@ -1059,9 +1378,14 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
     )
     repeated_phrase_rate = repeated_phrase_samples / max(sample_count, 1)
     weird_hyphen_or_subword_rate = weird_hyphen_total / max(sum(len(_raw_words(str(sample.get("clean_response") or sample.get("response") or ""))) for sample in samples), 1)
+    malformed_token_rate = malformed_token_total / max(sum(len(_raw_words(str(sample.get("clean_response") or sample.get("response") or ""))) for sample in samples), 1)
     unfinished_output_rate = unfinished_count / max(sample_count, 1)
     generic_attractor_rate = generic_attractor_samples / max(sample_count, 1)
     semantic_drift_score = sum(drift_scores) / max(len(drift_scores), 1)
+    max_dominant_content_word_rate = max(dominant_content_word_rates, default=0.0)
+    max_repeated_content_bigram_rate = max(repeated_content_bigram_rates, default=0.0)
+    max_repeated_content_trigram_rate = max(repeated_content_trigram_rates, default=0.0)
+    semantic_loop_detected = semantic_loop_count > 0
 
     reasons: list[str] = []
     if blank_count:
@@ -1074,18 +1398,35 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
         reasons.append("dominant_repeated_4gram")
     if weird_hyphen_or_subword_rate > 0.025 or weird_hyphen_samples >= max(2, sample_count // 5):
         reasons.append("weird_hyphen_or_subword_artifacts")
+    if malformed_token_rate > 0.015 or malformed_token_samples >= max(1, sample_count // 6):
+        reasons.append("malformed_token_rate_high")
     if domain_phrase_total and domain_boilerplate_samples >= domain_phrase_total:
         reasons.append("domain_boilerplate_repetition")
-    if domain_phrase_accuracy is not None and domain_phrase_accuracy < 0.5:
-        reasons.append("domain_phrase_accuracy_too_low")
-    if narrative_drift_count >= 2:
+        reasons.append("boilerplate_repetition")
+    if catalog_domain_drift_count > 0:
+        reasons.append("catalog_advising_drift_into_unrelated_prompt")
+    if semantic_loop_detected or max_repeated_content_bigram_rate >= 0.18 or max_repeated_content_trigram_rate >= 0.12:
+        reasons.append("semantic_repetition")
+    if narrative_drift_count >= 1:
         reasons.append("narrative_prompts_drift_to_expository_history")
-    if everyday_medical_drift_count >= 2:
+        reasons.append("narrative_to_expository_drift")
+    if everyday_medical_drift_count >= 1 or everyday_product_research_drift_count >= 1:
         reasons.append("everyday_prompts_drift_to_medical_body_child_content")
+        reasons.append("everyday_to_medical_drift")
     if generic_attractor_rate > 0.4:
         reasons.append("generic_attractor_collapse")
     if semantic_drift_score > 0.45:
         reasons.append("semantic_drift_too_high")
+    reasons = list(dict.fromkeys(reasons))
+
+    failure_mode_counts = {
+        "topic_drift": sample_count - topic_retained,
+        "domain_misuse": (domain_phrase_total - domain_phrase_accurate) + catalog_domain_drift_count,
+        "semantic_loop": semantic_loop_count,
+        "malformed_generation": malformed_token_samples,
+        "genre_collapse": narrative_drift_count + everyday_medical_drift_count + everyday_product_research_drift_count,
+        "boilerplate_repetition": domain_boilerplate_samples,
+    }
 
     aggregate = {
         "sample_count": sample_count,
@@ -1099,13 +1440,25 @@ def assess_raw_lm_sample_behavior(samples: list[dict[str, Any]]) -> dict[str, An
         "repeated_phrase_rate": repeated_phrase_rate,
         "max_repeated_4gram_count": max_repeated_4gram_count,
         "weird_hyphen_or_subword_rate": weird_hyphen_or_subword_rate,
+        "malformed_token_rate": malformed_token_rate,
+        "malformed_token_sample_count": malformed_token_samples,
         "unfinished_output_rate": unfinished_output_rate,
         "generic_attractor_rate": generic_attractor_rate,
+        "generic_attractor_category_counts": generic_attractor_category_totals,
         "domain_boilerplate_repetition_rate": domain_boilerplate_repetition_rate,
         "domain_phrase_accuracy": domain_phrase_accuracy,
+        "catalog_domain_drift_count": catalog_domain_drift_count,
+        "dominant_content_word_rate": max_dominant_content_word_rate,
+        "mean_dominant_content_word_rate": sum(dominant_content_word_rates) / max(len(dominant_content_word_rates), 1),
+        "repeated_content_bigram_rate": max_repeated_content_bigram_rate,
+        "repeated_content_trigram_rate": max_repeated_content_trigram_rate,
+        "semantic_loop_detected": semantic_loop_detected,
+        "semantic_loop_sample_count": semantic_loop_count,
         "semantic_drift_score": semantic_drift_score,
         "narrative_expository_drift_count": narrative_drift_count,
         "everyday_medical_or_child_drift_count": everyday_medical_drift_count,
+        "everyday_product_or_research_drift_count": everyday_product_research_drift_count,
+        "failure_mode_counts": failure_mode_counts,
         "top_domain_boilerplate_phrases": [
             {"phrase": phrase, "count": count}
             for phrase, count in sorted(
@@ -1127,6 +1480,11 @@ def raw_lm_quality_status(
     short_stable_quality: dict[str, Any],
     long_stress_quality: dict[str, Any],
 ) -> str:
+    short_reasons = set(short_stable_quality.get("raw_lm_quality_gate_reasons", []))
+    long_reasons = set(long_stress_quality.get("raw_lm_quality_gate_reasons", []))
+    has_major_failure = bool((short_reasons | long_reasons) & RAW_LM_MAJOR_FAILURE_REASONS)
+    if has_major_failure:
+        return "weak_raw_lm"
     if bool(short_stable_quality.get("raw_lm_quality_gate_passed")) and bool(
         long_stress_quality.get("raw_lm_quality_gate_passed")
     ):

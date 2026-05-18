@@ -1,0 +1,48 @@
+{
+  "version": "1.0",
+  "tokenizer_path": "artifacts/tokenizer/webbgpt-local-mvp.model",
+  "sequence_length": 512,
+  "prepared_shard_size": 64,
+  "seed": 52,
+  "pretraining_token_budget": 0,
+  "continued_pretraining_token_budget": 0,
+  "pretrain_sources": [],
+  "continued_pretrain_sources": [],
+  "sft_sources": [
+    {
+      "name": "local_sft_examples",
+      "path": "data/local/sft.jsonl",
+      "format": "jsonl",
+      "weight": 1.0,
+      "messages_field": "messages",
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false
+    },
+    {
+      "name": "local_sft_grounding_guardrails",
+      "path": "data/local/sft_grounding_guardrails.jsonl",
+      "format": "jsonl",
+      "weight": 1.0,
+      "messages_field": "messages",
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false
+    }
+  ],
+  "sft_validation_sources": [
+    {
+      "name": "local_sft_validation",
+      "path": "data/local/sft_validation.jsonl",
+      "format": "jsonl",
+      "weight": 1.0,
+      "messages_field": "messages",
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false
+    }
+  ],
+  "preference_sources": [],
+  "preference_validation_sources": [],
+  "validation_sources": []
+}

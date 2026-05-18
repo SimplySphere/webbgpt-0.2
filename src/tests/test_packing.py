@@ -19,7 +19,14 @@ def test_pack_token_sequences_drops_one_token_tail_window():
     packed = pack_token_sequences(sequences, sequence_length=4, pad_token_id=0, eos_token_id=9)
 
     assert packed == [[1, 2, 3, 4]]
-    assert all(sum(token != 0 for token in row) > 1 for row in packed)
+    assert all(sum(token != 0 for token in row) >= 3 for row in packed)
+
+
+def test_pack_token_sequences_drops_content_token_plus_eos_window():
+    sequences = [[1]]
+    packed = pack_token_sequences(sequences, sequence_length=4, pad_token_id=0, eos_token_id=9)
+
+    assert packed == []
 
 
 def test_packer_tracks_dropped_short_windows_across_state_restore():
@@ -34,9 +41,9 @@ def test_packer_tracks_dropped_short_windows_across_state_restore():
     assert restored.dropped_short_windows == 1
 
 
-def test_finish_with_metadata_drops_one_token_current_window():
+def test_finish_with_metadata_drops_nearly_empty_current_window():
     packer = PackedSequencePacker(sequence_length=4, pad_token_id=0, eos_token_id=9)
 
-    assert list(packer.push_with_metadata([9], {"source": "tiny"})) == []
+    assert list(packer.push_with_metadata([42], {"source": "tiny"})) == []
     assert list(packer.finish_with_metadata()) == []
     assert packer.dropped_short_windows == 1
