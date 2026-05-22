@@ -1,0 +1,8 @@
+Title: Catalog Prerequisites
+Provenance: Curated explanatory source material for WebbGPT RAG, based on reviewed catalog source-material themes. This file is not a current policy, staff, deadline, dining, dorm, admissions, or phone source.
+Risk level: low
+Allowed use: RAG
+
+A course prerequisite is a requirement that should be completed before a student takes a later course. Course prerequisites are catalog requirements, not just suggestions. In catalog language, prerequisites tell students and advisors that earlier preparation is expected as a condition for enrollment or placement. Prerequisite language helps students plan sequences, avoid choosing courses out of order, and understand when a course depends on prior skills or background knowledge.
+
+If a catalog entry does not list a prerequisite, this source does not establish that there is a hidden prerequisite. Students should still check the current catalog, course request process, advisor guidance, and placement instructions when making actual course decisions.

@@ -6,7 +6,8 @@ import re
 from typing import TYPE_CHECKING
 
 from generation import default_stop_strings as default_generation_stop_strings
-from serve.quality import analyze_generation, degenerate_output_message
+from rag.simple_index import format_rag_context
+from serve.quality import analyze_generation
 from serve.types import AssistantResponse, ChatMessage
 from tokenizer import format_chat
 
@@ -15,6 +16,10 @@ if TYPE_CHECKING:
 
 
 COURSE_CODE_RE = re.compile(r"\b[a-z]{2,6}\s?-?\d{2,4}[a-z]?\b", re.IGNORECASE)
+MANUAL_CONTEXT_RE = re.compile(
+    r"context\s*:\s*(?P<context>.+?)\s*(?:question\s*:|$)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class AssistantOrchestrator:
@@ -22,8 +27,10 @@ class AssistantOrchestrator:
         self,
         backend,
         grounding_provider: GroundingProvider | WebbGroundingProvider | None = None,
+        rag_retriever=None,
         default_max_tokens: int = 512,
         default_temperature: float = 0.7,
+        default_top_k: int | None = 50,
         default_top_p: float = 0.95,
         default_repetition_penalty: float = 1.05,
         default_no_repeat_ngram_size: int = 4,
@@ -34,8 +41,10 @@ class AssistantOrchestrator:
     ):
         self.backend = backend
         self.grounding_provider = grounding_provider
+        self.rag_retriever = rag_retriever
         self.default_max_tokens = default_max_tokens
         self.default_temperature = default_temperature
+        self.default_top_k = default_top_k
         self.default_top_p = default_top_p
         self.default_repetition_penalty = default_repetition_penalty
         self.default_no_repeat_ngram_size = default_no_repeat_ngram_size
@@ -226,6 +235,32 @@ class AssistantOrchestrator:
             f"so I cannot verify the answer to: {query}"
         )
 
+    def _manual_context(self, query: str) -> str | None:
+        match = MANUAL_CONTEXT_RE.search(query)
+        if not match:
+            return None
+        context = re.sub(r"\s+", " ", match.group("context")).strip()
+        return context or None
+
+    def _rag_hit_metadata(self, hit: dict) -> dict:
+        preview = str(hit.get("text_preview") or hit.get("text") or "").strip()
+        if len(preview) > 420:
+            preview = preview[:420].rsplit(" ", 1)[0].strip()
+        return {
+            "chunk_id": hit.get("chunk_id"),
+            "score": hit.get("score"),
+            "source_file": hit.get("source_file"),
+            "source_category": hit.get("source_category"),
+            "title": hit.get("title"),
+            "text_preview": preview,
+            "risk_level": hit.get("risk_level"),
+            "allowed_use": hit.get("allowed_use"),
+            "word_count": hit.get("word_count"),
+            "matched_terms": list(hit.get("matched_terms") or []),
+            "missing_terms": list(hit.get("missing_terms") or []),
+            "lexical_overlap": hit.get("lexical_overlap"),
+        }
+
     def _summary_line(
         self,
         *,
@@ -235,10 +270,22 @@ class AssistantOrchestrator:
         abstained_due_to_no_hits: bool,
         degenerate_output: bool,
         safe_decode: bool,
+        final_label: str = "Generated",
+        retrieved_context_fallback: bool = False,
     ) -> str:
+        if final_label == "Weak generation":
+            if retrieved_hits:
+                return "Local-MVP text was generated with retrieved context, but the quality check flagged low confidence."
+            return "Local-MVP text was generated, but the quality check flagged low confidence."
+        if final_label == "Generated with sources":
+            return f"Local-MVP text was generated with {retrieved_hits} retrieved source chunk(s)."
+        if final_label == "Generated":
+            return "Local-MVP text was generated from the current model."
+        if retrieved_context_fallback:
+            return "Retrieved context was found, but generation failed; showing retrieved passages instead."
         if degenerate_output:
             suffix = "Safe decode was enabled." if safe_decode else "Safe decode was not enabled."
-            return f"Generation failed due to malformed output. {suffix}"
+            return f"Local-MVP text was generated, but the quality check flagged malformed output. {suffix}"
         if abstained_due_to_no_hits:
             return f"Grounded {route.replace('_', ' ')} lookup found no hits, so the assistant abstained deterministically."
         if used_tools:
@@ -266,6 +313,10 @@ class AssistantOrchestrator:
         snapshot_id: str | None = None,
         quality: dict | None = None,
         raw_output: str | None = None,
+        rag: dict | None = None,
+        manual_context: dict | None = None,
+        final_label: str = "Generated",
+        retrieved_context_fallback: bool = False,
     ) -> dict:
         summary = self._summary_line(
             used_tools=used_tools,
@@ -274,6 +325,8 @@ class AssistantOrchestrator:
             abstained_due_to_no_hits=abstained_due_to_no_hits,
             degenerate_output=degenerate_output,
             safe_decode=safe_decode,
+            final_label=final_label,
+            retrieved_context_fallback=retrieved_context_fallback,
         )
         return {
             "grounded": used_tools,
@@ -288,6 +341,10 @@ class AssistantOrchestrator:
                 "cited": bool(citation_labels) and not degenerate_output,
                 "abstained": abstained_due_to_no_hits,
                 "degenerate_output": degenerate_output,
+                "generation_failed": final_label == "Generation failed",
+                "retrieved_context_fallback": retrieved_context_fallback,
+                "answered": final_label in {"Generated", "Generated with sources", "Weak generation"},
+                "final_label": final_label,
             },
             "summary": summary,
             "routing": {
@@ -318,6 +375,16 @@ class AssistantOrchestrator:
                 "routes_checked": list(routes_checked or []),
                 "routes_with_hits": list(routes_with_hits or []),
             },
+            "rag": rag
+            or {
+                "enabled": self.rag_retriever is not None,
+                "queried": False,
+                "no_hit": False,
+                "retrieved_hits": 0,
+                "hits": [],
+                "diagnostics": {},
+            },
+            "manual_context": manual_context or {"detected": False},
             "quality": quality or {"degenerate": False, "reasons": [], "metrics": {}},
             "debug": {
                 "raw_output": raw_output,
@@ -338,10 +405,31 @@ class AssistantOrchestrator:
         tools: bool = True,
         citations: bool = True,
         safe_decode: bool = False,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
     ) -> AssistantResponse:
         parsed_messages = [
             message if isinstance(message, ChatMessage) else ChatMessage(**message) for message in messages
         ]
+        query = next(message.content for message in reversed(parsed_messages) if message.role == "user")
+        manual_context_text = self._manual_context(query)
+        manual_context_info = {
+            "detected": manual_context_text is not None,
+            "context_preview": (manual_context_text or "")[:420],
+            "context_characters": len(manual_context_text or ""),
+        }
+        rag_info = {
+            "enabled": self.rag_retriever is not None,
+            "queried": False,
+            "no_hit": False,
+            "retrieved_hits": 0,
+            "hits": [],
+            "instruction": None,
+            "diagnostics": {},
+            "skipped_reason": None,
+        }
         route_details = self._route_decision_details(parsed_messages)
         route = route_details["route"]
         should_ground = route_details["grounded"]
@@ -357,14 +445,58 @@ class AssistantOrchestrator:
         snapshot_id = self.catalog_snapshot.get("snapshot_id")
         routes_checked: list[str] = []
         routes_with_hits: list[str] = []
-        effective_max_tokens = self.default_max_tokens
-        effective_temperature = self.default_temperature
-        effective_top_p = self.default_top_p
+        effective_max_tokens = self.default_max_tokens if max_tokens is None else max(1, int(max_tokens))
+        effective_temperature = self.default_temperature if temperature is None else max(0.0, float(temperature))
+        effective_top_k = self.default_top_k if top_k is None else max(0, int(top_k))
+        effective_top_p = self.default_top_p if top_p is None else min(1.0, max(1e-5, float(top_p)))
         effective_repetition_penalty = self.default_repetition_penalty
         effective_no_repeat_ngram_size = self.default_no_repeat_ngram_size
         effective_decode_preset = self.decode_preset
         stop_reason = "not_reported_by_backend"
-        query = next(message.content for message in reversed(parsed_messages) if message.role == "user")
+        if tools and self.rag_retriever is not None and manual_context_text is None:
+            rag_result = self.rag_retriever.query(query)
+            rag_hits = list(rag_result.get("hits") or [])
+            rag_info.update(
+                {
+                    "queried": True,
+                    "no_hit": bool(rag_result.get("no_hit")),
+                    "retrieved_hits": len(rag_hits),
+                    "hits": [self._rag_hit_metadata(hit) for hit in rag_hits],
+                    "diagnostics": dict(rag_result.get("diagnostics") or {}),
+                }
+            )
+            if rag_hits:
+                rag_instruction = (
+                    "Use the retrieved context below when it is relevant, but still generate a local-MVP answer. "
+                    "If the context does not answer the question, say what the model can infer and avoid inventing "
+                    "names, dates, policies, courses, or sources."
+                )
+                rag_info["instruction"] = rag_instruction
+                effective_messages.insert(
+                    0,
+                    ChatMessage(
+                        role="system",
+                        content=(
+                            "You are WebbGPT 0.2, a local-MVP research model.\n"
+                            f"{rag_instruction}\n\n"
+                            "Retrieved context:\n"
+                            f"{format_rag_context(rag_hits)}"
+                        ),
+                    ),
+                )
+                used_tools = False
+        elif tools and self.rag_retriever is not None and manual_context_text is not None:
+            rag_info["skipped_reason"] = "manual_context_prompt"
+            effective_messages.insert(
+                0,
+                ChatMessage(
+                    role="system",
+                    content=(
+                        "Use only the manual context in the user prompt. If it does not answer the question, say that "
+                        "the provided context does not contain enough information."
+                    ),
+                ),
+            )
         if used_tools and self._ambiguous_timeframe(query, school_years):
             clarification = (
                 "Your question mixes a current timeframe with an explicit historical year. "
@@ -390,6 +522,9 @@ class AssistantOrchestrator:
                     stop_reason="timeframe_clarification_required",
                     citation_labels=[],
                     snapshot_id=snapshot_id,
+                    rag=rag_info,
+                    manual_context=manual_context_info,
+                    final_label="Abstained",
                 ),
             )
         if used_tools:
@@ -420,6 +555,9 @@ class AssistantOrchestrator:
                         stop_reason="deterministic_no_hit_fallback",
                         citation_labels=citation_labels,
                         snapshot_id=snapshot_id,
+                        rag=rag_info,
+                        manual_context=manual_context_info,
+                        final_label="Abstained",
                     ),
                 )
             effective_messages.insert(
@@ -427,7 +565,7 @@ class AssistantOrchestrator:
                 ChatMessage(
                     role="system",
                     content=(
-                        "You are WebbGPT. "
+                        "You are WebbGPT 0.2, a local-MVP research model. "
                         f"{self._grounded_instruction(routes_with_hits or routes_to_try)}\n\n"
                         f"{grounding_context}"
                     ),
@@ -436,33 +574,42 @@ class AssistantOrchestrator:
         if safe_decode:
             effective_decode_preset = f"{self.decode_preset}-safe"
             effective_temperature = 0.0
+            effective_top_k = None
             effective_top_p = 1.0
             effective_repetition_penalty = max(self.default_repetition_penalty, 1.10)
             effective_no_repeat_ngram_size = max(self.default_no_repeat_ngram_size, 4)
-            effective_max_tokens = min(self.default_max_tokens, 128 if used_tools else 96)
+            effective_max_tokens = min(effective_max_tokens, 128 if used_tools else 96)
 
         prompt = format_chat([asdict(message) for message in effective_messages], add_generation_prompt=True)
         raw_text = self.backend.generate(
             prompt,
             max_tokens=effective_max_tokens,
             temperature=effective_temperature,
+            top_k=effective_top_k,
             top_p=effective_top_p,
             repetition_penalty=effective_repetition_penalty,
             no_repeat_ngram_size=effective_no_repeat_ngram_size,
             stop_strings=self.default_stop_strings,
         ).strip()
-        quality = analyze_generation(raw_text)
+        rag_context_text = " ".join(str(hit.get("text_preview") or "") for hit in rag_info.get("hits") or [])
+        quality_context = manual_context_text or rag_context_text
+        quality = analyze_generation(
+            raw_text,
+            prompt=query,
+            context=quality_context,
+            grounded=bool(manual_context_text or rag_info.get("retrieved_hits")),
+        )
         if quality["degenerate"]:
-            text = degenerate_output_message()
             citation_labels = [citation.label for citation in grounding_citations[:3]]
+            response_used_tools = used_tools or bool(rag_info.get("retrieved_hits"))
             metadata = self._base_metadata(
-                used_tools=used_tools,
-                route=route,
+                used_tools=response_used_tools,
+                route="rag" if rag_info.get("retrieved_hits") else ("manual_context" if manual_context_text else route),
                 candidate_routes=candidate_routes,
                 routes_checked=routes_checked,
                 routes_with_hits=routes_with_hits,
                 low_confidence=low_confidence,
-                retrieved_hits=retrieved_hits,
+                retrieved_hits=retrieved_hits + int(rag_info.get("retrieved_hits") or 0),
                 abstained_due_to_no_hits=False,
                 degenerate_output=True,
                 safe_decode=safe_decode,
@@ -472,10 +619,14 @@ class AssistantOrchestrator:
                 snapshot_id=snapshot_id,
                 quality=quality,
                 raw_output=raw_text,
+                rag=rag_info,
+                manual_context=manual_context_info,
+                final_label="Weak generation",
+                retrieved_context_fallback=False,
             )
             return AssistantResponse(
-                text=text,
-                used_tools=used_tools,
+                text=raw_text,
+                used_tools=response_used_tools,
                 citations=grounding_citations if citations else [],
                 metadata=metadata,
             )
@@ -484,18 +635,22 @@ class AssistantOrchestrator:
             citation_labels = ", ".join(citation.label for citation in grounding_citations[:3])
             text = f"{text}\n\n[source: {citation_labels}]"
         citation_labels = [citation.label for citation in grounding_citations[:3]]
+        response_used_tools = used_tools or bool(rag_info.get("retrieved_hits"))
+        response_route = "rag" if rag_info.get("retrieved_hits") else ("manual_context" if manual_context_text else route)
+        response_candidate_routes = ["rag"] if rag_info.get("retrieved_hits") else candidate_routes
+        final_label = "Generated with sources" if rag_info.get("retrieved_hits") else "Generated"
         return AssistantResponse(
             text=text,
-            used_tools=used_tools,
+            used_tools=response_used_tools,
             citations=grounding_citations if citations else [],
             metadata=self._base_metadata(
-                used_tools=used_tools,
-                route=route,
-                candidate_routes=candidate_routes,
+                used_tools=response_used_tools,
+                route=response_route,
+                candidate_routes=response_candidate_routes,
                 routes_checked=routes_checked,
                 routes_with_hits=routes_with_hits,
                 low_confidence=low_confidence,
-                retrieved_hits=retrieved_hits,
+                retrieved_hits=retrieved_hits + int(rag_info.get("retrieved_hits") or 0),
                 abstained_due_to_no_hits=no_hit_fallback,
                 degenerate_output=False,
                 safe_decode=safe_decode,
@@ -504,5 +659,8 @@ class AssistantOrchestrator:
                 citation_labels=citation_labels,
                 snapshot_id=snapshot_id,
                 quality=quality,
+                rag=rag_info,
+                manual_context=manual_context_info,
+                final_label=final_label,
             ),
         )

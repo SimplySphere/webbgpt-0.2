@@ -20,6 +20,7 @@ from serve.app import build_app
 from serve.backends.transformers_backend import TransformersChatBackend
 from serve.quality import analyze_generation
 from serve.orchestrator import AssistantOrchestrator
+from serve.playground import render_playground_html
 from serve.types import ChatMessage
 
 
@@ -72,7 +73,9 @@ def test_orchestrator_retains_should_ground_compatibility():
 def test_orchestrator_intercepts_degenerate_output():
     orchestrator = AssistantOrchestrator(_DegenerateBackend(), catalog_snapshot={"snapshot_id": "demo"})
     reply = orchestrator.respond([ChatMessage(role="user", content="Hi there")])
-    assert "response generation failed" in reply.text.lower()
+    assert reply.text == ",,,, a,,, and,,, not,,, the,,, of,,, is,,, or,,,-,,, you,,, an,,,s,,,."
+    assert reply.metadata["status"]["final_label"] == "Weak generation"
+    assert reply.metadata["status"]["answered"] is True
     assert reply.metadata["status"]["degenerate_output"] is True
     assert reply.metadata["debug"]["raw_output"]
 
@@ -132,6 +135,137 @@ def test_chat_endpoint_serializes_slotted_citations(monkeypatch: pytest.MonkeyPa
             "metadata": {"page": 1},
         }
     ]
+
+
+def test_generate_alias_wraps_chat_completion(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class _Backend:
+        backend_name = "dummy"
+        device = "cpu"
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class _Orchestrator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def respond(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(text="Alias answer", used_tools=False, citations=[], metadata={})
+
+    monkeypatch.setattr("serve.app.VLLMChatBackend", _Backend)
+    monkeypatch.setattr("serve.app.TransformersChatBackend", _Backend)
+    monkeypatch.setattr("serve.app.AssistantOrchestrator", _Orchestrator)
+    monkeypatch.setattr("serve.app.seed_everything", lambda _seed: {"python": 52, "numpy": 52, "torch": 52})
+
+    client = TestClient(build_app(ServeConfig(enable_grounding=False)))
+    status = client.get("/status").json()
+    response = client.post(
+        "/generate",
+        json={
+            "prompt": "At Webb, students often...",
+            "tools": False,
+            "citations": False,
+            "max_new_tokens": 12,
+            "temperature": 0.4,
+            "top_k": 40,
+            "top_p": 0.95,
+        },
+    )
+
+    assert "/generate" in status["endpoints"]
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["text"] == "Alias answer"
+    assert payload["metadata"]["api"] == {"route": "/generate", "canonical": "/v1/chat/completions"}
+    assert captured["messages"] == [{"role": "user", "content": "At Webb, students often..."}]
+    assert captured["kwargs"]["tools"] is False
+    assert captured["kwargs"]["citations"] is False
+    assert captured["kwargs"]["max_tokens"] == 12
+    assert captured["kwargs"]["temperature"] == pytest.approx(0.4)
+    assert captured["kwargs"]["top_k"] == 40
+    assert captured["kwargs"]["top_p"] == pytest.approx(0.95)
+
+
+def test_playground_uses_webbgpt_02_labels_and_final_prompt_chips():
+    html = render_playground_html(ServeConfig(use_rag=True))
+    expected_order = [
+        "hi WebbGPT 0.2, how are you?",
+        "What is the difference between a prerequisite and a recommendation?",
+        "What does a course catalog help students understand?",
+        "What is the phone policy in the dining hall?",
+        "A course catalog helps students",
+        "During a science project, the first step is",
+    ]
+
+    assert "<title>WebbGPT 0.2 Chat</title>" in html
+    assert "<strong>WebbGPT 0.2</strong>" in html
+    assert "Use RAG" in html
+    assert "Show sources" in html
+    assert "Sources available" in html
+    assert "What is the Hogwarts dining policy?" not in html
+    assert "hi im harry potter" not in html
+    positions = [html.index(prompt) for prompt in expected_order]
+    assert positions == sorted(positions)
+
+
+def test_generate_stream_progressively_reveals_final_response(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    class _Backend:
+        backend_name = "dummy"
+        device = "cpu"
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class _Orchestrator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def respond(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(
+                text="Streamed final answer with sources.",
+                used_tools=True,
+                citations=[],
+                metadata={"status": {"final_label": "Generated with sources", "retrieved_context_fallback": False}},
+            )
+
+    monkeypatch.setattr("serve.app.VLLMChatBackend", _Backend)
+    monkeypatch.setattr("serve.app.TransformersChatBackend", _Backend)
+    monkeypatch.setattr("serve.app.AssistantOrchestrator", _Orchestrator)
+    monkeypatch.setattr("serve.app.seed_everything", lambda _seed: {"python": 52, "numpy": 52, "torch": 52})
+
+    client = TestClient(build_app(ServeConfig(enable_grounding=False)))
+    status = client.get("/status").json()
+    response = client.post(
+        "/generate_stream",
+        json={
+            "prompt": "What does the catalog say about prerequisites?",
+            "tools": True,
+            "citations": True,
+            "max_new_tokens": 32,
+        },
+    )
+
+    assert "/generate_stream" in status["endpoints"]
+    assert response.status_code == 200
+    body = response.text
+    assert "event: start" in body
+    assert "event: delta" in body
+    assert "Streamed final" in body
+    assert "answer with" in body
+    assert "event: metadata" in body
+    assert "ui_progressive_rendering" in body
+    assert "true_model_token_streaming" in body
+    assert "event: done" in body
+    assert captured["messages"] == [{"role": "user", "content": "What does the catalog say about prerequisites?"}]
+    assert captured["kwargs"]["tools"] is True
 
 
 def test_benchmark_manifest_and_reliability_report_counts(tmp_path: Path):

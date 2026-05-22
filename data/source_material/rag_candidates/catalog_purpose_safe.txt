@@ -1,0 +1,8 @@
+Title: Course Catalog Purpose
+Provenance: Curated explanatory source material for WebbGPT RAG, based on reviewed catalog and school-context source-material themes. This file is not a current policy, staff, deadline, dining, dorm, admissions, or phone source.
+Risk level: low
+Allowed use: RAG
+
+A course catalog helps students understand academic options before they request or choose courses. Catalog entries commonly help students compare course titles, departments, descriptions, levels, sequence expectations, prerequisites, recommendations, and the kind of work a course may involve. The catalog is useful for planning because it lets a student see how one course may prepare for another and how choices fit into a broader academic path.
+
+A catalog is not the same as a live schedule, a promise that a course will run, a staff directory, or a handbook policy source. For current offerings, deadlines, placement decisions, and school rules, students should use the current official source or advisor process.

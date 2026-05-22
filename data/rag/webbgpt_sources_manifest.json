@@ -1,0 +1,116 @@
+{
+  "version": "1.0",
+  "kind": "webbgpt_rag_sources_manifest",
+  "chunk_output": "data/rag/webbgpt_chunks.jsonl",
+  "input_dirs": [
+    "data/source_material/rag_candidates"
+  ],
+  "chunk_words": 220,
+  "overlap_words": 45,
+  "chunk_count": 166,
+  "sources": [
+    {
+      "source_file": "data/source_material/rag_candidates/boarding_school_community_safe.txt",
+      "source_category": "rag_candidates",
+      "risk_level": "low",
+      "allowed_use": "RAG",
+      "word_count": 114,
+      "chunks_kept": 1,
+      "chunks_skipped": 0,
+      "skip_reasons": {},
+      "source_metadata": {
+        "title": "Boarding School Community",
+        "risk level": "low",
+        "allowed use": "RAG"
+      }
+    },
+    {
+      "source_file": "data/source_material/rag_candidates/catalog_prerequisites_safe.txt",
+      "source_category": "rag_candidates",
+      "risk_level": "low",
+      "allowed_use": "RAG",
+      "word_count": 109,
+      "chunks_kept": 1,
+      "chunks_skipped": 0,
+      "skip_reasons": {},
+      "source_metadata": {
+        "title": "Catalog Prerequisites",
+        "risk level": "low",
+        "allowed use": "RAG"
+      }
+    },
+    {
+      "source_file": "data/source_material/rag_candidates/catalog_purpose_safe.txt",
+      "source_category": "rag_candidates",
+      "risk_level": "low",
+      "allowed_use": "RAG",
+      "word_count": 110,
+      "chunks_kept": 1,
+      "chunks_skipped": 0,
+      "skip_reasons": {},
+      "source_metadata": {
+        "title": "Course Catalog Purpose",
+        "risk level": "low",
+        "allowed use": "RAG"
+      }
+    },
+    {
+      "source_file": "data/source_material/rag_candidates/catalog_recommendations_safe.txt",
+      "source_category": "rag_candidates",
+      "risk_level": "low",
+      "allowed_use": "RAG",
+      "word_count": 103,
+      "chunks_kept": 1,
+      "chunks_skipped": 0,
+      "skip_reasons": {},
+      "source_metadata": {
+        "title": "Catalog Recommendations",
+        "risk level": "low",
+        "allowed use": "RAG"
+      }
+    },
+    {
+      "source_file": "data/source_material/rag_candidates/course_descriptions_safe.txt",
+      "source_category": "rag_candidates",
+      "risk_level": "low",
+      "allowed_use": "RAG",
+      "word_count": 120,
+      "chunks_kept": 1,
+      "chunks_skipped": 0,
+      "skip_reasons": {},
+      "source_metadata": {
+        "title": "Course Descriptions",
+        "risk level": "low",
+        "allowed use": "RAG"
+      }
+    },
+    {
+      "source_file": "data/source_material/rag_candidates/handbook_catalog_distinction_safe.txt",
+      "source_category": "rag_candidates",
+      "risk_level": "low",
+      "allowed_use": "RAG",
+      "word_count": 112,
+      "chunks_kept": 1,
+      "chunks_skipped": 0,
+      "skip_reasons": {},
+      "source_metadata": {
+        "title": "Handbook and Catalog Distinction",
+        "risk level": "low",
+        "allowed use": "RAG"
+      }
+    },
+    {
+      "source_file": "data/source_material/rag_candidates/webb_school_context_large_lm_corpus.txt",
+      "source_category": "rag_candidates",
+      "risk_level": "medium",
+      "allowed_use": "RAG",
+      "word_count": 36072,
+      "chunks_kept": 160,
+      "chunks_skipped": 47,
+      "skip_reasons": {
+        "repeated_ngram": 47
+      },
+      "source_metadata": {}
+    }
+  ]
+}

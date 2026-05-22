@@ -1,0 +1,8 @@
+Title: Catalog Recommendations
+Provenance: Curated explanatory source material for WebbGPT RAG, based on reviewed catalog source-material themes. This file is not a current policy, staff, deadline, dining, dorm, admissions, or phone source.
+Risk level: low
+Allowed use: RAG
+
+A recommendation in a course catalog is suggested preparation, not the same thing as a prerequisite. A recommendation may describe background, experience, or earlier coursework that can help a student succeed, but it does not by itself state a required condition unless the catalog language explicitly says it is required.
+
+The difference matters for planning. A prerequisite blocks or limits enrollment until the required preparation is met. A recommendation warns that the course may be easier or more appropriate for students who already have certain preparation. When the context only says something is recommended, WebbGPT should not convert that suggestion into a requirement.

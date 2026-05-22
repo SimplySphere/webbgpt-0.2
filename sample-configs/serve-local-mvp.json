@@ -1,63 +1,26 @@
 {
-  "checkpoint_path": "artifacts/runs/local-mvp/export/final",
-  "decode_preset": "local-mvp-serve",
-  "enable_citations": true,
-  "enable_grounding": true,
-  "grounding": {
-    "allow_ocr_fallback": false,
-    "dsn": "sqlite:///artifacts/grounding/webbgpt-local-mvp.db",
-    "freshness_policy": {
-      "academic_publications": {
-        "cadence": "168h"
-      },
-      "admissions_general": {
-        "cadence": "24h"
-      },
-      "athletics": {
-        "active_season": "6h",
-        "off_season": "24h"
-      },
-      "college_guidance": {
-        "cadence": "24h"
-      },
-      "course_catalog": {
-        "cadence": "168h"
-      },
-      "faculty": {
-        "cadence": "24h"
-      },
-      "handbook_policy": {
-        "cadence": "168h"
-      },
-      "mission_values": {
-        "cadence": "168h"
-      },
-      "museum_programs": {
-        "cadence": "168h"
-      },
-      "student_life": {
-        "cadence": "24h"
-      }
-    },
-    "handbook_url": "https://webb.myschoolapp.com/ftpimages/823/download/download_10529422.pdf?_=1774412901890",
-    "legacy_catalog_input_path": null,
-    "planner_beta_enabled": false,
-    "route_fanout_limit": 2,
-    "seed_url_pack": "data/webb/seed_urls.json",
-    "snapshot_id": "latest",
-    "source_policy_path": "data/webb/source_policies.json",
-    "sync_families": [],
-    "sync_on_start": false,
-    "version": "1.0"
-  },
+  "version": "1.0",
   "host": "0.0.0.0",
-  "max_model_len": 512,
-  "max_new_tokens": 256,
-  "model_name": "webbgpt-local-mvp",
-  "no_repeat_ngram_size": 4,
   "port": 8000,
-  "repetition_penalty": 1.05,
+  "model_name": "webbgpt-local-mvp",
+  "model_mode": "pretrained",
   "seed": 52,
+  "checkpoint_path": "artifacts/runs/local-mvp/checkpoints/pretrain/best-pretrain",
+  "tokenizer_path": "artifacts/tokenizer/webbgpt-local-mvp.model",
+  "model_config_path": "sample-configs/model-local-mvp.json",
+  "max_model_len": 512,
+  "tensor_parallel_size": 1,
+  "trust_remote_code": false,
+  "grounding": null,
+  "enable_grounding": false,
+  "enable_citations": false,
+  "decode_preset": "local-mvp-serve",
+  "max_new_tokens": 48,
+  "temperature": 0.3,
+  "top_k": 30,
+  "top_p": 0.92,
+  "repetition_penalty": 1.15,
+  "no_repeat_ngram_size": 4,
   "stop_strings": [
     "</s>",
     "<|assistant|>",
@@ -66,11 +29,14 @@
     "<|tool|>",
     "<|citation|>"
   ],
-  "temperature": 0.0,
-  "tensor_parallel_size": 1,
-  "tokenizer_path": "artifacts/runs/local-mvp/export/final",
-  "top_p": 1.0,
-  "transcript_path": "artifacts/runs/local-mvp/manual_demos/chat_transcript.jsonl",
-  "trust_remote_code": false,
-  "version": "1.0"
+  "use_rag": false,
+  "rag_index_path": "data/rag/webbgpt_index.json",
+  "rag_chunks_path": "data/rag/webbgpt_chunks.jsonl",
+  "rag_top_k": 3,
+  "rag_min_score": 0.05,
+  "rag_min_lexical_overlap": 0.45,
+  "rag_min_matched_terms": 2,
+  "rag_require_named_terms": true,
+  "rag_min_top_score_margin": 0.0,
+  "transcript_path": "artifacts/runs/local-mvp/manual_demos/chat_transcript.jsonl"
 }

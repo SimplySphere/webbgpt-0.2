@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import math
 import sys
@@ -18,6 +17,7 @@ from progress import build_progress_snapshot
 from train.checkpoint import CheckpointManager
 from train.console import dump_rounded_json
 from train.distributed import barrier, is_main_process
+from torch_runtime import autocast_if_available, get_torch_device
 
 MAX_NONFINITE_EVENT_SAMPLES = 8
 LOW_LOSS_TIER_ORDER = ("severe", "suspicious", "broad")
@@ -523,13 +523,9 @@ def run_training(
     worsening_evals = 0
     should_stop_training = False
     last_train_loss = math.nan
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_torch_device()
     model = model.to(device)
-    scaler_context = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if train_config.use_bf16 and torch.cuda.is_available()
-        else contextlib.nullcontext()
-    )
+    scaler_context = autocast_if_available(torch, device=device, use_bf16=train_config.use_bf16)
     optimizer.zero_grad(set_to_none=True)
     if resume_from:
         loaded = checkpoint_manager.load(resume_from, model, optimizer=optimizer, scheduler=scheduler)

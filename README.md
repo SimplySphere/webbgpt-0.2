@@ -4,6 +4,17 @@ WebbGPT is a Python CLI for training a small decoder-only model, preparing postt
 
 The current local development path is `local-mvp`.
 
+## Current Final Direction
+
+The active path is:
+
+1. Curated base pretraining.
+2. Optional small continued pretraining from reviewed source material.
+3. SFT with RAG/context grounding.
+4. Website demo.
+
+DPO is archived as legacy because the small local-MVP DPO run worsened real sample behavior and is not part of the current final project.
+
 ## Current Local-MVP
 
 `local-mvp` now means curated-real-data base pretraining:
@@ -14,6 +25,7 @@ The current local development path is `local-mvp`.
 - No Webb/domain-heavy generated corpora are used for base pretraining.
 - Domain realization is disabled for this base-pretrain recipe.
 - Webb-specific behavior is deferred to SFT, RAG, and domain grounding.
+- Former stale corpora now live under `data/source_material/` and must be filtered or chunked with provenance before future use.
 
 The final local-MVP experiment before 3B planning is the lower-LR curated recipe in `sample-configs/train-local-mvp.json`.
 
@@ -90,13 +102,123 @@ webbgpt train-pretrain \
   --train-config sample-configs/train-local-mvp.json
 ```
 
-`webbgpt main --profile local-mvp` is also pretrain-only now. It builds/reuses tokenizer assets, materializes the curated pretrain and validation manifests, then runs base pretraining. It does not silently run continued pretraining, SFT, or DPO.
+`webbgpt main --profile local-mvp` is also pretrain-only now. It builds/reuses tokenizer assets, materializes the curated pretrain and validation manifests, then runs base pretraining. It does not silently run continued pretraining, SFT, or legacy DPO.
 
 ## Posttraining And Grounding
 
-The current 22M local-MVP base is still a raw LM experiment. SFT, DPO, and Webb-specific behavior should be added only after selecting a usable base checkpoint.
+The current 22M local-MVP base is still a raw LM experiment. Continued pretraining and SFT are optional improvement paths and should be evaluated against the pretrained checkpoint before changing the website default.
 
-Grounding/RAG work remains separate and can use the checked-in Webb fixtures:
+DPO was tested as a small plumbing/stretch experiment. It moved tiny preference metrics but worsened real samples, so the DPO configs, data, checkpoint artifacts, and full trainer implementation are archived under `junk/dpo-legacy/`.
+
+### Continued Pretraining
+
+Small continued pretraining now reads reviewed source material from `data/source_material/continued_pretrain_candidates/`. The first local run is intentionally bounded and uses a small token budget because the clean source set is smaller than the original 500K-2M target.
+
+Audit and prepare the continued-pretraining data:
+
+```bash
+python3.12 src/cli.py audit-data \
+  --config sample-configs/data-local-mvp-continue-small.json \
+  --stage continue
+
+python3.12 src/cli.py prepare-data \
+  --config sample-configs/data-local-mvp-continue-small.json \
+  --stage continue \
+  --output artifacts/runs/local-mvp-continue-small/prepared/pretrain.json \
+  --force-rebuild
+
+python3.12 src/cli.py prepare-data \
+  --config sample-configs/data-local-mvp-continue-small.json \
+  --stage validation \
+  --output artifacts/runs/local-mvp-continue-small/prepared/validation.json \
+  --force-rebuild
+```
+
+The training command is available, but should not be run until explicitly approved:
+
+```bash
+PYTHONPATH=src python3.12 src/cli.py train-continue \
+  --model-config sample-configs/model-local-mvp.json \
+  --data-config sample-configs/data-local-mvp-continue-small-prepared.json \
+  --train-config sample-configs/train-local-mvp-continue-small.json
+```
+
+### RAG Source And Index
+
+RAG is the safer path for stale Webb-like source material because source text stays outside model weights and is returned with chunk metadata.
+
+RAG is experimental. Retrieval can surface useful passages, but the 22M local-MVP model can still fail to synthesize a reliable answer. In the WebbGPT 0.2 demo, local-MVP generation remains visible even when the quality checker flags weak output. Retrieved sources support the generated answer; source cards are not proof that the generated answer is correct.
+
+The current RAG source expansion adds low-risk curated explanatory files for prerequisites, recommendations, catalog purpose, course descriptions, handbook/catalog distinction, and boarding school community. These files live in `data/source_material/rag_candidates/`, are marked `Allowed use: RAG`, and avoid staff names, current-year deadlines, phone policies, dorm rules, admissions deadlines, dining rules, and other current factual claims.
+
+Build and query the local lexical RAG store:
+
+```bash
+python3.12 tools/build_rag_corpus.py
+python3.12 tools/build_rag_index.py
+python3.12 tools/query_rag_index.py "school community" --top-k 3
+python3.12 tools/query_rag_index.py "What does a course catalog help students understand?" --top-k 3
+```
+
+The generated files are:
+
+- `data/rag/webbgpt_chunks.jsonl`
+- `data/rag/webbgpt_index.json`
+- `data/rag/webbgpt_sources_manifest.json`
+
+After the source expansion, the local RAG corpus has 166 chunks. Direct retrieval checks now return safe curated sources for:
+
+- `What does the catalog say about prerequisites?`
+- `What is the difference between a prerequisite and a recommendation?`
+- `What does a course catalog help students understand?`
+- `What is a course description used for?`
+- `What is the difference between handbook language and catalog language?`
+
+The same checks return no-hit for `Who is the dean?`, `What is the phone policy in the dining hall?`, and `hi im dr dzula` unless a safe source is later added for those prompts.
+
+Run the fixed reliability prompt set against a running RAG server:
+
+```bash
+python3.12 tools/run_rag_reliability_regression.py \
+  --output artifacts/runs/local-mvp/rag_reliability_regression.json
+```
+
+The source-expansion regression artifact is:
+
+`artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json`
+
+Current result: prerequisite/catalog prompts retrieve relevant chunks, then WebbGPT 0.2 still asks the local-MVP checkpoint to generate. If the quality checker flags the output, the UI shows `Weak generation` while still displaying the generated text and keeping sources collapsed below the message.
+
+### SFT With RAG Context
+
+SFT-RAG rows teach short context-grounded answers. They do not copy stale corpora directly into assistant targets and they do not use fake citation labels.
+
+Build the first SFT-RAG data set:
+
+```bash
+python3.12 tools/build_sft_rag_data.py
+```
+
+The training command is available, but should not be run until explicitly approved:
+
+```bash
+PYTHONPATH=src python3.12 src/cli.py train-sft \
+  --model-config sample-configs/model-local-mvp.json \
+  --data-config sample-configs/data-local-mvp-sft-rag-v1.json \
+  --train-config sample-configs/train-local-mvp-sft-rag-v1.json \
+  --force-rebuild
+```
+
+Compare checkpoints before changing the demo default:
+
+```bash
+PYTHONPATH=src python3.12 tools/compare_checkpoints.py \
+  --rag-index data/rag/webbgpt_index.json \
+  --rag-chunks data/rag/webbgpt_chunks.jsonl \
+  --output artifacts/runs/local-mvp-continue-small/comparison.json
+```
+
+Grounding work can still use the checked-in Webb fixtures:
 
 ```bash
 webbgpt webb-sync \
@@ -105,6 +227,96 @@ webbgpt webb-sync \
   --source-policy-path data/webb/source_policies.json \
   --handbook-url data/webb/mock/handbook.txt
 ```
+
+## Local Demo Server
+
+### Thursday Demo Default
+
+The Thursday demo default is the final 22M pretrained local-MVP checkpoint:
+
+`artifacts/runs/local-mvp/checkpoints/pretrain/best-pretrain`
+
+SFT-small, SFT-v2, SFT-v3, and DPO-small were run as local posttraining/plumbing experiments, but they are not the website default. SFT-v3 completed and reduced validation loss, but the final demo prompt comparison stayed mixed/worse than pretrained: prompt retention and grounded-context behavior did not improve enough to justify switching. DPO-small amplified the bad SFT behavior and is archived. Keep `WEBBGPT_MODEL_MODE=pretrained` unless a later checkpoint clearly beats pretrained on behavior samples.
+
+Start the local-MVP demo server with the pretrained 22M checkpoint:
+
+```bash
+PYTHONPATH=src \
+WEBBGPT_CHECKPOINT=artifacts/runs/local-mvp/checkpoints/pretrain/best-pretrain \
+WEBBGPT_MODEL_MODE=pretrained \
+python3.12 src/cli.py serve \
+  --serve-config sample-configs/serve-local-mvp.json \
+  --force-untrusted
+```
+
+Open the browser demo at `http://127.0.0.1:8000/`. The root page is a ChatGPT-style WebbGPT 0.2 chat interface with a centered transcript, bottom composer, example prompt chips, compact model/RAG badges, a collapsible settings panel, collapsed source cards under RAG-supported responses, and a collapsible run-details panel for metadata.
+
+The canonical generation API is `/v1/chat/completions`; `/generate` is a small demo compatibility alias for prompt-only calls. `/generate_stream` is the browser UI streaming route.
+
+Check server status:
+
+```bash
+curl http://127.0.0.1:8000/status
+```
+
+Test canonical generation:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"At Webb, students often..."}],"tools":false,"citations":false,"max_new_tokens":32,"temperature":0.4,"top_k":40,"top_p":0.95}'
+```
+
+Test the prompt-only demo alias:
+
+```bash
+curl -X POST http://127.0.0.1:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"At Webb, students often","tools":false,"citations":false,"max_new_tokens":40,"temperature":0.7,"top_k":40,"top_p":0.95}'
+```
+
+Test the streaming demo route:
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/generate_stream \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is the difference between a prerequisite and a recommendation?","tools":true,"citations":true,"max_new_tokens":32,"temperature":0.3,"top_k":30,"top_p":0.92}'
+```
+
+`/generate_stream` returns Server-Sent Events with `start`, `delta`, `metadata`, `done`, and `error` events. This is UI-level progressive rendering: the native backend still produces the response normally, then the server reveals the final text in word-like chunks while preserving the same quality-gate, abstention, source, and provenance metadata.
+
+Start the same pretrained demo with local RAG enabled:
+
+```bash
+PYTHONPATH=src \
+WEBBGPT_CHECKPOINT=artifacts/runs/local-mvp/checkpoints/pretrain/best-pretrain \
+WEBBGPT_MODEL_MODE=pretrained \
+WEBBGPT_USE_RAG=1 \
+WEBBGPT_RAG_INDEX=data/rag/webbgpt_index.json \
+WEBBGPT_RAG_CHUNKS=data/rag/webbgpt_chunks.jsonl \
+python3.12 src/cli.py serve \
+  --serve-config sample-configs/serve-local-mvp.json \
+  --force-untrusted
+```
+
+When RAG is enabled, the server retrieves local chunks, feeds relevant source context into the local-MVP prompt, and returns retrieved chunk metadata in response metadata. If RAG is off, the server does not retrieve sources and uses raw local-MVP generation only. If retrieval is weak or absent in the main chat demo, the model still generates unless a legacy grounded-only route explicitly requires deterministic abstention. If generation is punctuation-only, token-garbage, or otherwise low confidence, the response is labeled `Weak generation`; the generated text is still shown because WebbGPT 0.2 is a research demo of a small local model.
+
+The UI shows these states per assistant message:
+
+- `Generated`
+- `Generated with sources`
+- `Weak generation`
+- `Abstained`
+- `Generation failed`
+
+RAG source cards show chunk ID, source file, retrieval score, risk level, allowed use, and a short preview. Source cards are collapsed by default under `Sources available (n)`. Raw metadata is hidden under `Run details`.
+
+Current reliability settings in `sample-configs/serve-local-mvp.json`:
+
+- Decode changed from `max_new_tokens=96`, `temperature=0.4`, `top_k=40`, `top_p=0.95`, `repetition_penalty=1.08` to `max_new_tokens=48`, `temperature=0.3`, `top_k=30`, `top_p=0.92`, `repetition_penalty=1.15`.
+- RAG retrieval requires `rag_min_score=0.05`, `rag_min_lexical_overlap=0.45`, `rag_min_matched_terms=2`, and named query terms must appear in retrieved chunks.
+- RAG source expansion improves prerequisite/catalog retrieval coverage, but generated answers still fail often enough that `Weak generation` should be expected on some grounded prompts.
+- These settings make the demo safer; they do not make the 22M checkpoint a polished assistant.
 
 ## Remote Profiles
 
@@ -145,6 +357,7 @@ python3.12 -m pytest src/tests/test_cli_profiles.py
 
 - `sample-configs/`: active starter configs
 - `data/raw/`: active real-text tokenizer/pretraining corpora
+- `data/source_material/`: reviewed buckets for future continued pretraining and RAG source material
 - `data/eval/`: active eval fixtures and historical evals
 - `data/webb/`: Webb grounding fixtures and source packs
 - `src/`: CLI, model, training, eval, grounding, and serving code

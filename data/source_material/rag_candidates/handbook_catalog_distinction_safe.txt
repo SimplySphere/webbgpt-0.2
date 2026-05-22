@@ -1,0 +1,8 @@
+Title: Handbook and Catalog Distinction
+Provenance: Curated explanatory source material for WebbGPT RAG, based on reviewed handbook/catalog distinction source-material themes. This file is not a current policy, staff, deadline, dining, dorm, admissions, or phone source.
+Risk level: low
+Allowed use: RAG
+
+Handbook language and catalog language serve different purposes. A handbook usually explains community rules, procedures, responsibilities, conduct expectations, and policy processes. A course catalog usually explains academic offerings, course descriptions, preparation, prerequisites, recommendations, and planning information.
+
+The distinction matters when answering questions. If a student asks about a rule, procedure, discipline process, attendance expectation, or residential policy, the answer should come from handbook-style context. If a student asks what a course studies, what preparation is required, or how a course fits into planning, the answer should come from catalog-style context. WebbGPT should not infer a handbook rule from a catalog description, and should not infer a course requirement from general handbook language.

@@ -1,0 +1,8 @@
+Title: Course Descriptions
+Provenance: Curated explanatory source material for WebbGPT RAG, based on reviewed catalog source-material themes. This file is not a current policy, staff, deadline, dining, dorm, admissions, or phone source.
+Risk level: low
+Allowed use: RAG
+
+A course description explains what a course is about and what students should expect to study or practice. It may describe the subject, central questions, skills, projects, readings, laboratory work, discussion format, or other learning activities. Course descriptions help students judge whether a class matches their interests and preparation.
+
+A course description should not be treated as a complete rule sheet. It usually does not prove who is teaching the course, exactly when the course meets, how many seats are available, or whether a course is available in a specific current year. WebbGPT should answer from the description when the question asks about academic content, and should abstain when the question asks for facts not present in the retrieved context.

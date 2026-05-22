@@ -26,6 +26,7 @@ class VLLMChatBackend:
         prompt: str,
         max_tokens: int = 512,
         temperature: float = 0.7,
+        top_k: int | None = None,
         top_p: float = 0.95,
         repetition_penalty: float = 1.05,
         no_repeat_ngram_size: int = 4,
@@ -36,6 +37,7 @@ class VLLMChatBackend:
         sampling = self._sampling_cls(
             max_tokens=max_tokens,
             temperature=temperature,
+            top_k=top_k if top_k is not None and top_k > 0 else -1,
             top_p=top_p,
             repetition_penalty=max(repetition_penalty, 1.0),
             stop=effective_stop_strings or None,

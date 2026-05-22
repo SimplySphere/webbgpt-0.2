@@ -22,6 +22,7 @@ from provenance import (
     tokenizer_manifest,
 )
 from repro import seed_everything
+from torch_runtime import get_torch_device
 
 
 def _require_torch():
@@ -338,10 +339,9 @@ def _run_evaluation_once(
     checkpoint_path: str,
 ) -> dict:
     seed_bundle = seed_everything(eval_config.seed)
-    torch = _require_torch()
     model = CausalTransformer(model_config)
     _load_checkpoint(model, checkpoint_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_torch_device()
     model = model.to(device)
     model.eval()
 

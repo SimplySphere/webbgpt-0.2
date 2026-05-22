@@ -242,7 +242,7 @@ def _parse_args() -> argparse.Namespace:
     train_sft.add_argument("--train-config", required=True)
     train_sft.add_argument("--force-rebuild", action="store_true")
 
-    train_dpo = subparsers.add_parser("train-dpo", help="Run DPO alignment")
+    train_dpo = subparsers.add_parser("train-dpo", help="Legacy DPO command archived; disabled")
     train_dpo.add_argument("--model-config", required=True)
     train_dpo.add_argument("--data-config", required=True)
     train_dpo.add_argument("--train-config", required=True)
@@ -3482,35 +3482,10 @@ def main() -> int:
         return 0
 
     if args.command == "train-dpo":
-        from posttrain.dpo import run_dpo_job
+        from posttrain.dpo import LEGACY_DPO_MESSAGE
 
-        print("WebbGPT: starting DPO alignment.", file=sys.stderr, flush=True)
-        model_config = load_config(args.model_config, ModelConfig)
-        data_config = load_config(args.data_config, DataConfig)
-        base_train_config = load_config(args.train_config, TrainConfig)
-        data_config = _prepare_manual_stage_data_config(
-            args.model_config,
-            args.data_config,
-            args.train_config,
-            data_config,
-            base_train_config,
-            stage_name="dpo",
-            force_rebuild=args.force_rebuild,
-        )
-        train_config = _prepare_manual_dpo_train_config(
-            args.model_config,
-            args.data_config,
-            args.train_config,
-            base_train_config,
-            reference_checkpoint=args.reference_checkpoint,
-        )
-        run_dpo_job(
-            model_config,
-            data_config,
-            train_config,
-            reference_checkpoint=args.reference_checkpoint,
-        )
-        return 0
+        print(f"WebbGPT: {LEGACY_DPO_MESSAGE}", file=sys.stderr, flush=True)
+        return 2
 
     if args.command == "eval":
         from eval.runner import run_evaluation

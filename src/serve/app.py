@@ -1,20 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+
 import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from config import GroundingConfig, ServeConfig
 from grounding.ingest import webb_sync
 from grounding.provider import WebbGroundingProvider
 from grounding.store import WebbKnowledgeStore
-from provenance import export_manifest, grounding_snapshot_manifest, tokenizer_manifest
+from provenance import (
+    checkpoint_manifest,
+    export_manifest,
+    grounding_snapshot_manifest,
+    tokenizer_manifest,
+)
 from repro import seed_everything
+from rag.simple_index import LocalRagRetriever
+from serve.backends.native_backend import NativeCheckpointChatBackend
 from serve.backends.transformers_backend import TransformersChatBackend
 from serve.backends.vllm_backend import VLLMChatBackend
 from serve.orchestrator import AssistantOrchestrator
@@ -31,6 +42,21 @@ class ChatRequest(BaseModel):
     tools: bool = True
     citations: bool = True
     safe_decode: bool = False
+    max_new_tokens: int | None = Field(default=None, ge=1, le=512)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_k: int | None = Field(default=None, ge=0, le=500)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    tools: bool = True
+    citations: bool = True
+    safe_decode: bool = False
+    max_new_tokens: int | None = Field(default=None, ge=1, le=512)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_k: int | None = Field(default=None, ge=0, le=500)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
 
 
 class ChatResponse(BaseModel):
@@ -76,12 +102,83 @@ def _build_repro_capsule(provenance: dict, response_metadata: dict) -> dict:
     }
 
 
-def build_app(config: ServeConfig) -> FastAPI:
-    seed_bundle = seed_everything(config.seed)
+def _sse_event(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _progressive_text_chunks(text: str) -> list[str]:
+    parts = re.findall(r"\S+\s*", text)
+    if not parts:
+        return [text] if text else []
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        current += part
+        if len(current) >= 14 or part.endswith(("\n", ". ", "? ", "! ")):
+            chunks.append(current)
+            current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def apply_environment_overrides(config: ServeConfig) -> ServeConfig:
+    updated = ServeConfig.from_dict(config.to_dict())
+    checkpoint = os.environ.get("WEBBGPT_CHECKPOINT")
+    if checkpoint:
+        updated.checkpoint_path = checkpoint
+    mode = os.environ.get("WEBBGPT_MODEL_MODE")
+    if mode in {"pretrained", "sft", "dpo"}:
+        updated.model_mode = mode
+    elif checkpoint:
+        lowered = checkpoint.lower()
+        if "dpo" in lowered:
+            updated.model_mode = "dpo"
+        elif "sft" in lowered:
+            updated.model_mode = "sft"
+    use_rag = os.environ.get("WEBBGPT_USE_RAG")
+    if use_rag is not None:
+        updated.use_rag = use_rag.strip().lower() in {"1", "true", "yes", "on"}
+    rag_index = os.environ.get("WEBBGPT_RAG_INDEX")
+    if rag_index:
+        updated.rag_index_path = rag_index
+    rag_chunks = os.environ.get("WEBBGPT_RAG_CHUNKS")
+    if rag_chunks:
+        updated.rag_chunks_path = rag_chunks
+    rag_top_k = os.environ.get("WEBBGPT_RAG_TOP_K")
+    if rag_top_k:
+        updated.rag_top_k = max(1, int(rag_top_k))
+    rag_min_score = os.environ.get("WEBBGPT_RAG_MIN_SCORE")
+    if rag_min_score:
+        updated.rag_min_score = max(0.0, float(rag_min_score))
+    rag_min_lexical_overlap = os.environ.get("WEBBGPT_RAG_MIN_LEXICAL_OVERLAP")
+    if rag_min_lexical_overlap:
+        updated.rag_min_lexical_overlap = min(1.0, max(0.0, float(rag_min_lexical_overlap)))
+    rag_min_matched_terms = os.environ.get("WEBBGPT_RAG_MIN_MATCHED_TERMS")
+    if rag_min_matched_terms:
+        updated.rag_min_matched_terms = max(1, int(rag_min_matched_terms))
+    rag_require_named_terms = os.environ.get("WEBBGPT_RAG_REQUIRE_NAMED_TERMS")
+    if rag_require_named_terms is not None:
+        updated.rag_require_named_terms = rag_require_named_terms.strip().lower() in {"1", "true", "yes", "on"}
+    rag_min_top_score_margin = os.environ.get("WEBBGPT_RAG_MIN_TOP_SCORE_MARGIN")
+    if rag_min_top_score_margin:
+        updated.rag_min_top_score_margin = max(0.0, float(rag_min_top_score_margin))
+    return updated
+
+
+def _build_chat_backend(config: ServeConfig):
+    if (Path(config.checkpoint_path) / "checkpoint.pt").exists():
+        return NativeCheckpointChatBackend(config)
     try:
-        backend = VLLMChatBackend(config)
+        return VLLMChatBackend(config)
     except RuntimeError:
-        backend = TransformersChatBackend(config)
+        return TransformersChatBackend(config)
+
+
+def build_app(config: ServeConfig) -> FastAPI:
+    config = apply_environment_overrides(config)
+    seed_bundle = seed_everything(config.seed)
+    backend = _build_chat_backend(config)
     grounding_config = (
         GroundingConfig.from_dict(config.grounding.to_dict()) if config.enable_grounding and config.grounding else None
     )
@@ -142,8 +239,13 @@ def build_app(config: ServeConfig) -> FastAPI:
         )
     else:
         catalog_snapshot = {}
+    checkpoint_provenance = (
+        checkpoint_manifest(config.checkpoint_path)
+        if (Path(config.checkpoint_path) / "checkpoint.pt").exists()
+        else export_manifest(config.checkpoint_path) or {"path": config.checkpoint_path}
+    )
     provenance = {
-        "checkpoint": export_manifest(config.checkpoint_path) or {"path": config.checkpoint_path},
+        "checkpoint": checkpoint_provenance,
         "tokenizer": tokenizer_manifest(config.tokenizer_path),
         "catalog_snapshot": catalog_snapshot,
         "grounding_snapshot": catalog_snapshot,
@@ -151,12 +253,26 @@ def build_app(config: ServeConfig) -> FastAPI:
             "preset": config.decode_preset,
             "max_new_tokens": config.max_new_tokens,
             "temperature": config.temperature,
+            "top_k": config.top_k,
             "top_p": config.top_p,
             "repetition_penalty": config.repetition_penalty,
             "no_repeat_ngram_size": config.no_repeat_ngram_size,
             "stop_strings": config.stop_strings,
         },
         "seed_bundle": seed_bundle,
+        "model_mode": config.model_mode,
+        "device": str(getattr(backend, "device", "unknown")),
+        "rag": {
+            "enabled": bool(config.use_rag),
+            "index_path": config.rag_index_path,
+            "chunks_path": config.rag_chunks_path,
+            "top_k": config.rag_top_k,
+            "min_score": config.rag_min_score,
+            "min_lexical_overlap": config.rag_min_lexical_overlap,
+            "min_matched_terms": config.rag_min_matched_terms,
+            "require_named_terms": config.rag_require_named_terms,
+            "min_top_score_margin": config.rag_min_top_score_margin,
+        },
     }
     if sync_status is not None:
         provenance["sync_on_start"] = sync_status
@@ -168,11 +284,25 @@ def build_app(config: ServeConfig) -> FastAPI:
             route_fanout_limit=grounding_config.route_fanout_limit,
             planner_beta_enabled=grounding_config.planner_beta_enabled,
         )
+    rag_retriever = None
+    if config.use_rag:
+        rag_retriever = LocalRagRetriever(
+            index_path=config.rag_index_path,
+            chunks_path=config.rag_chunks_path,
+            top_k=config.rag_top_k,
+            min_score=config.rag_min_score,
+            min_lexical_overlap=config.rag_min_lexical_overlap,
+            min_matched_terms=config.rag_min_matched_terms,
+            require_named_terms=config.rag_require_named_terms,
+            min_top_score_margin=config.rag_min_top_score_margin,
+        )
     orchestrator = AssistantOrchestrator(
         backend,
         grounding_provider=grounding_provider,
+        rag_retriever=rag_retriever,
         default_max_tokens=config.max_new_tokens,
         default_temperature=config.temperature,
+        default_top_k=config.top_k,
         default_top_p=config.top_p,
         default_repetition_penalty=config.repetition_penalty,
         default_no_repeat_ngram_size=config.no_repeat_ngram_size,
@@ -182,7 +312,7 @@ def build_app(config: ServeConfig) -> FastAPI:
         catalog_snapshot=catalog_snapshot,
     )
 
-    app = FastAPI(title="WebbGPT")
+    app = FastAPI(title="WebbGPT 0.2")
 
     @app.get("/", response_class=HTMLResponse)
     async def root() -> str:
@@ -191,9 +321,31 @@ def build_app(config: ServeConfig) -> FastAPI:
     @app.get("/status")
     async def status() -> dict[str, object]:
         return {
-            "name": "WebbGPT",
+            "name": "WebbGPT 0.2",
             "status": "ok",
-            "endpoints": ["/", "/status", "/healthz", "/v1/chat/completions", "/docs"],
+            "endpoints": [
+                "/",
+                "/status",
+                "/healthz",
+                "/v1/chat/completions",
+                "/generate",
+                "/generate_stream",
+                "/docs",
+            ],
+            "checkpoint_path": config.checkpoint_path,
+            "model_mode": config.model_mode,
+            "device": str(getattr(backend, "device", "unknown")),
+            "rag": {
+                "enabled": bool(config.use_rag),
+                "index_path": config.rag_index_path,
+                "chunks_path": config.rag_chunks_path,
+                "top_k": config.rag_top_k,
+                "min_score": config.rag_min_score,
+                "min_lexical_overlap": config.rag_min_lexical_overlap,
+                "min_matched_terms": config.rag_min_matched_terms,
+                "require_named_terms": config.rag_require_named_terms,
+                "min_top_score_margin": config.rag_min_top_score_margin,
+            },
             "provenance": provenance,
         }
 
@@ -201,15 +353,19 @@ def build_app(config: ServeConfig) -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/v1/chat/completions")
-    async def chat(request: ChatRequest) -> ChatResponse:
+    def _complete_chat(request: ChatRequest, *, api_route: str) -> ChatResponse:
         response = orchestrator.respond(
             [message.model_dump() for message in request.messages],
             tools=request.tools,
             citations=request.citations,
             safe_decode=request.safe_decode,
+            max_tokens=request.max_new_tokens,
+            temperature=request.temperature,
+            top_k=request.top_k,
+            top_p=request.top_p,
         )
         serialized_citations = [_serialize_citation(citation) for citation in response.citations]
+        response.metadata.setdefault("api", {"route": api_route, "canonical": "/v1/chat/completions"})
         response.metadata.setdefault("provenance", provenance)
         response.metadata.setdefault("repro_capsule", _build_repro_capsule(provenance, response.metadata))
         if config.transcript_path:
@@ -217,6 +373,7 @@ def build_app(config: ServeConfig) -> FastAPI:
                 config.transcript_path,
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "api_route": api_route,
                     "request": request.model_dump(),
                     "response": {
                         "text": response.text,
@@ -231,6 +388,79 @@ def build_app(config: ServeConfig) -> FastAPI:
             used_tools=response.used_tools,
             citations=serialized_citations,
             metadata=response.metadata,
+        )
+
+    @app.post("/v1/chat/completions")
+    async def chat(request: ChatRequest) -> ChatResponse:
+        return _complete_chat(request, api_route="/v1/chat/completions")
+
+    @app.post("/generate")
+    async def generate(request: GenerateRequest) -> ChatResponse:
+        chat_request = ChatRequest(
+            messages=[ChatMessageModel(role="user", content=request.prompt)],
+            tools=request.tools,
+            citations=request.citations,
+            safe_decode=request.safe_decode,
+            max_new_tokens=request.max_new_tokens,
+            temperature=request.temperature,
+            top_k=request.top_k,
+            top_p=request.top_p,
+        )
+        return _complete_chat(chat_request, api_route="/generate")
+
+    @app.post("/generate_stream")
+    async def generate_stream(request: GenerateRequest) -> StreamingResponse:
+        async def event_stream():
+            yield _sse_event(
+                "start",
+                {
+                    "streaming": "ui_progressive_rendering",
+                    "message": "Generation request accepted. Final text will be progressively rendered after backend completion.",
+                },
+            )
+            try:
+                chat_request = ChatRequest(
+                    messages=[ChatMessageModel(role="user", content=request.prompt)],
+                    tools=request.tools,
+                    citations=request.citations,
+                    safe_decode=request.safe_decode,
+                    max_new_tokens=request.max_new_tokens,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                )
+                response = await asyncio.to_thread(_complete_chat, chat_request, api_route="/generate_stream")
+                response.metadata.setdefault("streaming", {})
+                response.metadata["streaming"].update(
+                    {
+                        "route": "/generate_stream",
+                        "mode": "ui_progressive_rendering",
+                        "true_model_token_streaming": False,
+                        "note": (
+                            "The native backend does not expose safe token callbacks here; "
+                            "the server preserves normal generation and progressively reveals the final text."
+                        ),
+                    }
+                )
+                for chunk in _progressive_text_chunks(response.text):
+                    yield _sse_event("delta", {"text": chunk})
+                    await asyncio.sleep(0.018)
+                yield _sse_event(
+                    "metadata",
+                    {
+                        "metadata": response.metadata,
+                        "used_tools": response.used_tools,
+                        "citations": response.citations,
+                    },
+                )
+                yield _sse_event("done", {"ok": True})
+            except Exception as exc:
+                yield _sse_event("error", {"message": str(exc)})
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     return app

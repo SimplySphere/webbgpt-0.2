@@ -4,6 +4,7 @@ from copy import deepcopy
 
 from config import ServeConfig
 from generation import strip_stop_strings
+from torch_runtime import get_torch_device
 
 
 class TransformersChatBackend:
@@ -22,7 +23,7 @@ class TransformersChatBackend:
             config.checkpoint_path,
             trust_remote_code=config.trust_remote_code,
         )
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = get_torch_device()
         self.model = self.model.to(self.device)
         self.model.eval()
         generation_config = getattr(self.model, "generation_config", None)
@@ -55,6 +56,7 @@ class TransformersChatBackend:
         prompt: str,
         max_tokens: int = 512,
         temperature: float = 0.7,
+        top_k: int | None = None,
         top_p: float = 0.95,
         repetition_penalty: float = 1.05,
         no_repeat_ngram_size: int = 4,
@@ -87,6 +89,8 @@ class TransformersChatBackend:
             if do_sample:
                 if hasattr(generation_config, "temperature"):
                     generation_config.temperature = max(temperature, 1e-5)
+                if top_k is not None and hasattr(generation_config, "top_k"):
+                    generation_config.top_k = max(int(top_k), 0)
                 if hasattr(generation_config, "top_p"):
                     generation_config.top_p = top_p
             else:
@@ -109,6 +113,8 @@ class TransformersChatBackend:
             generate_kwargs["generation_config"] = generation_config
         if do_sample:
             generate_kwargs["temperature"] = max(temperature, 1e-5)
+            if top_k is not None:
+                generate_kwargs["top_k"] = max(int(top_k), 0)
             generate_kwargs["top_p"] = top_p
         with self._torch.no_grad():
             outputs = self.model.generate(

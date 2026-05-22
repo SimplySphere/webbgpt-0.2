@@ -1,0 +1,52 @@
+{
+  "version": "1.0",
+  "tokenizer_path": "artifacts/tokenizer/webbgpt-local-mvp.model",
+  "sequence_length": 512,
+  "prepared_shard_size": 256,
+  "seed": 52,
+  "num_workers": 0,
+  "pretraining_token_budget": 0,
+  "continued_pretraining_token_budget": 300000,
+  "min_document_chars": 320,
+  "max_document_chars": 6000,
+  "lm_weighted_source_token_budget": 32768,
+  "lm_max_source_token_share": 0.75,
+  "lm_max_source_repeat_rate": 0.08,
+  "continue_readiness_min_clean_token_fraction": 0.6,
+  "continue_readiness_min_documents": 80,
+  "continue_readiness_min_source_families": 2,
+  "continue_readiness_max_single_source_share": 0.8,
+  "continue_readiness_max_repeat_rate": 0.08,
+  "domain_tags": [
+    "education",
+    "course_catalog",
+    "school_context"
+  ],
+  "pretrain_sources": [],
+  "continued_pretrain_sources": [
+    {
+      "name": "prepared_continue_small",
+      "path": "artifacts/runs/local-mvp-continue-small/prepared/pretrain.json",
+      "format": "prepared",
+      "weight": 1.0,
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false
+    }
+  ],
+  "sft_sources": [],
+  "sft_validation_sources": [],
+  "preference_sources": [],
+  "preference_validation_sources": [],
+  "validation_sources": [
+    {
+      "name": "prepared_continue_small_validation",
+      "path": "artifacts/runs/local-mvp-continue-small/prepared/validation.json",
+      "format": "prepared",
+      "weight": 1.0,
+      "quality_filter": false,
+      "deduplicate": false,
+      "pii_scrub": false
+    }
+  ]
+}

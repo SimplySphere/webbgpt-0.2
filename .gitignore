@@ -11,6 +11,7 @@ __pycache__/
 .coverage.*
 htmlcov/
 artifacts/
+artifacts/cache/
 artifacts/runs/
 artifacts/archive/
 data/raw/
@@ -20,3 +21,12 @@ dist/
 *.pyc
 *.zip
 *.log
+
+# Accidental shell command paste artifacts.
+--data-config
+--force-rebuild
+--model-config
+--train-config
+python3.12
+PYTHONPATH=src
+train-sft

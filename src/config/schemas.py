@@ -473,9 +473,11 @@ class ServeConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     model_name: str = "webbgpt-3b-instruct"
+    model_mode: Literal["pretrained", "sft", "dpo"] = "pretrained"
     seed: int = 52
     checkpoint_path: str = "artifacts/export/webbgpt-3b-instruct"
     tokenizer_path: str = "artifacts/tokenizer/webbgpt.model"
+    model_config_path: str | None = None
     max_model_len: int = 8_192
     tensor_parallel_size: int = 1
     trust_remote_code: bool = False
@@ -487,11 +489,21 @@ class ServeConfig:
     decode_preset: str = "serve"
     max_new_tokens: int = 256
     temperature: float = 0.0
+    top_k: int | None = 50
     top_p: float = 1.0
     repetition_penalty: float = 1.05
     no_repeat_ngram_size: int = 4
     stop_strings: list[str] = field(default_factory=_default_stop_strings)
     transcript_path: str | None = None
+    use_rag: bool = False
+    rag_index_path: str = "data/rag/webbgpt_index.json"
+    rag_chunks_path: str = "data/rag/webbgpt_chunks.jsonl"
+    rag_top_k: int = 3
+    rag_min_score: float = 0.05
+    rag_min_lexical_overlap: float = 0.45
+    rag_min_matched_terms: int = 2
+    rag_require_named_terms: bool = True
+    rag_min_top_score_margin: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ServeConfig":

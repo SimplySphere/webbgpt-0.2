@@ -1,1309 +1,940 @@
 from __future__ import annotations
 
+import json
 from html import escape
+from pathlib import Path
 
 from config import ServeConfig
 
 
+def _checkpoint_label(path: str) -> str:
+    name = Path(path).name
+    parent = Path(path).parent.name
+    return f"{parent}/{name}" if parent else name
+
+
 def render_playground_html(config: ServeConfig) -> str:
-    model_name = escape(config.model_name)
-    return f"""<!DOCTYPE html>
+    examples_json = json.dumps(
+        [
+            "hi WebbGPT 0.2, how are you?",
+            "What is the difference between a prerequisite and a recommendation?",
+            "What does a course catalog help students understand?",
+            "What is the phone policy in the dining hall?",
+            "A course catalog helps students",
+            "During a science project, the first step is",
+        ]
+    )
+    replacements = {
+        "__MODEL_NAME__": escape(config.model_name),
+        "__MODEL_MODE__": escape(config.model_mode),
+        "__CHECKPOINT_PATH__": escape(config.checkpoint_path),
+        "__CHECKPOINT_LABEL__": escape(_checkpoint_label(config.checkpoint_path)),
+        "__RAG_MODE__": "on" if config.use_rag else "off",
+        "__MAX_NEW_TOKENS__": str(int(config.max_new_tokens)),
+        "__TEMPERATURE__": str(float(config.temperature)),
+        "__TOP_K__": "" if config.top_k is None else str(int(config.top_k)),
+        "__TOP_P__": str(float(config.top_p)),
+        "__EXAMPLES_JSON__": examples_json,
+    }
+    html = """<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WebbGPT Playground</title>
+    <title>WebbGPT 0.2 Chat</title>
     <style>
-      :root {{
-        --bg: #f4efe4;
-        --panel: rgba(255, 252, 246, 0.92);
-        --panel-strong: #fffaf0;
-        --panel-soft: rgba(255, 255, 255, 0.5);
-        --ink: #20170f;
-        --muted: #6b5d52;
-        --line: rgba(53, 35, 18, 0.14);
-        --accent: #b14d1f;
-        --accent-strong: #8f3410;
-        --accent-soft: rgba(177, 77, 31, 0.12);
-        --user: #1f5f8b;
-        --assistant: #5d3b8c;
-        --good: #1f7a4d;
-        --good-soft: rgba(31, 122, 77, 0.12);
+      :root {
+        --bg: #f7f7f5;
+        --surface: #ffffff;
+        --surface-soft: #f1f4f2;
+        --surface-warm: #fbf8f2;
+        --text: #171717;
+        --muted: #646a73;
+        --line: #dfe4e1;
+        --line-strong: #cdd5d0;
+        --accent: #256f5c;
+        --accent-dark: #15483b;
+        --accent-soft: #e4f1ed;
+        --user: #243b53;
+        --assistant: #8a4b20;
         --warn: #8a5a11;
-        --warn-soft: rgba(138, 90, 17, 0.12);
-        --bad: #9b1c1c;
-        --bad-soft: rgba(155, 28, 28, 0.12);
-        --shadow: 0 24px 60px rgba(52, 31, 15, 0.12);
-      }}
+        --danger: #9b1c1c;
+        --shadow: 0 18px 60px rgba(24, 32, 38, 0.08);
+      }
 
-      * {{
+      * {
         box-sizing: border-box;
-      }}
+      }
 
-      body {{
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
         margin: 0;
-        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
-        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        color: var(--text);
         background:
-          radial-gradient(circle at top left, rgba(177, 77, 31, 0.14), transparent 28%),
-          radial-gradient(circle at top right, rgba(31, 95, 139, 0.12), transparent 26%),
-          linear-gradient(180deg, #f8f2e8 0%, var(--bg) 55%, #efe6d7 100%);
-        min-height: 100vh;
-      }}
+          linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(247, 247, 245, 0.98)),
+          var(--bg);
+      }
 
-      .shell {{
-        width: min(1240px, calc(100vw - 32px));
-        margin: 24px auto;
-        display: grid;
-        grid-template-columns: 320px 1fr;
-        gap: 20px;
-      }}
+      button,
+      textarea,
+      input {
+        font: inherit;
+      }
 
-      .panel {{
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 24px;
-        box-shadow: var(--shadow);
-        backdrop-filter: blur(14px);
-      }}
-
-      .sidebar {{
-        padding: 24px;
-        display: flex;
-        flex-direction: column;
-        gap: 18px;
-      }}
-
-      .eyebrow {{
-        margin: 0;
-        font-size: 0.78rem;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: var(--accent);
-        font-weight: 700;
-      }}
-
-      h1 {{
-        margin: 0;
-        font-size: clamp(2rem, 4vw, 3rem);
-        line-height: 0.95;
-      }}
-
-      .lede {{
-        margin: 0;
-        color: var(--muted);
-        line-height: 1.55;
-      }}
-
-      .badge-grid {{
-        display: grid;
-        gap: 10px;
-      }}
-
-      .badge {{
-        padding: 12px 14px;
-        border-radius: 16px;
-        background: var(--panel-strong);
-        border: 1px solid var(--line);
-      }}
-
-      .badge strong {{
-        display: block;
-        font-size: 0.78rem;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: var(--muted);
-        margin-bottom: 5px;
-      }}
-
-      .controls {{
-        display: grid;
-        gap: 12px;
-      }}
-
-      label.toggle {{
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 14px;
-        padding: 12px 14px;
-        border-radius: 16px;
-        border: 1px solid var(--line);
-        background: var(--panel-strong);
-        font-size: 0.98rem;
-      }}
-
-      label.toggle.disabled {{
-        opacity: 0.6;
-      }}
-
-      .toggle input {{
-        width: 18px;
-        height: 18px;
-      }}
-
-      .control-note {{
-        margin: -2px 2px 2px;
-        color: var(--muted);
-        font-size: 0.84rem;
-        line-height: 1.45;
-      }}
-
-      button {{
+      button {
         border: 0;
-        border-radius: 16px;
-        padding: 12px 16px;
-        font: inherit;
         cursor: pointer;
-      }}
+      }
 
-      .ghost {{
-        background: transparent;
-        border: 1px solid var(--line);
-        color: var(--ink);
-      }}
-
-      .primary {{
-        background: linear-gradient(135deg, var(--accent), var(--accent-strong));
-        color: #fff8f3;
-        font-weight: 700;
-      }}
-
-      .workspace {{
-        padding: 22px;
+      .app {
+        min-height: 100vh;
         display: grid;
-        gap: 16px;
-      }}
+        grid-template-rows: auto 1fr auto;
+      }
 
-      .topbar {{
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+        backdrop-filter: blur(16px);
+      }
+
+      .topbar-inner {
+        width: min(1040px, calc(100vw - 28px));
+        min-height: 62px;
+        margin: 0 auto;
         display: flex;
+        align-items: center;
         justify-content: space-between;
+        gap: 16px;
+      }
+
+      .brand {
+        display: flex;
         align-items: center;
         gap: 12px;
-        padding: 4px 4px 0;
-      }}
+        min-width: 0;
+      }
 
-      .topbar h2 {{
-        margin: 0;
-        font-size: 1.05rem;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }}
-
-      .chat-log {{
-        min-height: 58vh;
-        max-height: 58vh;
-        overflow: auto;
-        padding: 10px 4px 4px;
+      .mark {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
         display: grid;
-        gap: 14px;
-      }}
+        place-items: center;
+        color: #fff;
+        background: linear-gradient(135deg, var(--accent), var(--assistant));
+        font-weight: 800;
+        letter-spacing: 0.02em;
+      }
 
-      .empty {{
-        padding: 28px;
-        border: 1px dashed var(--line);
-        border-radius: 20px;
+      .brand-title {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .brand-title strong {
+        font-size: 1rem;
+        line-height: 1.1;
+      }
+
+      .brand-title span {
         color: var(--muted);
-        background: rgba(255, 255, 255, 0.45);
-      }}
+        font-size: 0.82rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: min(42vw, 460px);
+      }
 
-      .message {{
-        padding: 18px 18px 14px;
-        border-radius: 22px;
-        border: 1px solid var(--line);
-        background: var(--panel-strong);
-      }}
-
-      .message.user {{
-        border-left: 6px solid var(--user);
-      }}
-
-      .message.assistant {{
-        border-left: 6px solid var(--assistant);
-      }}
-
-      .message .role {{
-        margin: 0 0 10px;
-        font-size: 0.76rem;
-        font-weight: 700;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: var(--muted);
-      }}
-
-      .message pre {{
-        margin: 0;
-        white-space: pre-wrap;
-        word-break: break-word;
-        font: inherit;
-        line-height: 1.65;
-      }}
-
-      .badge-row {{
+      .status-strip {
         display: flex;
-        flex-wrap: wrap;
+        align-items: center;
+        justify-content: flex-end;
         gap: 8px;
-        margin-top: 12px;
-      }}
+        flex-wrap: wrap;
+      }
 
-      .pill {{
+      .badge {
         display: inline-flex;
         align-items: center;
         gap: 6px;
-        padding: 6px 10px;
-        border-radius: 999px;
+        min-height: 28px;
+        padding: 5px 9px;
         border: 1px solid var(--line);
-        background: var(--panel-soft);
-        font-size: 0.82rem;
-        letter-spacing: 0.03em;
-      }}
+        border-radius: 999px;
+        background: var(--surface);
+        color: var(--muted);
+        font-size: 0.78rem;
+        white-space: nowrap;
+      }
 
-      .pill.good {{
-        background: var(--good-soft);
-        color: var(--good);
-      }}
+      .badge.good {
+        color: var(--accent-dark);
+        background: var(--accent-soft);
+        border-color: #c7e2d9;
+      }
 
-      .pill.warn {{
-        background: var(--warn-soft);
+      .badge.warn {
         color: var(--warn);
-      }}
+        background: #fff6de;
+        border-color: #ead9aa;
+      }
 
-      .pill.fail {{
-        background: var(--bad-soft);
-        color: var(--bad);
-      }}
-
-      .summary-line {{
-        margin: 12px 0 0;
-        color: var(--muted);
-        line-height: 1.45;
-      }}
-
-      .citation-block {{
-        margin-top: 10px;
-        color: var(--muted);
-      }}
-
-      .citation-shell {{
-        border: 0;
-        background: transparent;
-      }}
-
-      .citation-shell summary {{
-        cursor: pointer;
-        list-style: none;
-        font-size: 0.9rem;
-        line-height: 1.4;
-        color: var(--muted);
-      }}
-
-      .citation-shell summary::-webkit-details-marker {{
-        display: none;
-      }}
-
-      .citation-empty {{
-        font-size: 0.9rem;
-        line-height: 1.4;
-        color: var(--muted);
-      }}
-
-      .citation-groups {{
-        display: grid;
-        gap: 8px;
-        margin-top: 8px;
-      }}
-
-      .citation-group {{
-        border-left: 2px solid var(--line);
-        padding-left: 10px;
-      }}
-
-      .citation-group summary {{
-        cursor: pointer;
-        list-style: none;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        padding: 4px 0;
-        font-weight: 600;
-      }}
-
-      .citation-group summary::-webkit-details-marker {{
-        display: none;
-      }}
-
-      .citation-group-count {{
-        color: var(--muted);
-        font-size: 0.88rem;
-        font-weight: 400;
-      }}
-
-      .citation-snippets {{
-        padding: 2px 0 8px;
-        display: grid;
-        gap: 10px;
-      }}
-
-      .citation-snippets p {{
-        margin: 0;
-        line-height: 1.5;
-      }}
-
-      .citation-detail-label {{
-        color: var(--muted);
-        font-size: 0.9rem;
-      }}
-
-      .divider {{
-        margin-top: 14px;
-        border-top: 1px solid var(--line);
-      }}
-
-      .trace-card {{
-        margin-top: 14px;
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        background: rgba(255, 255, 255, 0.5);
-        overflow: hidden;
-      }}
-
-      .trace-card[hidden] {{
-        display: none;
-      }}
-
-      .trace-card summary {{
-        cursor: pointer;
-        list-style: none;
-        padding: 14px 16px;
-        font-weight: 700;
-        color: var(--ink);
-      }}
-
-      .trace-card summary::-webkit-details-marker {{
-        display: none;
-      }}
-
-      .trace-body {{
-        padding: 0 16px 16px;
-        display: grid;
-        gap: 14px;
-      }}
-
-      .trace-section {{
-        border-top: 1px solid var(--line);
-        padding-top: 12px;
-      }}
-
-      .trace-section h4 {{
-        margin: 0 0 8px;
-        font-size: 0.84rem;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: var(--muted);
-      }}
-
-      .kv-list {{
-        display: grid;
-        gap: 8px;
-      }}
-
-      .kv {{
-        display: grid;
-        grid-template-columns: 180px 1fr;
-        gap: 12px;
-        align-items: start;
-        font-size: 0.95rem;
-      }}
-
-      .kv dt {{
-        color: var(--muted);
-      }}
-
-      .kv dd {{
-        margin: 0;
-        word-break: break-word;
-      }}
-
-      .trace-actions {{
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-      }}
-
-      .subtle-button {{
-        padding: 8px 12px;
-        border-radius: 12px;
-        border: 1px solid var(--line);
-        background: transparent;
-      }}
-
-      .timeline {{
-        display: grid;
-        gap: 8px;
-      }}
-
-      .timeline-item {{
-        display: grid;
-        grid-template-columns: 150px 1fr;
-        gap: 10px;
-        font-size: 0.94rem;
-      }}
-
-      .timeline-item strong {{
-        color: var(--muted);
-        font-weight: 600;
-      }}
-
-      .failure-box {{
-        margin-top: 12px;
-        padding: 14px 16px;
-        border-radius: 18px;
-        border: 1px solid rgba(155, 28, 28, 0.28);
-        background: rgba(155, 28, 28, 0.06);
-      }}
-
-      .failure-box strong {{
-        display: block;
-        margin-bottom: 6px;
-        color: var(--bad);
-      }}
-
-      .assistant-actions {{
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-top: 12px;
-      }}
-
-      .assistant-actions-wrap {{
-        margin-top: 12px;
-      }}
-
-      .composer {{
-        display: grid;
-        gap: 12px;
-        padding-top: 10px;
-        border-top: 1px solid var(--line);
-      }}
-
-      textarea {{
-        width: 100%;
-        min-height: 128px;
-        resize: vertical;
-        padding: 16px 18px;
-        border-radius: 18px;
-        border: 1px solid var(--line);
-        background: rgba(255, 255, 255, 0.76);
-        color: var(--ink);
-        font: inherit;
-        line-height: 1.55;
-      }}
-
-      .composer-actions {{
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 12px;
-      }}
-
-      .hint {{
-        color: var(--muted);
-        font-size: 0.92rem;
-      }}
-
-      .status {{
-        min-height: 24px;
-        color: var(--muted);
-      }}
-
-      .status.error {{
-        color: var(--bad);
-      }}
-
-      code.inline {{
-        padding: 1px 6px;
+      .dot {
+        width: 8px;
+        height: 8px;
         border-radius: 999px;
-        background: rgba(53, 35, 18, 0.06);
-      }}
+        background: #94a3a0;
+      }
 
-      @media (max-width: 900px) {{
-        .shell {{
-          grid-template-columns: 1fr;
-        }}
+      .dot.live {
+        background: #16835f;
+      }
 
-        .chat-log {{
-          min-height: 44vh;
-          max-height: none;
-        }}
+      .chat-wrap {
+        width: min(880px, calc(100vw - 28px));
+        margin: 0 auto;
+        padding: 22px 0 180px;
+      }
 
-        .composer-actions {{
+      .notice {
+        margin: 0 0 18px;
+        padding: 11px 14px;
+        border: 1px solid #ead9aa;
+        border-radius: 14px;
+        background: #fff8e7;
+        color: #6e4a10;
+        line-height: 1.45;
+        font-size: 0.92rem;
+      }
+
+      .examples {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 0 0 20px;
+      }
+
+      .chip {
+        padding: 8px 11px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        color: #2f3a44;
+        background: var(--surface);
+        box-shadow: 0 1px 2px rgba(20, 28, 34, 0.04);
+      }
+
+      .chip:hover {
+        border-color: var(--line-strong);
+        background: var(--surface-soft);
+      }
+
+      .messages {
+        display: grid;
+        gap: 18px;
+      }
+
+      .empty {
+        margin-top: 11vh;
+        text-align: center;
+        color: var(--muted);
+      }
+
+      .empty h1 {
+        margin: 0 0 10px;
+        color: var(--text);
+        font-size: clamp(1.8rem, 5vw, 3rem);
+        letter-spacing: -0.02em;
+      }
+
+      .empty p {
+        margin: 0 auto;
+        max-width: 560px;
+        line-height: 1.55;
+      }
+
+      .message-row {
+        display: grid;
+        grid-template-columns: 36px minmax(0, 1fr);
+        gap: 12px;
+      }
+
+      .message-row.user {
+        grid-template-columns: minmax(0, 1fr) 36px;
+      }
+
+      .avatar {
+        width: 34px;
+        height: 34px;
+        border-radius: 11px;
+        display: grid;
+        place-items: center;
+        color: white;
+        font-size: 0.78rem;
+        font-weight: 800;
+        background: var(--assistant);
+      }
+
+      .user .avatar {
+        background: var(--user);
+        grid-column: 2;
+      }
+
+      .bubble {
+        width: fit-content;
+        max-width: 100%;
+        padding: 13px 15px;
+        border-radius: 16px;
+        border: 1px solid var(--line);
+        background: var(--surface);
+        box-shadow: 0 1px 3px rgba(20, 28, 34, 0.04);
+      }
+
+      .user .bubble {
+        justify-self: end;
+        background: #edf3f8;
+        border-color: #d7e3ed;
+      }
+
+      .assistant .bubble {
+        width: 100%;
+      }
+
+      .message-meta {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 0 0 8px;
+      }
+
+      .name {
+        color: var(--muted);
+        font-size: 0.82rem;
+        font-weight: 700;
+      }
+
+      .label {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 3px 8px;
+        font-size: 0.74rem;
+        border: 1px solid var(--line);
+        color: var(--muted);
+        background: var(--surface-soft);
+      }
+
+      .label.answered {
+        color: var(--accent-dark);
+        background: var(--accent-soft);
+        border-color: #c7e2d9;
+      }
+
+      .label.abstained,
+      .label.weak {
+        color: var(--warn);
+        background: #fff6de;
+        border-color: #ead9aa;
+      }
+
+      .label.failed {
+        color: var(--danger);
+        background: #fff0f0;
+        border-color: #edcaca;
+      }
+
+      .content {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        line-height: 1.62;
+      }
+
+      .typing {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        color: var(--muted);
+      }
+
+      .typing span {
+        width: 6px;
+        height: 6px;
+        border-radius: 99px;
+        background: currentColor;
+        opacity: 0.35;
+        animation: blink 1.2s infinite;
+      }
+
+      .typing span:nth-child(2) {
+        animation-delay: 0.15s;
+      }
+
+      .typing span:nth-child(3) {
+        animation-delay: 0.3s;
+      }
+
+      @keyframes blink {
+        0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+        40% { opacity: 0.9; transform: translateY(-2px); }
+      }
+
+      details.sources,
+      details.debug,
+      details.settings {
+        margin-top: 12px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--surface-warm);
+        overflow: hidden;
+      }
+
+      details.sources summary,
+      details.debug summary,
+      details.settings summary {
+        cursor: pointer;
+        list-style: none;
+        padding: 10px 12px;
+        font-weight: 700;
+        color: #3b434b;
+      }
+
+      details.sources summary::-webkit-details-marker,
+      details.debug summary::-webkit-details-marker,
+      details.settings summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .source-list {
+        display: grid;
+        gap: 10px;
+        padding: 0 12px 12px;
+      }
+
+      .source-card {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 10px;
+        background: var(--surface);
+      }
+
+      .source-card header {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 6px;
+        color: var(--muted);
+        font-size: 0.82rem;
+      }
+
+      .source-card p {
+        margin: 0;
+        color: #333b42;
+        line-height: 1.5;
+        font-size: 0.92rem;
+      }
+
+      .debug pre {
+        margin: 0;
+        padding: 0 12px 12px;
+        max-height: 340px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 0.78rem;
+        color: #2d343a;
+      }
+
+      .composer-shell {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 20;
+        border-top: 1px solid var(--line);
+        background: rgba(247, 247, 245, 0.9);
+        backdrop-filter: blur(16px);
+      }
+
+      .composer {
+        width: min(880px, calc(100vw - 28px));
+        margin: 0 auto;
+        padding: 12px 0 16px;
+      }
+
+      .composer-box {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        align-items: end;
+        padding: 10px;
+        border: 1px solid var(--line-strong);
+        border-radius: 20px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+
+      textarea {
+        width: 100%;
+        min-height: 46px;
+        max-height: 140px;
+        resize: none;
+        border: 0;
+        outline: 0;
+        padding: 10px 8px;
+        line-height: 1.45;
+        color: var(--text);
+        background: transparent;
+      }
+
+      .send {
+        width: 42px;
+        height: 42px;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        background: var(--accent);
+        color: white;
+        font-size: 1rem;
+        font-weight: 800;
+      }
+
+      .send:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .settings {
+        margin-bottom: 10px;
+        background: rgba(255, 255, 255, 0.78);
+      }
+
+      .settings-grid {
+        padding: 0 12px 12px;
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .field {
+        display: grid;
+        gap: 4px;
+      }
+
+      .field span {
+        color: var(--muted);
+        font-size: 0.75rem;
+        font-weight: 700;
+      }
+
+      input {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 8px 9px;
+        background: var(--surface);
+      }
+
+      .toggles {
+        padding: 0 12px 12px;
+        display: flex;
+        gap: 14px;
+        flex-wrap: wrap;
+        color: var(--muted);
+        font-size: 0.86rem;
+      }
+
+      .footer-note {
+        margin: 8px 4px 0;
+        color: var(--muted);
+        font-size: 0.78rem;
+      }
+
+      @media (max-width: 720px) {
+        .topbar-inner {
+          min-height: 74px;
+          align-items: flex-start;
           flex-direction: column;
-          align-items: stretch;
-        }}
+          justify-content: center;
+          padding: 10px 0;
+        }
 
-        .kv,
-        .timeline-item {{
+        .status-strip {
+          justify-content: flex-start;
+        }
+
+        .settings-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .message-row,
+        .message-row.user {
           grid-template-columns: 1fr;
-        }}
-      }}
+        }
+
+        .avatar,
+        .user .avatar {
+          display: none;
+        }
+      }
     </style>
   </head>
   <body>
-    <main class="shell">
-      <aside class="panel sidebar">
-        <p class="eyebrow">Local Playground</p>
-        <h1>WebbGPT</h1>
-        <p class="lede">
-          Your AI assistant for all things Webb.
-        </p>
-
-        <div class="badge-grid">
-          <section class="badge">
-            <strong>Model</strong>
-            <span>{model_name}</span>
-          </section>
-          <section class="badge">
-            <strong>API</strong>
-            <span><code>/v1/chat/completions</code></span>
-          </section>
-        </div>
-
-        <div class="controls">
-          <label class="toggle">
-            <span>Tailor for Webb</span>
-            <input id="toolsToggle" type="checkbox" checked />
-          </label>
-          <label id="citationsToggleLabel" class="toggle">
-            <span>Show Citations</span>
-            <input id="citationsToggle" type="checkbox" checked />
-          </label>
-          <div id="controlsNote" class="control-note">
-            Show Citations adds source labels when Webb tailoring finds grounded sources.
+    <div class="app">
+      <header class="topbar">
+        <div class="topbar-inner">
+          <div class="brand">
+            <div class="mark" aria-hidden="true">W</div>
+            <div class="brand-title">
+              <strong>WebbGPT 0.2</strong>
+              <span id="checkpointPath" title="__CHECKPOINT_PATH__">__CHECKPOINT_LABEL__</span>
+            </div>
+          </div>
+          <div class="status-strip" aria-label="Server status">
+            <span class="badge good"><span id="statusDot" class="dot"></span><span id="serverStatus">checking</span></span>
+            <span class="badge">mode <strong id="modeBadge">__MODEL_MODE__</strong></span>
+            <span class="badge">device <strong id="deviceBadge">loading</strong></span>
+            <span id="ragBadge" class="badge">RAG <strong>__RAG_MODE__</strong></span>
           </div>
         </div>
+      </header>
 
-        <button id="clearButton" class="ghost" type="button">New Conversation</button>
-      </aside>
-
-      <section class="panel workspace">
-        <div class="topbar">
-          <h2>Chat Session</h2>
-          <div class="hint">Use Shift+Enter for a new line, Enter to send.</div>
-        </div>
-
-        <div id="chatLog" class="chat-log">
+      <main class="chat-wrap">
+        <p class="notice">Local-MVP research model. Outputs may drift. RAG sources appear collapsed when available, and weak generations are labeled honestly.</p>
+        <div id="examples" class="examples" aria-label="Example prompts"></div>
+        <section id="messages" class="messages" aria-live="polite">
           <div class="empty">
-            Start with a general question, or ask a catalog-style question like “What does AdvSt Chemistry require?” to test grounding.
+            <h1>Ask WebbGPT 0.2</h1>
+            <p>Use the prompt chips or ask a question. RAG can add source context, but the local-MVP model output stays visible so the demo shows both strengths and limitations.</p>
           </div>
-        </div>
+        </section>
+      </main>
 
+      <footer class="composer-shell">
         <form id="composer" class="composer">
-          <textarea
-            id="promptInput"
-            placeholder="Ask WebbGPT anything..."
-            aria-label="Prompt"
-          ></textarea>
-          <div class="composer-actions">
-            <div id="statusLine" class="status"></div>
-            <button id="sendButton" class="primary" type="submit">Send Prompt</button>
+          <details class="settings">
+            <summary>Settings</summary>
+            <div class="settings-grid">
+              <label class="field">
+                <span>Max tokens</span>
+                <input id="maxTokensInput" type="number" min="1" max="512" step="1" value="__MAX_NEW_TOKENS__" />
+              </label>
+              <label class="field">
+                <span>Temperature</span>
+                <input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="__TEMPERATURE__" />
+              </label>
+              <label class="field">
+                <span>Top-K</span>
+                <input id="topKInput" type="number" min="0" max="500" step="1" value="__TOP_K__" />
+              </label>
+              <label class="field">
+                <span>Top-P</span>
+                <input id="topPInput" type="number" min="0.01" max="1" step="0.01" value="__TOP_P__" />
+              </label>
+            </div>
+            <div class="toggles">
+              <label><input id="ragToggle" type="checkbox" checked /> Use RAG</label>
+              <label><input id="sourcesToggle" type="checkbox" checked /> Show sources</label>
+            </div>
+          </details>
+          <div class="composer-box">
+            <textarea id="promptInput" rows="1" placeholder="Message WebbGPT 0.2..." aria-label="Prompt"></textarea>
+            <button id="sendButton" class="send" type="submit" aria-label="Send">↑</button>
           </div>
+          <p id="statusLine" class="footer-note">Enter sends. Shift+Enter adds a new line.</p>
         </form>
-      </section>
-    </main>
+      </footer>
+    </div>
 
     <script>
       const messages = [];
-      const chatLog = document.getElementById("chatLog");
+      const examples = __EXAMPLES_JSON__;
+      const messagesEl = document.getElementById("messages");
+      const examplesEl = document.getElementById("examples");
       const composer = document.getElementById("composer");
       const promptInput = document.getElementById("promptInput");
       const sendButton = document.getElementById("sendButton");
-      const clearButton = document.getElementById("clearButton");
       const statusLine = document.getElementById("statusLine");
-      const toolsToggle = document.getElementById("toolsToggle");
-      const citationsToggle = document.getElementById("citationsToggle");
-      const citationsToggleLabel = document.getElementById("citationsToggleLabel");
-      const controlsNote = document.getElementById("controlsNote");
+      const maxTokensInput = document.getElementById("maxTokensInput");
+      const temperatureInput = document.getElementById("temperatureInput");
+      const topKInput = document.getElementById("topKInput");
+      const topPInput = document.getElementById("topPInput");
+      const ragToggle = document.getElementById("ragToggle");
+      const sourcesToggle = document.getElementById("sourcesToggle");
 
-      function setStatus(text, isError = false) {{
-        statusLine.textContent = text;
-        statusLine.classList.toggle("error", isError);
-      }}
+      function el(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
 
-      function shortId(value) {{
-        if (!value || typeof value !== "string") {{
-          return "n/a";
-        }}
-        return value.slice(0, 12);
-      }}
+      function normalizeLabel(status) {
+        if (!status) return "Generated";
+        if (status.generation_failed && !status.degenerate_output) return "Generation failed";
+        if (status.degenerate_output) return "Weak generation";
+        if (status.abstained) return "Abstained";
+        return status.final_label || "Generated";
+      }
 
-      function shortPath(value) {{
-        if (!value || typeof value !== "string") {{
-          return "n/a";
-        }}
-        const parts = value.split("/");
-        return parts[parts.length - 1] || value;
-      }}
+      function labelClass(label) {
+        if (label === "Generated" || label === "Generated with sources") return "answered";
+        if (label === "Abstained") return "abstained";
+        if (label === "Weak generation") return "weak";
+        return "failed";
+      }
 
-      function createElement(tag, className, text) {{
-        const element = document.createElement(tag);
-        if (className) {{
-          element.className = className;
-        }}
-        if (text !== undefined) {{
-          element.textContent = text;
-        }}
-        return element;
-      }}
+      function requestPayload(prompt) {
+        const topKValue = topKInput.value.trim() === "" ? null : Number.parseInt(topKInput.value, 10);
+        return {
+          prompt,
+          tools: ragToggle.checked,
+          citations: true,
+          max_new_tokens: Number.parseInt(maxTokensInput.value, 10),
+          temperature: Number.parseFloat(temperatureInput.value),
+          top_k: Number.isFinite(topKValue) ? topKValue : null,
+          top_p: Number.parseFloat(topPInput.value),
+        };
+      }
 
-      function addBadge(container, text, tone = "") {{
-        const badge = createElement("span", "pill" + (tone ? " " + tone : ""), text);
-        container.appendChild(badge);
-      }}
+      function scrollLatest() {
+        window.requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" }));
+      }
 
-      function extractMeta(item) {{
-        return (item.meta && item.meta.metadata) || {{}};
-      }}
-
-      function extractStatus(item) {{
-        return extractMeta(item).status || {{}};
-      }}
-
-      function extractProvenance(item) {{
-        return extractMeta(item).provenance || {{}};
-      }}
-
-      function extractReproCapsule(item) {{
-        return extractMeta(item).repro_capsule || {{}};
-      }}
-
-      function extractRequest(item) {{
-        return (item.meta && item.meta.request) || {{}};
-      }}
-
-      function captureRequestState(conversation, safeDecode) {{
-        const tailoringRequested = Boolean(toolsToggle.checked);
-        const citationsSelected = Boolean(citationsToggle.checked);
-        return {{
-          messages: conversation.map(item => ({{ role: item.role, content: item.content }})),
-          tools: tailoringRequested,
-          citations: tailoringRequested && citationsSelected,
-          citationsSelected,
-          safe_decode: Boolean(safeDecode),
-        }};
-      }}
-
-      function syncDependentControls() {{
-        const tailoringRequested = Boolean(toolsToggle.checked);
-        citationsToggle.disabled = !tailoringRequested;
-        citationsToggleLabel.classList.toggle("disabled", !tailoringRequested);
-        controlsNote.textContent = tailoringRequested
-          ? "Show Citations adds source labels when Webb tailoring finds grounded sources."
-          : "Show Citations requires Tailor for Webb, because citations only come from grounded Webb sources.";
-      }}
-
-      function fallbackCopyText(payload, successMessage) {{
-        const textarea = document.createElement("textarea");
-        textarea.value = payload;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        textarea.style.pointerEvents = "none";
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
-        textarea.setSelectionRange(0, textarea.value.length);
-        try {{
-          const copied = document.execCommand("copy");
-          setStatus(copied ? (successMessage || "Copied.") : "Copy failed.", !copied);
-        }} catch (_error) {{
-          setStatus("Copy failed.", true);
-        }} finally {{
-          document.body.removeChild(textarea);
-        }}
-      }}
-
-      function copyText(text, successMessage) {{
-        const payload = typeof text === "string" ? text : JSON.stringify(text, null, 2);
-        if (navigator.clipboard && window.isSecureContext) {{
-          navigator.clipboard.writeText(payload)
-            .then(() => setStatus(successMessage || "Copied."))
-            .catch(() => fallbackCopyText(payload, successMessage));
-          return;
-        }}
-        fallbackCopyText(payload, successMessage);
-      }}
-
-      function createKvSection(title, rows) {{
-        const section = createElement("section", "trace-section");
-        section.appendChild(createElement("h4", "", title));
-        const list = createElement("dl", "kv-list");
-        for (const row of rows) {{
-          if (row.value === null || row.value === undefined || row.value === "") {{
-            continue;
-          }}
-          const wrapper = createElement("div", "kv");
-          const dt = createElement("dt", "", row.label);
-          const dd = createElement("dd", "");
-          dd.textContent = String(row.value);
-          wrapper.append(dt, dd);
-          list.appendChild(wrapper);
-        }}
-        if (!list.children.length) {{
-          return null;
-        }}
-        section.appendChild(list);
-        return section;
-      }}
-
-      function createTimelineSection(entries) {{
-        const section = createElement("section", "trace-section");
-        section.appendChild(createElement("h4", "", "Timeline"));
-        const timeline = createElement("div", "timeline");
-        for (const entry of entries || []) {{
-          const row = createElement("div", "timeline-item");
-          row.appendChild(createElement("strong", "", entry.label || ""));
-          row.appendChild(createElement("span", "", entry.value || ""));
-          timeline.appendChild(row);
-        }}
-        if (!timeline.children.length) {{
-          return null;
-        }}
-        section.appendChild(timeline);
-        return section;
-      }}
-
-      function requestPayload(conversation, safeDecode) {{
-        const request = captureRequestState(conversation, safeDecode);
-        return {{
-          messages: request.messages,
-          tools: request.tools,
-          citations: request.citations,
-          safe_decode: request.safe_decode,
-        }};
-      }}
-
-      async function requestCompletion(conversation, safeDecode = false) {{
-        const response = await fetch("/v1/chat/completions", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify(requestPayload(conversation, safeDecode)),
-        }});
-
-        if (!response.ok) {{
-          const text = await response.text();
-          throw new Error(text || ("Request failed with status " + response.status));
-        }}
-
-        return response.json();
-      }}
-
-      function createTraceCard(item, index) {{
-        const meta = extractMeta(item);
-        const request = extractRequest(item);
-        const provenance = extractProvenance(item);
-        const reproCapsule = extractReproCapsule(item);
-        const status = meta.status || {{}};
-        const routing = meta.routing || {{}};
-        const grounding = meta.grounding || {{}};
-        const generation = meta.generation || {{}};
-        const quality = meta.quality || {{}};
-        const trace = createElement("details", "trace-card");
-        trace.dataset.messageIndex = String(index);
-        trace.hidden = true;
-        const summary = createElement("summary", "", "Details");
-        trace.appendChild(summary);
-
-        const body = createElement("div", "trace-body");
-        const debug = meta.debug || {{}};
-        const decode = provenance.decode || {{}};
-        const exportArtifact = provenance.export || {{}};
-        const responseText = debug.raw_output || item.content || "";
-
-        const responseStatus = createKvSection("Response Status", [
-          {{ label: "Interpretation", value: meta.summary }},
-          {{ label: "Grounded response", value: status.grounded ? "yes" : "no" }},
-          {{ label: "Citations shown", value: status.cited ? "yes" : "no" }},
-          {{ label: "Abstained", value: status.abstained ? "yes" : "no" }},
-          {{ label: "Degenerate output", value: status.degenerate_output ? "yes" : "no" }},
-          {{ label: "Webb tailoring used", value: item.meta.usedTools ? "yes" : "no" }},
-          {{ label: "Citation count", value: (item.meta.citations || []).length }},
-          {{ label: "Response characters", value: responseText.length }},
-        ]);
-        if (responseStatus) {{
-          body.appendChild(responseStatus);
-        }}
-
-        const requestSection = createKvSection("Request Settings", [
-          {{ label: "Tailor for Webb requested", value: request.tools ? "yes" : "no" }},
-          {{ label: "Show Citations selected", value: request.citationsSelected ? "yes" : "no" }},
-          {{ label: "Show Citations active", value: request.citations ? "yes" : "no" }},
-          {{ label: "Safe decode requested", value: request.safeDecode ? "yes" : "no" }},
-        ]);
-        if (requestSection) {{
-          body.appendChild(requestSection);
-        }}
-
-        const groundingSection = createKvSection("Grounding", [
-          {{ label: "Routed as", value: routing.mode || "chat" }},
-          {{ label: "Catalog queried", value: routing.catalog_queried ? "yes" : "no" }},
-          {{ label: "Retrieved hits", value: grounding.retrieved_hits ?? 0 }},
-          {{ label: "Abstained on no hits", value: grounding.abstained_due_to_no_hits ? "yes" : "no" }},
-          {{ label: "Citation labels", value: (grounding.citation_labels || []).join(", ") || "none" }},
-          {{ label: "Snapshot label", value: grounding.catalog_snapshot_label || "n/a" }},
-        ]);
-        if (groundingSection) {{
-          body.appendChild(groundingSection);
-        }}
-
-        const checkpoint = provenance.checkpoint || {{}};
-        const tokenizer = provenance.tokenizer || {{}};
-        const modelArtifact = createKvSection("Model Artifact", [
-          {{ label: "Checkpoint", value: shortPath(checkpoint.path) }},
-          {{ label: "Checkpoint path", value: checkpoint.path }},
-          {{ label: "Checkpoint id", value: shortId(checkpoint.artifact_id) }},
-          {{ label: "Checkpoint sha256", value: checkpoint.checkpoint_sha256 }},
-          {{ label: "Directory sha256", value: checkpoint.directory_sha256 }},
-          {{ label: "Tokenizer", value: shortPath(tokenizer.path) }},
-          {{ label: "Tokenizer path", value: tokenizer.path }},
-          {{ label: "Tokenizer id", value: shortId(tokenizer.artifact_id) }},
-          {{ label: "Tokenizer sha256", value: tokenizer.sha256 }},
-          {{ label: "Tokenizer vocab sha256", value: tokenizer.vocab_sha256 || tokenizer.tokenizer_vocab_sha256 }},
-          {{ label: "Tokenizer config sha256", value: tokenizer.metadata_sha256 || tokenizer.tokenizer_config_sha256 }},
-          {{ label: "Export path", value: exportArtifact.path }},
-          {{ label: "Export id", value: shortId(exportArtifact.artifact_id) }},
-          {{ label: "Export directory sha256", value: exportArtifact.directory_sha256 }},
-        ]);
-        if (modelArtifact) {{
-          body.appendChild(modelArtifact);
-        }}
-
-        const snapshot = provenance.catalog_snapshot || {{}};
-        const snapshotSection = createKvSection("Catalog Snapshot", [
-          {{ label: "Snapshot label", value: grounding.catalog_snapshot_label || shortPath(snapshot.sqlite_path || snapshot.catalog_input_path) }},
-          {{ label: "Snapshot id", value: shortId(snapshot.snapshot_id) }},
-          {{ label: "Catalog DSN", value: snapshot.catalog_dsn }},
-          {{ label: "Catalog input", value: snapshot.catalog_input_path }},
-          {{ label: "Catalog input sha256", value: snapshot.catalog_input_sha256 }},
-          {{ label: "SQLite path", value: snapshot.sqlite_path }},
-          {{ label: "SQLite sha256", value: snapshot.sqlite_sha256 }},
-        ]);
-        if (snapshotSection) {{
-          body.appendChild(snapshotSection);
-        }}
-
-        const decodeSection = createKvSection("Decode Settings", [
-          {{ label: "Backend", value: generation.backend }},
-          {{ label: "Preset", value: generation.decode_preset }},
-          {{ label: "Safe decode", value: generation.safe_decode ? "yes" : "no" }},
-          {{ label: "Stop reason", value: generation.stop_reason }},
-          {{ label: "Max new tokens", value: decode.max_new_tokens }},
-          {{ label: "Temperature", value: decode.temperature }},
-          {{ label: "Top p", value: decode.top_p }},
-          {{ label: "Repetition penalty", value: decode.repetition_penalty }},
-          {{ label: "No-repeat ngram", value: decode.no_repeat_ngram_size }},
-          {{ label: "Stop strings", value: (decode.stop_strings || []).join(", ") || "none" }},
-        ]);
-        if (decodeSection) {{
-          body.appendChild(decodeSection);
-        }}
-
-        const seeds = reproCapsule.seed_bundle || {{}};
-        const reproducibility = createKvSection("Reproducibility", [
-          {{ label: "Checkpoint id", value: shortId(reproCapsule.checkpoint_artifact_id) }},
-          {{ label: "Tokenizer id", value: shortId(reproCapsule.tokenizer_artifact_id) }},
-          {{ label: "Snapshot id", value: shortId(reproCapsule.snapshot_id) }},
-          {{ label: "Backend", value: reproCapsule.backend }},
-          {{ label: "Decode preset", value: reproCapsule.decode_preset }},
-          {{ label: "Seed bundle", value: "python=" + (seeds.python ?? "n/a") + ", numpy=" + (seeds.numpy ?? "n/a") + ", torch=" + (seeds.torch ?? "n/a") }},
-        ]);
-        if (reproducibility) {{
-          body.appendChild(reproducibility);
-        }}
-
-        if (quality.degenerate || (quality.reasons && quality.reasons.length)) {{
-          const qualitySection = createKvSection("Response Quality", [
-            {{ label: "Degenerate", value: quality.degenerate ? "yes" : "no" }},
-            {{ label: "Reasons", value: (quality.reasons || []).join(", ") || "none" }},
-            {{ label: "Token count", value: quality.metrics?.token_count }},
-            {{ label: "Alpha ratio", value: quality.metrics?.alpha_ratio }},
-            {{ label: "Comma ratio", value: quality.metrics?.comma_ratio }},
-            {{ label: "Separator bursts", value: quality.metrics?.separator_bursts }},
-            {{ label: "Short fragment ratio", value: quality.metrics?.short_fragment_ratio }},
-            {{ label: "Punctuation suffix ratio", value: quality.metrics?.punctuation_suffix_ratio }},
-            {{ label: "Unique token ratio", value: quality.metrics?.unique_token_ratio }},
-            {{ label: "Repeated token run", value: quality.metrics?.repeated_token_run }},
-            {{ label: "Non-space chars", value: quality.metrics?.nonspace_chars }},
-          ]);
-          if (qualitySection) {{
-            body.appendChild(qualitySection);
-          }}
-        }}
-
-        const timeline = createTimelineSection(meta.timeline || []);
-        if (timeline) {{
-          body.appendChild(timeline);
-        }}
-
-        const rawOutputSection = createKvSection("Raw Output", [
-          {{ label: "Output", value: responseText }},
-        ]);
-        if (rawOutputSection) {{
-          body.appendChild(rawOutputSection);
-        }}
-
-        trace.appendChild(body);
-        return trace;
-      }}
-
-      function createAssistantActions(index, item) {{
-        const meta = extractMeta(item);
-        const status = meta.status || {{}};
-        if (!status.degenerate_output || index !== messages.length - 1) {{
-          return null;
-        }}
-        const wrapper = createElement("div", "assistant-actions-wrap");
-        const badgeRow = createElement("div", "badge-row");
-        addBadge(badgeRow, "Malformed output", "fail");
-        wrapper.appendChild(badgeRow);
-        const actions = createElement("div", "assistant-actions");
-        const reproCapsule = extractReproCapsule(item);
-
-        const retry = createElement("button", "ghost", "Retry");
-        retry.type = "button";
-        retry.addEventListener("click", async () => {{
-          await retryAssistant(index, false);
-        }});
-        actions.appendChild(retry);
-
-        const safeRetry = createElement("button", "ghost", "Retry With Safe Preset");
-        safeRetry.type = "button";
-        safeRetry.addEventListener("click", async () => {{
-          await retryAssistant(index, true);
-        }});
-        actions.appendChild(safeRetry);
-
-        const copyCapsule = createElement("button", "ghost", "Copy Repro Capsule");
-        copyCapsule.type = "button";
-        copyCapsule.addEventListener("click", () => {{
-          copyText(reproCapsule, "Repro capsule copied.");
-        }});
-        actions.appendChild(copyCapsule);
-
-        const copyDebug = createElement("button", "ghost", "Copy Full Debug JSON");
-        copyDebug.type = "button";
-        copyDebug.addEventListener("click", () => {{
-          copyText(meta, "Full debug JSON copied.");
-        }});
-        actions.appendChild(copyDebug);
-
-        const showDetails = createElement("button", "ghost", "Show Details");
-        showDetails.type = "button";
-        showDetails.addEventListener("click", () => {{
-          const trace = chatLog.querySelector(`.trace-card[data-message-index="${{index}}"]`);
-          if (!trace) {{
-            return;
-          }}
-          const shouldShow = trace.hidden;
-          trace.hidden = !shouldShow ? true : false;
-          if (shouldShow) {{
-            trace.open = true;
-            trace.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
-            showDetails.textContent = "Hide Details";
-          }} else {{
-            trace.open = false;
-            showDetails.textContent = "Show Details";
-          }}
-        }});
-        actions.appendChild(showDetails);
-
-        wrapper.appendChild(actions);
+      function renderSources(metadata) {
+        if (!sourcesToggle.checked) {
+          return document.createDocumentFragment();
+        }
+        const rag = metadata?.rag || {};
+        const hits = rag.hits || [];
+        const wrapper = document.createDocumentFragment();
+        if (!hits.length) {
+          if (metadata?.status?.abstained) {
+            const note = el("div", "footer-note", "No reliable source found.");
+            wrapper.appendChild(note);
+          }
+          return wrapper;
+        }
+        const details = el("details", "sources");
+        details.open = false;
+        details.appendChild(el("summary", "", `Sources available (${hits.length})`));
+        const list = el("div", "source-list");
+        for (const hit of hits) {
+          const card = el("article", "source-card");
+          const header = document.createElement("header");
+          header.appendChild(el("span", "", hit.chunk_id || "chunk"));
+          header.appendChild(el("span", "", hit.score === undefined ? "score n/a" : `score ${hit.score}`));
+          card.appendChild(header);
+          card.appendChild(el("p", "", hit.source_file || "source unavailable"));
+          const meta = el("p", "", `risk: ${hit.risk_level || "n/a"} · use: ${hit.allowed_use || "n/a"}`);
+          card.appendChild(meta);
+          card.appendChild(el("p", "", hit.text_preview || ""));
+          list.appendChild(card);
+        }
+        details.appendChild(list);
+        wrapper.appendChild(details);
         return wrapper;
-      }}
+      }
 
-      function createVisibleCitationBlock(item) {{
-        const meta = extractMeta(item);
-        const request = extractRequest(item);
-        const status = meta.status || {{}};
-        const grounding = meta.grounding || {{}};
-        const rawCitations = (item.meta && item.meta.citations) || [];
-        const groups = new Map();
+      function renderDebug(metadata) {
+        const details = el("details", "debug");
+        details.appendChild(el("summary", "", "Run details"));
+        const pre = document.createElement("pre");
+        pre.textContent = JSON.stringify(metadata || {}, null, 2);
+        details.appendChild(pre);
+        return details;
+      }
 
-        function simplifyLabel(label) {{
-          const text = String(label || "").trim();
-          if (!text) {{
-            return "Source";
-          }}
-          const parts = text.split("|").map(part => part.trim()).filter(Boolean);
-          if (!parts.length) {{
-            return text;
-          }}
-          if (parts.length > 1 && /The Webb Schools|Private Boarding & Day School in California/i.test(parts.slice(1).join(" | "))) {{
-            return parts[0];
-          }}
-          return text;
-        }}
-
-        function cleanSnippet(snippet, label) {{
-          let text = String(snippet || "").trim();
-          if (!text) {{
-            return "";
-          }}
-          const shortLabel = simplifyLabel(label).toLowerCase();
-          const lines = text.split(/\\n+/).map(part => part.trim()).filter(Boolean);
-          if (lines.length > 1 && simplifyLabel(lines[0]).toLowerCase() === shortLabel) {{
-            text = lines.slice(1).join("\\n").trim();
-          }}
-          const lowered = text.toLowerCase();
-          const prefix = shortLabel + " ";
-          if (lowered.startsWith(prefix)) {{
-            text = text.slice(prefix.length).trim();
-          }}
-          return text;
-        }}
-
-        function ensureGroup(rawLabel) {{
-          const displayLabel = simplifyLabel(rawLabel);
-          if (!groups.has(displayLabel)) {{
-            groups.set(displayLabel, {{
-              displayLabel,
-              rawLabels: new Set(),
-              snippets: [],
-              snippetKeys: new Set(),
-            }});
-          }}
-          const group = groups.get(displayLabel);
-          group.rawLabels.add(String(rawLabel || displayLabel).trim());
-          return group;
-        }}
-
-        for (const citation of rawCitations) {{
-          const rawLabel = citation.label || citation.source_id || citation.source_type || "Source";
-          const snippet = cleanSnippet(citation.snippet || "", rawLabel);
-          const group = ensureGroup(rawLabel);
-          const snippetKey = snippet;
-          if (snippet && !group.snippetKeys.has(snippetKey)) {{
-            group.snippetKeys.add(snippetKey);
-            group.snippets.push(snippet);
-          }}
-        }}
-
-        if (!groups.size) {{
-          for (const rawLabel of grounding.citation_labels || []) {{
-            ensureGroup(rawLabel);
-          }}
-        }}
-
-        if (!groups.size) {{
-          if (!request.citations) {{
-            return null;
-          }}
-          const block = createElement("section", "citation-block");
-          let note = "Sources: none surfaced for this response.";
-          if (!status.grounded) {{
-            note = "Sources: none. This response was model-only.";
-          }} else if (grounding.abstained_due_to_no_hits) {{
-            note = "Sources: none found in the current Webb snapshot.";
-          }} else if (status.degenerate_output) {{
-            note = "Sources: none surfaced because the response was intercepted as malformed.";
-          }}
-          block.appendChild(createElement("div", "citation-empty", note));
-          return block;
-        }}
-
-        const block = createElement("section", "citation-block");
-        const shell = createElement("details", "citation-shell");
-        const shellSummary = createElement(
-          "summary",
-          "",
-          "Sources: " + Array.from(groups.keys()).join(", ")
-        );
-        shell.appendChild(shellSummary);
-        const list = createElement("div", "citation-groups");
-        for (const group of groups.values()) {{
-          const detail = createElement("details", "citation-group");
-          const summary = createElement("summary", "");
-          summary.appendChild(createElement("span", "", group.displayLabel));
-          const countText = group.snippets.length
-            ? `${{group.snippets.length}} passage${{group.snippets.length === 1 ? "" : "s"}}`
-            : `${{group.rawLabels.size}} source${{group.rawLabels.size === 1 ? "" : "s"}}`;
-          summary.appendChild(createElement("span", "citation-group-count", countText));
-          detail.appendChild(summary);
-
-          const snippets = createElement("div", "citation-snippets");
-          if (group.snippets.length) {{
-            group.snippets.forEach(snippet => {{
-              snippets.appendChild(createElement("p", "", snippet));
-            }});
-          }} else {{
-            Array.from(group.rawLabels).forEach(rawLabel => {{
-              snippets.appendChild(createElement("p", "citation-detail-label", rawLabel));
-            }});
-          }}
-          detail.appendChild(snippets);
-          list.appendChild(detail);
-        }}
-        shell.appendChild(list);
-        block.appendChild(shell);
-        return block;
-      }}
-
-      function render() {{
-        chatLog.innerHTML = "";
-        if (!messages.length) {{
-          chatLog.innerHTML = '<div class="empty">Start with a general question, or ask a catalog-style question like “What does AdvSt Chemistry require?” to test grounding.</div>';
+      function render() {
+        messagesEl.innerHTML = "";
+        if (!messages.length) {
+          const empty = el("div", "empty");
+          empty.appendChild(el("h1", "", "Ask WebbGPT 0.2"));
+          empty.appendChild(el("p", "", "Use the prompt chips or ask a question. RAG can add source context, but the local-MVP model output stays visible so the demo shows both strengths and limitations."));
+          messagesEl.appendChild(empty);
           return;
-        }}
+        }
+        for (const message of messages) {
+          const row = el("article", `message-row ${message.role}`);
+          const avatar = el("div", "avatar", message.role === "user" ? "You" : "W");
+          const bubble = el("div", "bubble");
+          if (message.role === "assistant") {
+            const metadata = message.metadata || {};
+            const label = message.pending ? "Thinking" : (message.streaming ? "Streaming" : normalizeLabel(metadata.status));
+            const meta = el("div", "message-meta");
+            meta.appendChild(el("span", "name", "WebbGPT 0.2"));
+            meta.appendChild(el("span", `label ${message.pending || message.streaming ? "" : labelClass(label)}`, label));
+            if (metadata.rag?.retrieved_hits) {
+              meta.appendChild(el("span", "label answered", `${metadata.rag.retrieved_hits} source${metadata.rag.retrieved_hits === 1 ? "" : "s"}`));
+            }
+            bubble.appendChild(meta);
+          }
+          const content = el("div", "content", message.content);
+          if (message.pending && !message.content) {
+            const typing = el("div", "typing");
+            typing.appendChild(el("span"));
+            typing.appendChild(el("span"));
+            typing.appendChild(el("span"));
+            content.appendChild(typing);
+          }
+          bubble.appendChild(content);
+          if (message.role === "assistant" && !message.pending) {
+            bubble.appendChild(renderSources(message.metadata || {}));
+            bubble.appendChild(renderDebug(message.metadata || {}));
+          }
+          if (message.role === "user") {
+            row.appendChild(bubble);
+            row.appendChild(avatar);
+          } else {
+            row.appendChild(avatar);
+            row.appendChild(bubble);
+          }
+          messagesEl.appendChild(row);
+        }
+        scrollLatest();
+      }
 
-        messages.forEach((item, index) => {{
-          const card = createElement("article", "message " + item.role);
-          const role = createElement("p", "role", item.role);
-          card.appendChild(role);
+      function resizeComposer() {
+        promptInput.style.height = "auto";
+        promptInput.style.height = Math.min(promptInput.scrollHeight, 140) + "px";
+      }
 
-          if (item.role === "assistant") {{
-            const meta = extractMeta(item);
-            const status = meta.status || {{}};
-            const debug = meta.debug || {{}};
-            const body = createElement("pre", "");
-            body.textContent = status.degenerate_output && debug.raw_output ? debug.raw_output : item.content;
-            card.appendChild(body);
+      function parseSseEvent(raw) {
+        let event = "message";
+        const dataLines = [];
+        for (const line of raw.split("\\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+        }
+        return { event, data: dataLines.join("\\n") };
+      }
 
-            const citationBlock = createVisibleCitationBlock(item);
-            if (citationBlock) {{
-              card.appendChild(citationBlock);
-            }}
+      async function streamPrompt(prompt, assistant) {
+        const response = await fetch("/generate_stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestPayload(prompt)),
+        });
+        if (!response.ok || !response.body) {
+          throw new Error(await response.text() || `Streaming failed with ${response.status}`);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finalMetadata = {};
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split("\\n\\n");
+          buffer = parts.pop() || "";
+          for (const part of parts) {
+            if (!part.trim()) continue;
+            const parsed = parseSseEvent(part);
+            const payload = parsed.data ? JSON.parse(parsed.data) : {};
+            if (parsed.event === "delta") {
+              assistant.pending = false;
+              assistant.streaming = true;
+              assistant.content += payload.text || "";
+              render();
+            } else if (parsed.event === "metadata") {
+              finalMetadata = payload.metadata || {};
+            } else if (parsed.event === "error") {
+              throw new Error(payload.message || "Generation failed");
+            }
+          }
+        }
+        assistant.pending = false;
+        assistant.streaming = false;
+        assistant.metadata = finalMetadata;
+        render();
+      }
 
-            const badges = createElement("div", "badge-row");
-            if (!status.degenerate_output) {{
-              addBadge(badges, status.grounded ? "Grounded" : "Model Only", status.grounded ? "good" : "warn");
-              if (status.grounded) {{
-                addBadge(badges, "Catalog", "good");
-              }}
-              if (status.cited) {{
-                addBadge(badges, "Cited", "good");
-              }}
-              addBadge(badges, status.abstained ? "Abstained" : "Answered", status.abstained ? "warn" : "");
-            }}
-            card.appendChild(badges);
-
-            if (meta.summary && !status.degenerate_output) {{
-              card.appendChild(createElement("p", "summary-line", meta.summary));
-            }}
-
-            const actions = createAssistantActions(index, item);
-            if (actions) {{
-              card.appendChild(actions);
-            }}
-
-            if (status.degenerate_output) {{
-              card.appendChild(createElement("div", "divider"));
-              card.appendChild(createTraceCard(item, index));
-            }}
-          }} else {{
-            const body = createElement("pre", "");
-            body.textContent = item.content;
-            card.appendChild(body);
-          }}
-
-          chatLog.appendChild(card);
-        }});
-
-        chatLog.scrollTop = chatLog.scrollHeight;
-      }}
-
-      function normalizeAssistantPayload(payload, request) {{
-        return {{
-          role: "assistant",
-          content: payload.text || "",
-          meta: {{
-            usedTools: payload.used_tools,
-            citations: payload.citations || [],
-            request: {{
-              tools: Boolean(request && request.tools),
-              citations: Boolean(request && request.citations),
-              citationsSelected: Boolean(request && request.citationsSelected),
-              safeDecode: Boolean(request && request.safe_decode),
-            }},
-            metadata: payload.metadata || {{}},
-          }},
-        }};
-      }}
-
-      async function sendPrompt() {{
+      async function sendPrompt() {
         const prompt = promptInput.value.trim();
-        if (!prompt) {{
-          setStatus("Enter a prompt first.", true);
-          return;
-        }}
-
-        messages.push({{ role: "user", content: prompt }});
-        render();
+        if (!prompt || sendButton.disabled) return;
+        messages.push({ role: "user", content: prompt });
+        const assistant = { role: "assistant", content: "", pending: true, metadata: {} };
+        messages.push(assistant);
         promptInput.value = "";
-        sendButton.disabled = true;
-        setStatus("Generating response...");
-
-        try {{
-          const request = captureRequestState(messages, false);
-          const payload = await requestCompletion(messages, false);
-          messages.push(normalizeAssistantPayload(payload, request));
-          render();
-          setStatus("Response ready.");
-        }} catch (error) {{
-          setStatus(error.message || "Request failed.", true);
-        }} finally {{
-          sendButton.disabled = false;
-        }}
-      }}
-
-      async function retryAssistant(index, safeDecode) {{
-        const history = messages.slice(0, index);
-        if (!history.length) {{
-          return;
-        }}
-        messages.splice(index);
+        resizeComposer();
         render();
         sendButton.disabled = true;
-        setStatus(safeDecode ? "Retrying with safe preset..." : "Retrying response...");
-        try {{
-          const request = captureRequestState(history, safeDecode);
-          const payload = await requestCompletion(history, safeDecode);
-          messages.push(normalizeAssistantPayload(payload, request));
+        statusLine.textContent = "Generating...";
+        try {
+          await streamPrompt(prompt, assistant);
+          statusLine.textContent = "Response complete.";
+        } catch (error) {
+          assistant.pending = false;
+          assistant.content = error.message || "Request failed.";
+          assistant.metadata = { status: { final_label: "Generation failed", generation_failed: true, degenerate_output: false } };
           render();
-          setStatus(safeDecode ? "Safe retry complete." : "Retry complete.");
-        }} catch (error) {{
-          setStatus(error.message || "Retry failed.", true);
-        }} finally {{
+          statusLine.textContent = "Request failed.";
+        } finally {
           sendButton.disabled = false;
-        }}
-      }}
+          promptInput.focus();
+        }
+      }
 
-      composer.addEventListener("submit", async event => {{
+      composer.addEventListener("submit", (event) => {
         event.preventDefault();
-        await sendPrompt();
-      }});
+        sendPrompt();
+      });
 
-      promptInput.addEventListener("keydown", async event => {{
-        if (event.key === "Enter" && !event.shiftKey) {{
+      promptInput.addEventListener("input", resizeComposer);
+      promptInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
-          await sendPrompt();
-        }}
-      }});
+          sendPrompt();
+        }
+      });
 
-      clearButton.addEventListener("click", () => {{
-        messages.length = 0;
-        render();
-        setStatus("Conversation cleared.");
-        promptInput.focus();
-      }});
+      for (const prompt of examples) {
+        const chip = el("button", "chip", prompt);
+        chip.type = "button";
+        chip.addEventListener("click", () => {
+          promptInput.value = prompt;
+          resizeComposer();
+          promptInput.focus();
+        });
+        examplesEl.appendChild(chip);
+      }
 
-      toolsToggle.addEventListener("change", () => {{
-        syncDependentControls();
-      }});
+      fetch("/status")
+        .then((response) => response.json())
+        .then((payload) => {
+          document.getElementById("serverStatus").textContent = payload.status || "ok";
+          document.getElementById("statusDot").classList.add("live");
+          document.getElementById("modeBadge").textContent = payload.model_mode || "__MODEL_MODE__";
+          document.getElementById("deviceBadge").textContent = payload.device || "unknown";
+          const rag = payload.rag && payload.rag.enabled ? "on" : "off";
+          document.getElementById("ragBadge").innerHTML = `RAG <strong>${rag}</strong>`;
+          const path = payload.checkpoint_path || "__CHECKPOINT_PATH__";
+          document.getElementById("checkpointPath").textContent = path.split("/").slice(-2).join("/");
+          document.getElementById("checkpointPath").title = path;
+        })
+        .catch(() => {
+          document.getElementById("serverStatus").textContent = "offline";
+        });
 
       render();
-      syncDependentControls();
+      resizeComposer();
       promptInput.focus();
     </script>
   </body>
 </html>
 """
+    for key, value in replacements.items():
+        html = html.replace(key, value)
+    return html
