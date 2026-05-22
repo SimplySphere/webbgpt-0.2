@@ -1,6 +1,6 @@
 {
   "cleaned_stale_images": [],
-  "generated_at": "2026-05-22T10:05:50Z",
+  "generated_at": "2026-05-22T11:22:02Z",
   "generated_visual_count": 24,
   "main_command": "python3.12 tools/build_documentation_graphs.py",
   "requested_visual_count": 23,
@@ -117,11 +117,9 @@
     },
     {
       "caveats": [
-        "README records DPO as archived legacy; no active DPO artifact was present.",
         "Phase dates are derived from artifact file modification times or README evidence."
       ],
       "data_sources": [
-        "README.md",
         "artifacts/runs/local-mvp/checkpoints/pretrain/stage_summary.json",
         "artifacts/runs/local-mvp/checkpoints/sanity-probe/stage_summary.json",
         "artifacts/runs/local-mvp/checkpoints/sft-v3/stage_summary.json",
@@ -139,7 +137,7 @@
       "generated": true,
       "grounding": "derived",
       "key_numbers": {
-        "phase_count": 7
+        "phase_count": 6
       },
       "skipped_reason": null,
       "title": "How WebbGPT 0.2 Came Together",

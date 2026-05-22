@@ -1,19 +1,20 @@
 # WebbGPT
 
-WebbGPT is a Python CLI for training a small decoder-only model, preparing posttraining data, grounding against Webb data, and serving a local assistant.
+WebbGPT is a Python CLI and local demo stack for training a small decoder-only model, preparing posttraining data, grounding responses against local Webb-related source material, serving a local assistant, and generating project documentation visuals.
 
 The current local development path is `local-mvp`.
 
 ## Current Final Direction
 
-The active path is:
+The active local-MVP path is:
 
 1. Curated base pretraining.
-2. Optional small continued pretraining from reviewed source material.
-3. SFT with RAG/context grounding.
-4. Website demo.
+2. Use the final pretrained checkpoint as the website default.
+3. Add local lexical RAG for source-supported demo behavior.
+4. Keep continued pretraining and SFT-RAG as explicit optional experiments that must beat the pretrained baseline before promotion.
+5. Generate documentation graphics from saved artifacts for the final presentation/poster.
 
-DPO is archived as legacy because the small local-MVP DPO run worsened real sample behavior and is not part of the current final project.
+DPO is disabled legacy work. It is not part of the active final-demo path and should not be launched for the current project.
 
 ## Current Local-MVP
 
@@ -28,6 +29,16 @@ DPO is archived as legacy because the small local-MVP DPO run worsened real samp
 - Former stale corpora now live under `data/source_material/` and must be filtered or chunked with provenance before future use.
 
 The final local-MVP experiment before 3B planning is the lower-LR curated recipe in `sample-configs/train-local-mvp.json`.
+
+Current checked-in local-MVP artifact state:
+
+- Best pretrained checkpoint: `artifacts/runs/local-mvp/checkpoints/pretrain/best-pretrain`
+- Prepared pretraining data: 157,442 sequences and 63,590,914 tokens from `artifacts/runs/local-mvp/prepared/pretrain.json`
+- Best final-selection validation loss: 5.18789005279541
+- Best final-selection perplexity: 179.09028296542547
+- Pretraining stage quality status: `weak_raw_lm`
+- Demo default model mode: `pretrained`
+- RAG index files: `data/rag/webbgpt_chunks.jsonl`, `data/rag/webbgpt_index.json`, and `data/rag/webbgpt_sources_manifest.json`
 
 Active local-MVP configs:
 
@@ -104,11 +115,29 @@ webbgpt train-pretrain \
 
 `webbgpt main --profile local-mvp` is also pretrain-only now. It builds/reuses tokenizer assets, materializes the curated pretrain and validation manifests, then runs base pretraining. It does not silently run continued pretraining, SFT, or legacy DPO.
 
+## Documentation Graphics
+
+The project can regenerate presentation/poster graphics from local artifacts without starting training or changing model checkpoints:
+
+```bash
+python3.12 tools/build_documentation_graphs.py
+```
+
+The generated files live under `documentation/`. The current set contains 23 requested visuals plus a generated contact sheet:
+
+- `documentation/00_graph_index.png`
+- `documentation/01_pretrain_loss_curve.png` through `documentation/18_demo_readiness_scorecard.png`
+- `documentation/19_training_loss_animation.gif` through `documentation/23_data_filtering_funnel_animation.gif`
+- `documentation/visual_manifest.json`
+- `documentation/README.md`
+
+The generator uses saved pretraining history, prepared-data manifests, RAG chunks/indexes, saved RAG regression outputs, serving verification, static UI/server evidence, and deterministic heuristics where direct measurements are unavailable. It does not make network calls, start training, or modify checkpoints.
+
 ## Posttraining And Grounding
 
 The current 22M local-MVP base is still a raw LM experiment. Continued pretraining and SFT are optional improvement paths and should be evaluated against the pretrained checkpoint before changing the website default.
 
-DPO was tested as a small plumbing/stretch experiment. It moved tiny preference metrics but worsened real samples, so the DPO configs, data, checkpoint artifacts, and full trainer implementation are archived under `junk/dpo-legacy/`.
+DPO was tested as a small plumbing/stretch experiment. It moved tiny preference metrics but worsened real samples, so `src/cli.py train-dpo` is retained only as a disabled legacy command.
 
 ### Continued Pretraining
 
@@ -230,13 +259,13 @@ webbgpt webb-sync \
 
 ## Local Demo Server
 
-### Thursday Demo Default
+### Current Demo Default
 
-The Thursday demo default is the final 22M pretrained local-MVP checkpoint:
+The current demo default is the final 22M pretrained local-MVP checkpoint:
 
 `artifacts/runs/local-mvp/checkpoints/pretrain/best-pretrain`
 
-SFT-small, SFT-v2, SFT-v3, and DPO-small were run as local posttraining/plumbing experiments, but they are not the website default. SFT-v3 completed and reduced validation loss, but the final demo prompt comparison stayed mixed/worse than pretrained: prompt retention and grounded-context behavior did not improve enough to justify switching. DPO-small amplified the bad SFT behavior and is archived. Keep `WEBBGPT_MODEL_MODE=pretrained` unless a later checkpoint clearly beats pretrained on behavior samples.
+SFT-small, SFT-v2, and SFT-v3 were run as local posttraining/plumbing experiments, but they are not the website default. SFT-v3 completed and reduced validation loss, but the final demo prompt comparison stayed mixed/worse than pretrained: prompt retention and grounded-context behavior did not improve enough to justify switching. DPO is disabled legacy work and is not an active candidate. Keep `WEBBGPT_MODEL_MODE=pretrained` unless a later checkpoint clearly beats pretrained on behavior samples.
 
 Start the local-MVP demo server with the pretrained 22M checkpoint:
 
@@ -362,7 +391,5 @@ python3.12 -m pytest src/tests/test_cli_profiles.py
 - `data/webb/`: Webb grounding fixtures and source packs
 - `src/`: CLI, model, training, eval, grounding, and serving code
 - `tools/`: active reporting and audit tools
+- `documentation/`: generated project graphics, README, and visual manifest
 - `artifacts/`: generated tokenizers, manifests, checkpoints, reports, and exports
-- `junk/`: preserved legacy files moved out of the active path
-
-See `docs/CURRENT_LOCAL_MVP.md` for the current local-MVP baseline and rationale.
