@@ -1,0 +1,577 @@
+{
+  "cleaned_stale_images": [],
+  "generated_at": "2026-05-22T10:05:50Z",
+  "generated_visual_count": 24,
+  "main_command": "python3.12 tools/build_documentation_graphs.py",
+  "requested_visual_count": 23,
+  "style_system": {
+    "background": "white",
+    "name": "Clean editorial science-explainer",
+    "notes": "Presentation-oriented matplotlib styling with larger titles, human-facing subtitles, light gridlines, soft axes, and padded saves.",
+    "palette": {
+      "blue": "#244C6F",
+      "coral": "#D96C5F",
+      "gray": "#6B7785",
+      "light_gray": "#EEF2F6",
+      "mid_gray": "#D8DEE6",
+      "navy": "#17324D",
+      "orange": "#E9A23B",
+      "teal": "#2A9D8F"
+    }
+  },
+  "supplemental_visual_count": 1,
+  "visuals": [
+    {
+      "caveats": [
+        "Supplemental contact sheet summarizing the generated documentation graphics set."
+      ],
+      "data_sources": [
+        "documentation/01_pretrain_loss_curve.png",
+        "documentation/02_pretrain_perplexity_curve.png",
+        "documentation/03_loss_and_perplexity_dual_axis.png",
+        "documentation/04_experiment_timeline_chart.png",
+        "documentation/05_training_data_source_mix.png",
+        "documentation/06_data_filtering_funnel.png",
+        "documentation/07_data_rejection_reasons.png",
+        "documentation/08_rag_chunk_distribution.png",
+        "documentation/09_rag_regression_outcomes.png",
+        "documentation/10_rag_prompt_outcome_heatmap.png",
+        "documentation/11_failure_mode_heatmap.png",
+        "documentation/12_generation_length_distribution.png",
+        "documentation/13_repetition_score_distribution.png",
+        "documentation/14_retrieval_score_distribution.png",
+        "documentation/15_query_source_heatmap.png",
+        "documentation/16_rag_before_after_comparison.png",
+        "documentation/17_model_quality_radar.png",
+        "documentation/18_demo_readiness_scorecard.png",
+        "documentation/19_training_loss_animation.gif",
+        "documentation/20_perplexity_animation.gif",
+        "documentation/21_rag_retrieval_heatmap_animation.gif",
+        "documentation/22_streaming_output_demo.gif",
+        "documentation/23_data_filtering_funnel_animation.gif"
+      ],
+      "filename": "00_graph_index.png",
+      "filepath": "documentation/00_graph_index.png",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "indexed_visuals": 23
+      },
+      "skipped_reason": null,
+      "title": "Graph Index",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/checkpoints/pretrain/eval_history.jsonl"
+      ],
+      "filename": "01_pretrain_loss_curve.png",
+      "filepath": "documentation/01_pretrain_loss_curve.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "best_loss": 5.095178,
+        "final_loss": 5.18789,
+        "points": 197
+      },
+      "skipped_reason": null,
+      "title": "Pretraining Loss Over Time",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Values above 1000 are clipped for readability."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/checkpoints/pretrain/eval_history.jsonl"
+      ],
+      "filename": "02_pretrain_perplexity_curve.png",
+      "filepath": "documentation/02_pretrain_perplexity_curve.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "best_perplexity": 163.23284,
+        "final_perplexity": 179.090283,
+        "points": 197
+      },
+      "skipped_reason": null,
+      "title": "Pretraining Perplexity Over Time",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Perplexity is clipped at 1000 for readability."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/checkpoints/pretrain/eval_history.jsonl"
+      ],
+      "filename": "03_loss_and_perplexity_dual_axis.png",
+      "filepath": "documentation/03_loss_and_perplexity_dual_axis.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {},
+      "skipped_reason": null,
+      "title": "Loss and Perplexity Move Together",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "README records DPO as archived legacy; no active DPO artifact was present.",
+        "Phase dates are derived from artifact file modification times or README evidence."
+      ],
+      "data_sources": [
+        "README.md",
+        "artifacts/runs/local-mvp/checkpoints/pretrain/stage_summary.json",
+        "artifacts/runs/local-mvp/checkpoints/sanity-probe/stage_summary.json",
+        "artifacts/runs/local-mvp/checkpoints/sft-v3/stage_summary.json",
+        "artifacts/runs/local-mvp/manual_demos/chat_transcript.jsonl",
+        "artifacts/runs/local-mvp/prepare_pretrain.log",
+        "artifacts/runs/local-mvp/rag_reliability_regression.json",
+        "artifacts/runs/local-mvp/rag_serving_verification_after_source_expansion.json",
+        "artifacts/runs/local-mvp/sanity_probe.log",
+        "artifacts/runs/local-mvp/sft0_plumbing.log",
+        "artifacts/runs/scale-3b-smoke-100m/reports/data_audit/quality_summary.json",
+        "artifacts/runs/scale-3b-smoke-100m/reports/data_audit_cleanup/quality_summary.json"
+      ],
+      "filename": "04_experiment_timeline_chart.png",
+      "filepath": "documentation/04_experiment_timeline_chart.png",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "phase_count": 7
+      },
+      "skipped_reason": null,
+      "title": "How WebbGPT 0.2 Came Together",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/prepared/pretrain.json"
+      ],
+      "filename": "05_training_data_source_mix.png",
+      "filepath": "documentation/05_training_data_source_mix.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "fineweb_extension_corpus": 33688856,
+        "local_mvp_pretrain_corpus": 29902472
+      },
+      "skipped_reason": null,
+      "title": "What Fed Pretraining?",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "The funnel uses direct artifact counts with mixed units, so the x-axis is logarithmic."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/prepared/pretrain.json"
+      ],
+      "filename": "06_data_filtering_funnel.png",
+      "filepath": "documentation/06_data_filtering_funnel.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "accepted docs": 81912,
+        "cleaned records": 81912,
+        "final tokens": 63590914,
+        "packed sequences": 157442,
+        "raw records": 124306,
+        "repeat-packed docs": 28669
+      },
+      "skipped_reason": null,
+      "title": "From Raw Text to Training Tokens",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/prepared/pretrain.json",
+        "artifacts/runs/scale-3b-smoke-100m/reports/data_audit/quality_summary.json",
+        "artifacts/runs/scale-3b-smoke-100m/reports/data_audit_cleanup/quality_summary.json"
+      ],
+      "filename": "07_data_rejection_reasons.png",
+      "filepath": "documentation/07_data_rejection_reasons.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "broad_lm_navigation_boilerplate": 1740,
+        "broad_lm_url_heavy": 4049,
+        "curated_lm_category_menu_boilerplate": 791,
+        "curated_lm_dictionary_or_encyclopedia_fragment": 776,
+        "curated_lm_medical_body_dense": 16140,
+        "curated_lm_page_boilerplate": 1210,
+        "curated_lm_product_commercial_dense": 748,
+        "curated_lm_question_list_or_seo_fragments": 613,
+        "curated_lm_repeated_ngram_heavy": 7411,
+        "curated_lm_separator_heavy": 2187,
+        "curated_lm_too_few_words": 1333,
+        "curated_lm_url_or_metadata_heavy": 3154
+      },
+      "skipped_reason": null,
+      "title": "What the Filters Removed",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "data/rag/webbgpt_chunks.jsonl",
+        "data/rag/webbgpt_sources_manifest.json"
+      ],
+      "filename": "08_rag_chunk_distribution.png",
+      "filepath": "documentation/08_rag_chunk_distribution.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "source_categories": {
+          "rag_candidates": 166
+        },
+        "source_count": 7,
+        "total_chunks": 166
+      },
+      "skipped_reason": null,
+      "title": "RAG Sources at a Glance",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Outcome categories are non-exclusive counts derived from saved regression fields."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json"
+      ],
+      "filename": "09_rag_regression_outcomes.png",
+      "filepath": "documentation/09_rag_regression_outcomes.png",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "Abstained": 4,
+        "Generated": 6,
+        "Generated with sources": 5,
+        "Generation failed": 5,
+        "Weak generation": 6
+      },
+      "skipped_reason": null,
+      "title": "How the RAG Demo Responds",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json"
+      ],
+      "filename": "10_rag_prompt_outcome_heatmap.png",
+      "filepath": "documentation/10_rag_prompt_outcome_heatmap.png",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "columns": [
+          "retrieved source",
+          "generated text",
+          "weak generation",
+          "sources attached",
+          "abstained"
+        ],
+        "prompt_count": 10
+      },
+      "skipped_reason": null,
+      "title": "RAG Prompt Outcomes",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Failure types combine saved quality reasons with deterministic text heuristics."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json"
+      ],
+      "filename": "11_failure_mode_heatmap.png",
+      "filepath": "documentation/11_failure_mode_heatmap.png",
+      "generated": true,
+      "grounding": "heuristic",
+      "key_numbers": {
+        "columns": [
+          "repetition",
+          "drift",
+          "punctuation-only",
+          "gibberish",
+          "unsupported answer",
+          "no source",
+          "weak generation"
+        ],
+        "prompt_count": 10
+      },
+      "skipped_reason": null,
+      "title": "Where Outputs Failed",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/final_pretrained_vs_sft_v3_comparison.json",
+        "artifacts/runs/local-mvp/manual_demos/chat_transcript.jsonl",
+        "artifacts/runs/local-mvp/rag_reliability_regression.json",
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json",
+        "artifacts/runs/local-mvp/rag_serving_verification_after_source_expansion.json",
+        "artifacts/runs/local-mvp/sft_v2_comparison_samples.json"
+      ],
+      "filename": "12_generation_length_distribution.png",
+      "filepath": "documentation/12_generation_length_distribution.png",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "max_words": 277,
+        "median_words": 25,
+        "samples": 170
+      },
+      "skipped_reason": null,
+      "title": "How Long Saved Outputs Were",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Score uses saved unique_token_ratio when present, otherwise token dominance and repeated 4-grams."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/final_pretrained_vs_sft_v3_comparison.json",
+        "artifacts/runs/local-mvp/manual_demos/chat_transcript.jsonl",
+        "artifacts/runs/local-mvp/rag_reliability_regression.json",
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json",
+        "artifacts/runs/local-mvp/rag_serving_verification_after_source_expansion.json",
+        "artifacts/runs/local-mvp/sft_v2_comparison_samples.json"
+      ],
+      "filename": "13_repetition_score_distribution.png",
+      "filepath": "documentation/13_repetition_score_distribution.png",
+      "generated": true,
+      "grounding": "heuristic",
+      "key_numbers": {
+        "mean_score": 0.2864,
+        "samples": 170
+      },
+      "skipped_reason": null,
+      "title": "Repetition in Saved Outputs",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_query_checks_after_source_expansion.json",
+        "artifacts/runs/local-mvp/rag_reliability_regression.json",
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json",
+        "artifacts/runs/local-mvp/rag_serving_verification_after_source_expansion.json"
+      ],
+      "filename": "14_retrieval_score_distribution.png",
+      "filepath": "documentation/14_retrieval_score_distribution.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "hit_count": 20,
+        "max_score": 1.789971,
+        "min_score": 0.262011
+      },
+      "skipped_reason": null,
+      "title": "Retrieval Scores",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_query_checks_after_source_expansion.json",
+        "artifacts/runs/local-mvp/rag_serving_verification_after_source_expansion.json"
+      ],
+      "filename": "15_query_source_heatmap.png",
+      "filepath": "documentation/15_query_source_heatmap.png",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "query_count": 5,
+        "source_count": 6
+      },
+      "skipped_reason": null,
+      "title": "Which Sources Each Query Retrieved",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Metrics are non-exclusive counts derived from two saved RAG regression runs."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_reliability_regression.json",
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json"
+      ],
+      "filename": "16_rag_before_after_comparison.png",
+      "filepath": "documentation/16_rag_before_after_comparison.png",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "after": {
+          "abstentions": 4,
+          "bad answers": 6,
+          "grounded support": 9,
+          "source surfaced": 5,
+          "weak flagged": 6
+        },
+        "before": {
+          "abstentions": 6,
+          "bad answers": 4,
+          "grounded support": 9,
+          "source surfaced": 3,
+          "weak flagged": 4
+        }
+      },
+      "skipped_reason": null,
+      "title": "RAG Source Expansion Changed Coverage",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Scores summarize saved regression metadata with a deterministic rubric, not human grading."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json"
+      ],
+      "filename": "17_model_quality_radar.png",
+      "filepath": "documentation/17_model_quality_radar.png",
+      "generated": true,
+      "grounding": "heuristic",
+      "key_numbers": {
+        "abstention honesty": 0.8,
+        "fluency": 0.4,
+        "grounding support": 0.9,
+        "prompt retention": 0.4,
+        "repetition control": 0.3,
+        "source surfacing": 1.0
+      },
+      "skipped_reason": null,
+      "title": "Final System Behavior at a Glance",
+      "type": "png"
+    },
+    {
+      "caveats": [
+        "Core tests status is read from pytest's lastfailed cache; the generator does not run the full test suite."
+      ],
+      "data_sources": [
+        ".pytest_cache/v/cache/lastfailed",
+        "artifacts/runs/local-mvp/checkpoints/pretrain/best-pretrain/checkpoint.pt",
+        "artifacts/runs/local-mvp/rag_reliability_regression_after_source_expansion.json",
+        "artifacts/runs/local-mvp/rag_serving_verification_after_source_expansion.json",
+        "documentation",
+        "src/serve/app.py",
+        "src/serve/playground.py",
+        "tools/build_documentation_graphs.py"
+      ],
+      "filename": "18_demo_readiness_scorecard.png",
+      "filepath": "documentation/18_demo_readiness_scorecard.png",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "RAG enabled": 1.0,
+        "UI source cards present": 1.0,
+        "checkpoint artifact present": 1.0,
+        "core tests last run clean": 1.0,
+        "documentation generated": 1.0,
+        "server verification ok": 1.0,
+        "sources surfaced": 1.0,
+        "streaming route present": 1.0
+      },
+      "skipped_reason": null,
+      "title": "Demo Readiness Checklist",
+      "type": "png"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/checkpoints/pretrain/eval_history.jsonl"
+      ],
+      "filename": "19_training_loss_animation.gif",
+      "filepath": "documentation/19_training_loss_animation.gif",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "frames": 45,
+        "points": 197
+      },
+      "skipped_reason": null,
+      "title": "Loss Curve Animation",
+      "type": "gif"
+    },
+    {
+      "caveats": [
+        "Perplexity is clipped at 1000 for readability."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/checkpoints/pretrain/eval_history.jsonl"
+      ],
+      "filename": "20_perplexity_animation.gif",
+      "filepath": "documentation/20_perplexity_animation.gif",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "frames": 45,
+        "points": 197
+      },
+      "skipped_reason": null,
+      "title": "Perplexity Curve Animation",
+      "type": "gif"
+    },
+    {
+      "caveats": [],
+      "data_sources": [
+        "artifacts/runs/local-mvp/rag_query_checks_after_source_expansion.json",
+        "artifacts/runs/local-mvp/rag_serving_verification_after_source_expansion.json"
+      ],
+      "filename": "21_rag_retrieval_heatmap_animation.gif",
+      "filepath": "documentation/21_rag_retrieval_heatmap_animation.gif",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "frames": 5,
+        "query_count": 5
+      },
+      "skipped_reason": null,
+      "title": "Retrieval Heatmap Animation",
+      "type": "gif"
+    },
+    {
+      "caveats": [
+        "The GIF simulates UI progressive reveal; it is not a live browser capture. It uses the documented sample sentence because the saved response text was not presentation-friendly."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/manual_demos/chat_transcript.jsonl",
+        "src/serve/app.py",
+        "src/serve/playground.py"
+      ],
+      "filename": "22_streaming_output_demo.gif",
+      "filepath": "documentation/22_streaming_output_demo.gif",
+      "generated": true,
+      "grounding": "derived",
+      "key_numbers": {
+        "frames": 16,
+        "sample_text_used": true
+      },
+      "skipped_reason": null,
+      "title": "Progressive Response Demo",
+      "type": "gif"
+    },
+    {
+      "caveats": [
+        "The funnel uses direct artifact counts with mixed units, so the x-axis is logarithmic."
+      ],
+      "data_sources": [
+        "artifacts/runs/local-mvp/prepared/pretrain.json"
+      ],
+      "filename": "23_data_filtering_funnel_animation.gif",
+      "filepath": "documentation/23_data_filtering_funnel_animation.gif",
+      "generated": true,
+      "grounding": "direct",
+      "key_numbers": {
+        "frames": 6
+      },
+      "skipped_reason": null,
+      "title": "Filtering Funnel Animation",
+      "type": "gif"
+    }
+  ]
+}
